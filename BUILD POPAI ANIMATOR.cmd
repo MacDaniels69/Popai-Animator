@@ -1,4 +1,4 @@
 @echo off
-title Popai Animator - building the Windows app
+rem Opens the Popai Animator installer window (no terminal needed).
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\windows\build.ps1"
+start "" powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0scripts\windows\installer-gui.ps1"

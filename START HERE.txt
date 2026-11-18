@@ -6,10 +6,12 @@ POPAI ANIMATOR - HOW TO GET THE APP
 
 2. Open that folder and double-click:   BUILD POPAI ANIMATOR.cmd
 
+   A Popai Animator installer window opens and shows each step, the progress and the
+   download speed. (If it does not open, use scripts\windows\build (text mode).cmd.)
    - If Windows says "Windows protected your PC", click "More info" then "Run anyway".
    - If Windows asks "Do you want to allow this app to make changes", click "Yes"
      (needed once, to install the Microsoft C++ build tools).
-   - Leave the window open. The first time it downloads about 2-2.5 GB of tools
+   - Leave the installer window open. The first time it downloads about 2-2.5 GB of tools
      (mostly the Microsoft C++ build tools) and takes roughly 20-40 minutes.
      Later builds reuse everything and take a few minutes.
 

@@ -3,6 +3,10 @@
 # then opens the finished installer. Everything is logged to build-log.txt.
 # (ASCII only on purpose: Windows PowerShell 5.1 reads scripts without a BOM as ANSI.)
 
+# -Gui: started hidden by installer-gui.ps1, which reads the @@STEP / @@FAIL / @@DONE lines below
+# to show progress in a window (no Read-Host prompts, no windows opened at the end).
+param([switch]$Gui)
+
 # Native tools (rustup, npm, cargo) print progress on stderr; with 'Stop' Windows PowerShell 5.1 can
 # treat that as an error, so failures are detected from exit codes instead.
 $ErrorActionPreference = 'Continue'
@@ -15,16 +19,18 @@ function Have($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 function RefreshPath {
   $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User') + ";$env:USERPROFILE\.cargo\bin;$env:ProgramFiles\nodejs"
 }
+function Step($id, $state, $text = '') { [Console]::Out.WriteLine("@@STEP|$id|$state|$text"); [Console]::Out.Flush() }
 function Fail($msg) {
+  [Console]::Out.WriteLine("@@FAIL|$msg"); [Console]::Out.Flush()
   Write-Host ''; Write-Host "BUILD STOPPED: $msg" -ForegroundColor Red
   Write-Host "Details are in: $Log" -ForegroundColor Yellow
   try { Stop-Transcript | Out-Null } catch {}
-  Read-Host 'Press Enter to close'
+  if (-not $Gui) { Read-Host 'Press Enter to close' }
   exit 1
 }
 # (named InstallPkg, not Winget: PowerShell prefers functions over programs of the same name)
 function InstallPkg($id, $extra) {
-  $wargs = @('install', '--id', $id, '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') + $extra
+  $wargs = @('install', '--id', $id, '-e', '--source', 'winget', '--silent', '--accept-source-agreements', '--accept-package-agreements') + $extra
   & winget.exe @wargs
   if ($LASTEXITCODE -ne 0) { Write-Host "winget finished with code $LASTEXITCODE for $id - checking whether it is usable anyway..." -ForegroundColor Yellow }
   RefreshPath
@@ -36,18 +42,22 @@ Write-Host '   Please keep this window open. The first build can take a while.' 
 Write-Host '==============================================================' -ForegroundColor DarkCyan
 
 # --- sanity checks --------------------------------------------------------------------------
+Step 'check' 'run' 'checking folder, disk space and winget'
 if (-not (Test-Path (Join-Path $Root 'ui\package.json'))) { Fail 'project files not found. Extract the whole zip to a folder first (for example C:\PopaiAnimator), then double-click the BUILD file inside it.' }
 if ($Root.Length -gt 80) { Write-Host "Note: the folder path is long ($Root). If the build fails, move the folder to C:\PopaiAnimator." -ForegroundColor Yellow }
 $drive = (Get-Item $Root).PSDrive
 if ($drive.Free -lt 12GB) { Write-Host ("Warning: only {0:N1} GB free on drive {1}:. The tools and build need about 12 GB." -f ($drive.Free / 1GB), $drive.Name) -ForegroundColor Yellow }
 if (-not (Have 'winget.exe')) { Fail "the Windows package installer (winget / 'App Installer') is missing. Install 'App Installer' from the Microsoft Store, then double-click the BUILD file again." }
 RefreshPath
+Step 'check' 'ok' 'ready'
 
 # --- 1. Microsoft C++ build tools (needed by Rust on Windows) --------------------------------
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 function HasVC { (Test-Path $vswhere) -and [bool](& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) }
-if (HasVC) { Say 'C++ build tools: already installed' 'Green' }
+$cppWas = HasVC
+if ($cppWas) { Say 'C++ build tools: already installed' 'Green'; Step 'cpp' 'ok' 'already installed' }
 else {
+  Step 'cpp' 'run' 'downloading and installing - no progress is reported, watch the network speed'
   Say 'Installing Microsoft C++ build tools (largest download, about 1.5-2 GB). Windows may ask for permission - click Yes.'
   InstallPkg 'Microsoft.VisualStudio.2022.BuildTools' @('--override', '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.22621')
   if (-not (HasVC)) {
@@ -73,9 +83,13 @@ else {
   if (-not (HasVC)) { Fail 'the C++ build tools did not finish installing. Open "Visual Studio Installer" from the Start menu, click Modify on Build Tools 2022, tick "Desktop development with C++", click Modify, wait for it to finish, then double-click the BUILD file again.' }
 }
 
+if (-not $cppWas -and (HasVC)) { Step 'cpp' 'ok' 'installed' }
+
 # --- 2. Rust ---------------------------------------------------------------------------------
+Step 'rust' 'run' 'checking'
 if (Have 'cargo') { Say 'Rust: already installed' 'Green' }
 else {
+  Step 'rust' 'run' 'downloading and installing'
   Say 'Installing Rust (about 200 MB)...'
   InstallPkg 'Rustlang.Rustup' @()
   if (-not (Have 'rustup')) { Fail 'Rust did not install. Restart the PC and try again.' }
@@ -83,24 +97,47 @@ else {
 & rustup set profile minimal
 & rustup default stable-msvc
 if ($LASTEXITCODE -ne 0) { Fail 'could not set up the Rust compiler' }
+RefreshPath
+# A Rust install that was cut short leaves rustup working but the compiler broken
+# ("error reading rustc version"); reinstall the toolchain in that case.
+function RustOk { $v = & rustc --version 2>&1; return ($LASTEXITCODE -eq 0 -and "$v" -match '^rustc ') }
+if (-not (RustOk)) {
+  Step 'rust' 'run' 'repairing a damaged install (about 200 MB)'
+  Say 'The Rust compiler is damaged (probably an earlier download was cut short) - reinstalling it (about 200 MB)...' 'Yellow'
+  $tc = 'stable-x86_64-pc-windows-msvc'
+  & rustup toolchain uninstall $tc
+  & rustup toolchain install $tc --profile minimal
+  & rustup default $tc
+  RefreshPath
+  if (-not (RustOk)) { Fail 'the Rust compiler still does not start. Check the internet connection and run the BUILD file again.' }
+}
+$rv = "$(& rustc --version)"
+Say ("Rust: " + $rv) 'Green'
+Step 'rust' 'ok' $rv
 
 # --- 3. Node.js ------------------------------------------------------------------------------
-if (Have 'node') { Say 'Node.js: already installed' 'Green' }
+if (Have 'node') { Say 'Node.js: already installed' 'Green'; Step 'node' 'ok' 'already installed' }
 else {
+  Step 'node' 'run' 'downloading and installing'
   Say 'Installing Node.js (about 30 MB)...'
   InstallPkg 'OpenJS.NodeJS.LTS' @()
   if (-not (Have 'node')) { Fail 'Node.js did not install. Restart the PC and try again.' }
+  Step 'node' 'ok' 'installed'
 }
 
 # --- 4. build --------------------------------------------------------------------------------
 Set-Location (Join-Path $Root 'ui')
+Step 'npm' 'run' 'downloading'
 Say 'Downloading the interface packages (about 25 MB)...'
 & npm ci --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { Fail 'downloading the interface packages failed (check the internet connection)' }
+Step 'npm' 'ok' 'done'
 
+Step 'build' 'run' 'starting'
 Say 'Building Popai Animator (first time: 5-15 minutes, downloads about 25 MB of Rust packages)...'
 & npx tauri build
 if ($LASTEXITCODE -ne 0) { Fail 'the app build failed' }
+Step 'build' 'ok' 'done'
 
 # --- 5. hand over ----------------------------------------------------------------------------
 $out = Join-Path $Root 'Popai Animator - Windows'
@@ -116,6 +153,9 @@ Write-Host '  - Popai Animator Setup.exe      installs the app (Start menu + des
 Write-Host '  - Popai Animator (portable).exe runs without installing' -ForegroundColor Gray
 Write-Host 'If Windows shows "Windows protected your PC", click More info, then Run anyway.' -ForegroundColor Yellow
 try { Stop-Transcript | Out-Null } catch {}
-Start-Process explorer.exe $out
-Start-Process (Join-Path $out 'Popai Animator Setup.exe')
-Read-Host 'Press Enter to close this window'
+[Console]::Out.WriteLine("@@DONE|$out"); [Console]::Out.Flush()
+if (-not $Gui) {
+  Start-Process explorer.exe $out
+  Start-Process (Join-Path $out 'Popai Animator Setup.exe')
+  Read-Host 'Press Enter to close this window'
+}
