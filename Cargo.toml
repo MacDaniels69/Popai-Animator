@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/popai-core", "crates/popai-engine-host"]
+# The desktop app (src-tauri) is its own workspace: it needs the platform webview SDK
+# (WebView2 on Windows). Build it with `npm run tauri build` in ui/.
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

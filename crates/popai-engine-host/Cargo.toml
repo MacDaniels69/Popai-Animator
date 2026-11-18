@@ -1,0 +1,9 @@
+[package]
+name = "popai-engine-host"
+description = "Runs the Popai core engine behind a local HTTP endpoint (browser development, automated tests, headless use)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+popai-core = { path = "../popai-core" }
+serde_json.workspace = true

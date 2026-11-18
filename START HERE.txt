@@ -1,0 +1,25 @@
+POPAI ANIMATOR - HOW TO GET THE APP
+===================================
+
+1. Extract this whole zip to a short folder, for example:  C:\PopaiAnimator
+   (Right-click the zip > Extract All...  - do not run anything from inside the zip.)
+
+2. Open that folder and double-click:   BUILD POPAI ANIMATOR.cmd
+
+   - If Windows says "Windows protected your PC", click "More info" then "Run anyway".
+   - If Windows asks "Do you want to allow this app to make changes", click "Yes"
+     (needed once, to install the Microsoft C++ build tools).
+   - Leave the window open. The first time it downloads about 2-2.5 GB of tools
+     (mostly the Microsoft C++ build tools) and takes roughly 20-40 minutes.
+     Later builds reuse everything and take a few minutes.
+
+3. When it finishes, a folder called "Popai Animator - Windows" opens with:
+   - Popai Animator Setup.exe        installs the app (Start menu + desktop shortcut)
+   - Popai Animator (portable).exe   runs without installing
+   The installer also starts automatically.
+
+If something goes wrong, the window says what happened, and the full details are
+saved in build-log.txt in the same folder. Running the BUILD file again is safe:
+it skips everything that is already installed.
+
+Needs: Windows 10 or 11 (64-bit), about 12 GB of free disk space, internet.

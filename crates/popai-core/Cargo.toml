@@ -1,0 +1,9 @@
+[package]
+name = "popai-core"
+description = "Popai Animator core engine: document model, animation evaluation, bones, binding, deformation, undo history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
