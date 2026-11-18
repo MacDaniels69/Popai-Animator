@@ -130,6 +130,7 @@ function evalChannel(ch, f) {
 // ---------- application state (not saved in document) ----------
 const S = {
   doc: null,
+  boneLabels: (() => { try { return localStorage.getItem('popai.boneLabels') !== '0'; } catch { return true; } })(),
   media: {}, // id -> {name, type, url, el(img|audioBuffer)}
   frame: 0,
   playing: false,
@@ -1126,7 +1127,7 @@ function drawHandles(ctx, bb, color = '#ff8a3d') {
     ctx.fill(); ctx.stroke();
   }
 }
-const POINT_TOOLS = new Set(['points', 'pen', 'curvature', 'freehand', 'fill', 'rect', 'ellipse', 'polygon']);
+const POINT_TOOLS = new Set(['points', 'pen', 'curvature', 'freehand', 'fill', 'shape', 'rect', 'ellipse', 'polygon']);
 const BONE_TOOLS = new Set(['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset', 'physics', 'force']);
 function drawOverlays(ctx) {
   const dpr = Stage.dpr, sel = selLayer();
@@ -1260,14 +1261,25 @@ function drawBones(ctx, B) {
     const isSel = selIds.has(bs.id), prim = S.selBone === bs.id;
     ctx.globalAlpha = bs.off ? 0.3 : 1;
     ctx.beginPath(); ctx.moveTo(bs.base[0], bs.base[1]); ctx.lineTo(mx + nx * w, my + ny * w); ctx.lineTo(bs.tip[0], bs.tip[1]); ctx.lineTo(mx - nx * w, my - ny * w); ctx.closePath();
-    ctx.fillStyle = isSel ? (prim ? 'rgba(255,138,61,.9)' : 'rgba(255,180,120,.75)') : boundIds.has(bs.id) ? 'rgba(92,207,138,.75)' : bs.b.dyn && bs.b.dyn.on ? 'rgba(59,201,219,.7)' : bs.b.color || 'rgba(110,140,255,.6)';
+    ctx.fillStyle = isSel ? (prim ? 'rgba(255,138,61,.9)' : 'rgba(255,180,120,.75)') : boundIds.has(bs.id) ? 'rgba(92,207,138,.75)' : bs.b.color || (bs.b.dyn && bs.b.dyn.on ? 'rgba(59,201,219,.7)' : 'rgba(110,140,255,.6)');
     ctx.strokeStyle = isSel ? '#fff' : 'rgba(0,0,0,.7)'; ctx.lineWidth = dpr; ctx.fill(); ctx.stroke();
     ctx.beginPath(); ctx.arc(bs.base[0], bs.base[1], 3.5 * dpr, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.stroke();
     if (bs.b.dyn && bs.b.dyn.on) { ctx.strokeStyle = '#3bc9db'; ctx.beginPath(); for (let i = 0; i <= 6; i++) { const t = 0.35 + i * 0.08, o = (i % 2 ? 4 : -4) * dpr; const px = bs.base[0] + dx * t + nx * o, py = bs.base[1] + dy * t + ny * o; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke(); }
-    if (isSel || ['bonetf', 'boneadd', 'bonesel', 'reparent', 'vitruvian', 'strength'].includes(T)) { ctx.fillStyle = 'rgba(255,255,255,.88)'; ctx.font = `${10 * dpr}px sans-serif`; ctx.fillText(bs.b.name + (T === 'vitruvian' && bs.b.vg ? ` [${bs.b.vg}]` : '') + (T === 'strength' ? ` · ${bs.b.str || 0}` : ''), bs.tip[0] + 5 * dpr, bs.tip[1] - 4 * dpr); }
+    if (S.boneLabels || isSel || ['vitruvian', 'strength'].includes(T)) {
+      const txt = bs.b.name + (T === 'vitruvian' && bs.b.vg ? ` [${bs.b.vg}]` : '') + (T === 'strength' ? ` · ${bs.b.str || 0}` : '');
+      let ang = Math.atan2(dy, dx); if (ang > Math.PI / 2) ang -= Math.PI; else if (ang < -Math.PI / 2) ang += Math.PI; // keep text upright
+      const fs = 11 * dpr, room = len - 10 * dpr;
+      ctx.save(); ctx.font = `600 ${fs}px Inter, system-ui, sans-serif`;
+      const tw = ctx.measureText(txt).width;
+      if (tw <= room) { ctx.translate(bs.base[0] + dx * 0.55, bs.base[1] + dy * 0.55); ctx.rotate(ang); } // along the bone
+      else { ctx.translate(bs.tip[0] + 6 * dpr, bs.tip[1] - 6 * dpr); } // short bone: next to its tip
+      ctx.textAlign = tw <= room ? 'center' : 'left'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+      ctx.lineWidth = 3 * dpr; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(txt, 0, 0);
+      ctx.fillStyle = isSel ? '#fff' : 'rgba(255,255,255,.92)'; ctx.fillText(txt, 0, 0); ctx.restore();
+    }
     ctx.globalAlpha = 1;
   }
-  if (T === 'force') {
+  if (T === 'force' || (T === 'bonesel' && (Stage.forceArrow || ((B.force || {}).windS && B.bones.some((b) => b.dyn && b.dyn.on))))) {
     const f = B.force || {}, c = Stage.forceArrow || null;
     let x0, y0, x1, y1;
     if (c) [x0, y0, x1, y1] = c; else { x0 = Stage.cv.width / 2; y0 = 60 * dpr; const L = Math.min(200 * dpr, ((f.windS || 0) / 1.5) * k); x1 = x0 + Math.cos((f.windA || 0) * DEG) * L; y1 = y0 + Math.sin((f.windA || 0) * DEG) * L; }
@@ -1367,9 +1379,9 @@ function hitSegment(L, sx, sy) {
 const TOOLS = {};
 const TOOL_GROUPS = [
   ['Select', ['select', 'points']],
-  ['Draw', ['pen', 'freehand', 'rect', 'ellipse', 'polygon', 'text']],
+  ['Draw', ['pen', 'freehand', 'shape', 'text']],
   ['Edit', ['curvature', 'fill']],
-  ['Bone', ['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset', 'physics', 'force']],
+  ['Bone', ['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset']],
   ['FX', ['emitter']],
   ['Camera', ['camera']],
   ['View', ['pan', 'zoom']],
@@ -1378,7 +1390,7 @@ function defTool(id, t) { TOOLS[id] = { id, ...t }; }
 // Which tools apply depends on: selected layer type + editing mode + current selection.
 // Tools never move; unavailable ones are dimmed and explain why.
 const TOOLS_ALWAYS = new Set(['select', 'text', 'emitter', 'camera', 'pan', 'zoom']);
-const TOOLS_DRAW = new Set(['pen', 'freehand', 'rect', 'ellipse', 'polygon']);
+const TOOLS_DRAW = new Set(['pen', 'freehand', 'shape', 'rect', 'ellipse', 'polygon']);
 function toolAvail(id) {
   if (TOOLS_ALWAYS.has(id)) return null;
   const L = selLayer(), T = L ? LAYER_TYPES[L.type].name : '';
@@ -1438,6 +1450,7 @@ function updateModeUI() {
   document.body.classList.toggle('setup', S.mode === 'setup');
 }
 function setTool(id) {
+  if (id === 'rect' || id === 'ellipse' || id === 'polygon') { TOOLS.shape.opts.kind = id; id = 'shape'; if (S.tool === 'shape') { renderToolOpts(); return; } }
   const why = toolAvail(id);
   if (why && id !== S.tool) { toast(why, 'err'); return; }
   if (S.tool === 'pen') finishPen();
@@ -1659,7 +1672,7 @@ function primTool(id, icon, name, key, gen) {
     up() { commitEdit(); },
   });
 }
-primTool('rect', '▭', 'Rectangle', 'R', (x, y, w, h) => [[x, y, 0], [x + w, y, 0], [x + w, y + h, 0], [x, y + h, 0]]);
+primTool('rect', '▭', 'Rectangle', '', (x, y, w, h) => [[x, y, 0], [x + w, y, 0], [x + w, y + h, 0], [x, y + h, 0]]);
 primTool('ellipse', '◯', 'Ellipse', 'E', (x, y, w, h) => {
   const cx = x + w / 2, cy = y + h / 2, out = [];
   for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; out.push([cx + (Math.cos(a) * w) / 2, cy + (Math.sin(a) * h) / 2, 1.105]); }
@@ -1669,6 +1682,16 @@ primTool('polygon', '⬠', 'Polygon / star', 'Y', (x, y, w, h) => {
   const n = clamp(S.polySides | 0, 3, 24), cx = x + w / 2, cy = y + h / 2, out = [], star = S.polyStar, m = star ? n * 2 : n;
   for (let i = 0; i < m; i++) { const a = (i / m) * Math.PI * 2 - Math.PI / 2, r = star && i % 2 ? 0.45 : 1; out.push([cx + (Math.cos(a) * w * r) / 2, cy + (Math.sin(a) * h * r) / 2, 0]); }
   return out;
+});
+
+// --- Create shape: one tool for rectangle, ellipse and polygon/star (pick the shape in the bar above)
+defTool('shape', {
+  icon: '▭', name: 'Create shape', key: 'R', cursor: 'crosshair',
+  hint: 'Pick Rectangle, Ellipse or Polygon in the bar above, then drag to draw · Shift = equal proportions · Alt = from center · E = ellipse, Y = polygon',
+  opts: { kind: 'rect' },
+  down(e, sx, sy) { TOOLS[this.opts.kind].down(e, sx, sy); },
+  move(e, sx, sy) { TOOLS[this.opts.kind].move(e, sx, sy); },
+  up(e) { TOOLS[this.opts.kind].up(e); },
 });
 
 // --- Text
@@ -1775,8 +1798,13 @@ function newBone(B, name, parent, x, y, a, len) {
 
 // 1. Select Bone
 defTool('bonesel', {
-  icon: BIC.bonesel, name: 'Select bone', key: 'S', cursor: 'pointer', hint: 'Click a bone to select it · Shift-click adds more · its name, limits, strength and physics appear in Properties',
-  down(e, sx, sy) { const B = activeBoneLayer(), hb = hitBone(B, sx, sy); selectBone(hb && hb.id, e.shiftKey); if (hb && currentTab !== 'props') setTab('props'); },
+  icon: BIC.bonesel, name: 'Select bone', key: 'S', cursor: 'pointer', hint: 'Click a bone to select it · Shift-click adds more · rename it, recolour it and turn on physics in the bar above · drag on empty space to set the wind for bones with physics',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy); selectBone(hb && hb.id, e.shiftKey); if (hb && currentTab !== 'props') setTab('props');
+    if (!hb && B && B.bones.some((b) => b.dyn && b.dyn.on)) startDrag(e, { B, k: M.scaleOf(lcOf(B).full), wind: true });
+  },
+  move(e, sx, sy) { const d = Stage.drag; if (!d || !d.wind) return; if (!d.began) { beginEdit('Wind force'); d.began = true; } TOOLS.force.move(e, sx, sy); },
+  up() { const d = Stage.drag; Stage.forceArrow = null; if (d && d.began) commitEdit(); },
 });
 // 2. Add Bone
 defTool('boneadd', {
@@ -2272,10 +2300,11 @@ function renderToolOpts() {
     <label title="New-shape stroke"><input type="checkbox" data-o="strokeOn" ${ns.strokeOn ? 'checked' : ''}>Stroke <input type="color" data-o="stroke" value="${ns.stroke}"></label>
     <label>Width <input type="number" data-o="width" value="${ns.width}" min="0" step="0.5"></label>`;
   let opts = '';
-  if (['pen', 'freehand', 'rect', 'ellipse', 'polygon', 'fill'].includes(S.tool)) opts += styleCtl;
+  if (S.tool === 'shape') opts += '<span class="seg shapepick">' + [['rect', 'Rectangle'], ['ellipse', 'Ellipse'], ['polygon', 'Polygon / star']].map(([k, n]) => `<button class="btn ${TOOLS.shape.opts.kind === k ? 'on' : ''}" data-shape="${k}" title="${n}">${TOOL_ICONS[k]}${n}</button>`).join('') + '</span>';
+  if (['pen', 'freehand', 'shape', 'rect', 'ellipse', 'polygon', 'fill'].includes(S.tool)) opts += styleCtl;
   if (S.tool === 'pen') opts += `<label><input type="checkbox" data-pen="smooth" ${TOOLS.pen.opts.smooth ? 'checked' : ''}>Smooth points</label><button class="btn" id="penDone">Finish path ⏎</button>`;
   if (S.tool === 'freehand') opts += `<label>Simplify <input type="range" min="0" max="12" step="1" data-g="freehandSmooth" value="${S.freehandSmooth}"></label>`;
-  if (S.tool === 'polygon') opts += `<label>Sides <input type="number" min="3" max="24" data-g="polySides" value="${S.polySides}"></label><label><input type="checkbox" data-g="polyStar" ${S.polyStar ? 'checked' : ''}>Star</label>`;
+  if (S.tool === 'polygon' || (S.tool === 'shape' && TOOLS.shape.opts.kind === 'polygon')) opts += `<label>Sides <input type="number" min="3" max="24" data-g="polySides" value="${S.polySides}"></label><label><input type="checkbox" data-g="polyStar" ${S.polyStar ? 'checked' : ''}>Star</label>`;
   const Bt = activeBoneLayer(), sb = Bt && boneOf(Bt, S.selBone);
   if (S.tool === 'bonemanip') opts += `<label><input type="checkbox" data-g="ikMode" ${S.ikMode ? 'checked' : ''}>IK (drag pulls parents)</label><span class="chip">Alt = rotate one bone · Shift = move</span>${S.mode === 'setup' ? '<span class="chip warn">Setup: testing only — the pose snaps back</span>' : ''}`;
   if (S.tool === 'strength') opts += sb ? `<label>Strength of <b>${esc(sb.name)}</b> <input type="number" min="0" data-bopt="str" value="${sb.str || 0}"></label><button class="btn" data-ctx="strauto">Auto (45% of length)</button><button class="btn" data-ctx="strzero">Off</button>` : '<span class="chip">Drag sideways on a bone</span>';
@@ -2288,6 +2317,13 @@ function renderToolOpts() {
   if (S.tool === 'offset' && Bt) opts += `<span class="chip">${Bt.bones.filter((b) => b.ox || b.oy).length} bone(s) offset</span><button class="btn" data-ctx="offreset">Reset all offsets</button>`;
   if (S.tool === 'physics') opts += sb ? `<label><input type="checkbox" data-dyn="on" ${sb.dyn && sb.dyn.on ? 'checked' : ''}>Physics on <b>${esc(sb.name)}</b></label>${sb.dyn && sb.dyn.on ? `<label>Spring <input type="number" min="1" data-dyn="spring" value="${sb.dyn.spring ?? 60}"></label><label>Damping <input type="number" min="0" step="0.5" data-dyn="damp" value="${sb.dyn.damp ?? 11}"></label><label>Inertia <input type="number" min="0" step="0.1" data-dyn="inertia" value="${sb.dyn.inertia ?? 0.6}"></label><label><input type="checkbox" data-dyn="lockTip" ${sb.dyn.lockTip ? 'checked' : ''}>Stiff (return to neutral faster)</label>` : ''}` : '<span class="chip">Click a bone</span>';
   if (S.tool === 'force' && Bt) { const fo = Bt.force || {}; opts += `<label>Wind <input type="number" min="0" data-force="windS" value="${fo.windS || 0}"></label><label>Direction° <input type="number" data-force="windA" value="${fo.windA || 0}"></label><label>Turbulence <input type="number" min="0" max="3" step="0.1" data-force="turb" value="${fo.turb || 0}"></label><label>Gravity <input type="number" min="0" data-force="gravS" value="${fo.gravS || 0}"></label><label>Direction° <input type="number" data-force="gravA" value="${fo.gravA ?? 90}"></label>`; }
+  if (S.tool === 'bonesel' && Bt) {
+    if (sb) opts += `<label>Name <input type="text" data-bname value="${esc(sb.name)}" style="width:110px" title="Rename the bone (the label on the bone uses this name)"></label><label>Colour <input type="color" data-bcolor value="${sb.color && sb.color[0] === '#' ? sb.color : '#6e8cff'}"></label>${sb.color ? '<button class="btn" data-ctx="bcolreset" title="Back to the default bone colour">Reset colour</button>' : ''}`;
+    else opts += '<span class="chip">Click a bone to rename, recolour or give it physics</span>';
+    opts += `<label title="Show each bone's name on the bone"><input type="checkbox" data-ctx="blabels" ${S.boneLabels ? 'checked' : ''}>Labels</label>`;
+    if (sb) opts += '<span class="sep"></span><span class="chip">Physics</span>' + sb ? `<label><input type="checkbox" data-dyn="on" ${sb.dyn && sb.dyn.on ? 'checked' : ''}>Physics on <b>${esc(sb.name)}</b></label>${sb.dyn && sb.dyn.on ? `<label>Spring <input type="number" min="1" data-dyn="spring" value="${sb.dyn.spring ?? 60}"></label><label>Damping <input type="number" min="0" step="0.5" data-dyn="damp" value="${sb.dyn.damp ?? 11}"></label><label>Inertia <input type="number" min="0" step="0.1" data-dyn="inertia" value="${sb.dyn.inertia ?? 0.6}"></label><label><input type="checkbox" data-dyn="lockTip" ${sb.dyn.lockTip ? 'checked' : ''}>Stiff (return to neutral faster)</label>` : ''}` : '<span class="chip">Click a bone</span>';
+    if (Bt.bones.some((b) => b.dyn && b.dyn.on)) { opts += '<span class="sep"></span><span class="chip" title="Drag on empty stage space to set the wind">Force</span>'; const fo = Bt.force || {}; opts += `<label>Wind <input type="number" min="0" data-force="windS" value="${fo.windS || 0}"></label><label>Direction° <input type="number" data-force="windA" value="${fo.windA || 0}"></label><label>Turbulence <input type="number" min="0" max="3" step="0.1" data-force="turb" value="${fo.turb || 0}"></label><label>Gravity <input type="number" min="0" data-force="gravS" value="${fo.gravS || 0}"></label><label>Direction° <input type="number" data-force="gravA" value="${fo.gravA ?? 90}"></label>`;  }
+  }
   if (S.tool === 'bindpts') opts += `<span class="chip">${S.selPts.size} point(s) selected</span>`;
   if (S.tool === 'reparent') opts += `<span class="chip">${selectedBoneIds().length ? 'Moving: ' + esc(selectedBoneIds().map((id) => (boneOf(Bt, id) || {}).name).join(', ')) + ' → click the new parent' : 'Select bone(s) first'}</span>`;
   if (S.tool === 'emitter') opts += `<label>Preset <select id="emPreset">${Object.keys(PARTICLE_PRESETS).map((k) => `<option ${k === TOOLS.emitter.opts.preset ? 'selected' : ''}>${k}</option>`).join('')}</select></label>`;
@@ -2315,6 +2351,12 @@ function renderToolOpts() {
     el.querySelectorAll('[data-bopt]').forEach((i) => (i.onchange = () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone ' + i.dataset.bopt, () => (b[i.dataset.bopt] = Math.max(0, +i.value))); el._h = ''; }));
     el.querySelectorAll('[data-dyn]').forEach((i) => (i.onchange = () => { const b = boneOf(Bt, S.selBone); if (!b) return; edit('Bone physics', () => { b.dyn = { spring: 60, damp: 11, inertia: 0.6, ...(b.dyn || {}) }; b.dyn[i.dataset.dyn] = i.type === 'checkbox' ? i.checked : +i.value; }); el._h = ''; }));
     el.querySelectorAll('[data-force]').forEach((i) => (i.onchange = () => { edit('Force', () => { Bt.force = Bt.force || {}; Bt.force[i.dataset.force] = +i.value; }); el._h = ''; }));
+    const bn = el.querySelector('[data-bname]');
+    if (bn) { bn.onchange = () => { const b = boneOf(Bt, S.selBone), v = bn.value.trim(); if (b && v && v !== b.name) edit('Rename bone', () => (b.name = v)); el._h = ''; }; bn.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') bn.blur(); }; }
+    const bc = el.querySelector('[data-bcolor]');
+    if (bc) bc.onchange = () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone colour', () => (b.color = bc.value)); el._h = ''; };
+    on('bcolreset', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone colour', () => delete b.color); });
+    on('blabels', 'onchange', (e) => { S.boneLabels = e.target.checked; try { localStorage.setItem('popai.boneLabels', S.boneLabels ? '1' : '0'); } catch {} el._h = ''; requestDraw(); });
     el.querySelectorAll('[data-sk]').forEach((i) => (i.onchange = () => { TOOLS.sketch.opts[i.dataset.sk] = Math.max(0, +i.value); el._h = ''; }));
     on('strauto', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone strength', () => (b.str = round(b.len * 0.45))); });
     on('strzero', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone strength', () => (b.str = 0)); });
@@ -2323,6 +2365,7 @@ function renderToolOpts() {
     on('vactive', 'onchange', (e) => { const v = e.target.value; e.target.blur(); edit('Active construction', () => setVal(Bt, 'vit', v, S.frame, true)); });
     on('offreset', 'onclick', () => edit('Reset offsets', () => Bt.bones.forEach((b) => { b.ox = 0; b.oy = 0; })));
   }
+  el.querySelectorAll('[data-shape]').forEach((b) => (b.onclick = () => { TOOLS.shape.opts.kind = b.dataset.shape; el._h = ''; renderToolOpts(); }));
   const pd = $('#penDone'); if (pd) pd.onclick = () => finishPen(false);
   const ep = $('#emPreset'); if (ep) ep.onchange = () => (TOOLS.emitter.opts.preset = ep.value);
   const cr = $('#camReset'); if (cr) cr.onclick = () => edit('Reset camera', () => { const c = S.doc.camera; for (const k of ['x', 'y', 'zoom', 'roll']) setVal(c, k, k === 'zoom' ? 1 : 0); });

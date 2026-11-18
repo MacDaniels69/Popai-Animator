@@ -47,6 +47,9 @@ export const TOOL_ICONS: Record<string, string> = {
   freehand: svg(
     '<path d="M15.5 3.5l5 5L10 19l-5.5.5L5 14z"/><path d="M13.5 5.5l5 5"/>' +
     '<path class="a" d="M12.5 21c2-1.8 3.2.6 5-1s2.8.8 4-.6"/>'),
+  // Create shape: rectangle, ellipse and star together (the shape is picked in the bar above)
+  shape: svg('<rect x="2.5" y="9.5" width="11" height="11" rx="1"/><circle cx="16" cy="8" r="5.5" fill="currentColor" fill-opacity=".14"/>' +
+    '<path class="a" d="M17.5 13.6l1.3 2.5 2.8.4-2 2 .5 2.8-2.6-1.3-2.5 1.3.5-2.8-2-2 2.8-.4z" stroke-width="1.4"/>'),
   // Rectangle: box dragged corner to corner
   rect: svg('<rect x="4" y="6" width="16" height="12" rx="1"/>' + node(4, 6) + node(20, 18)),
   // Ellipse

@@ -251,3 +251,11 @@ svg.ti .af{fill:var(--icoacc)}
 .engine-badge{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid var(--line2);white-space:nowrap;font-variant-numeric:tabular-nums;cursor:default}
 .engine-badge.rust{color:#bfe9cf;border-color:#5ccf8a66}
 .engine-badge.legacy{color:#ffd166;border-color:#ffd16666}
+
+/* Create shape: shape picker in the tool bar */
+#toolopts .shapepick{display:inline-flex;gap:2px}
+#toolopts .shapepick .btn{display:inline-flex;align-items:center;gap:4px}
+#toolopts .shapepick .btn svg{width:16px;height:16px}
+#toolopts .shapepick .btn.on{background:var(--acc);color:#1b1206;border-color:var(--acc2)}
+#toolopts .shapepick .btn.on svg.ti .a{stroke:#1b1206}
+#toolopts .shapepick .btn.on svg.ti .af{fill:#1b1206}
