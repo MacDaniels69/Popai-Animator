@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, type ReactNode } from 'react';
 import appIcon from '../assets/popai-icon.png';
 /** Stable host surfaces. The compatibility engine owns children of the empty panels. */
 export const EditorSurface=memo(function EditorSurface(){return <>
@@ -8,4 +8,4 @@ export const EditorSurface=memo(function EditorSurface(){return <>
   <div id="tsplit" className="hsplit"/><footer id="timeline"><div id="tlbar"/><div id="tlcontext" aria-label="Timeline context"/><div id="tlwrap"><canvas id="tlcanvas"/></div></footer>
 </>;});
 export const EnginePortals=memo(function EnginePortals(){return <><div id="menuLayer"/><div id="modal"/><div id="toasts"/><input type="file" id="fileIn" hidden/></>;});
-export const MenuBar=memo(function MenuBar(){return <header id="menubar"><div className="brand"><img className="brand-icon" src={appIcon} alt="Popai Animator" title="Popai Animator"/></div><nav id="menus"/><div className="mb-right"><div className="seg" id="modeSeg" title="Setup builds geometry; Animate records keys"><button data-m="setup">⚙ Setup</button><button data-m="animate">● Animate</button></div><span id="docname" title="Project settings"/><button className="ib" id="btnUndo" title="Undo">↶</button><button className="ib" id="btnRedo" title="Redo">↷</button><button aria-label="Search commands" className="search-btn" id="btnCmd" title="Command search (Ctrl+Shift+P)">⌕</button></div></header>;});
+export const MenuBar=memo(function MenuBar({tabs}:{tabs?:ReactNode}){return <header id="menubar"><div className="brand"><img className="brand-icon" src={appIcon} alt="Popai Animator" title="Popai Animator"/></div><nav id="menus"/>{tabs}<div className="mb-right"><div className="seg" id="modeSeg" title="Setup builds geometry; Animate records keys"><button data-m="setup">⚙ Setup</button><button data-m="animate">● Animate</button></div><span id="docname" title="Project settings"/><button className="ib" id="btnUndo" title="Undo">↶</button><button className="ib" id="btnRedo" title="Redo">↷</button><button aria-label="Search commands" className="search-btn" id="btnCmd" title="Command search (Ctrl+Shift+P)">⌕</button></div></header>;});

@@ -7,6 +7,7 @@ import { EditorSurface, EnginePortals, MenuBar } from './EditorSurface';
 import { AIComposer } from './AIComposer';
 import { EffectsLab } from './EffectsLab';
 import { UnsavedCloseDialog } from './UnsavedCloseDialog';
+import { CompositionWorkspace } from '../composition/Workspace';
 function Workspace({engine,onAI,onEffects}:{engine:EngineRuntime;onAI:()=>void;onEffects:()=>void}){
   const state=useSyncExternalStore(engine.subscribe,engine.read);
   const run=(id:string)=>{void Promise.resolve().then(()=>engine.command(id)).catch(error=>engine.showMessage(error instanceof Error?error.message:String(error),true));};
@@ -23,6 +24,9 @@ export function App({engine}:{engine:EngineRuntime}){
   const [dialog,setDialog]=useState<'ai'|'effects'|null>(null),[failure,setFailure]=useState(''),[closing,setClosing]=useState(false);
   useEffect(()=>window.popaiDesktop?.onCloseRequested?.(()=>setClosing(true)),[]);
   const resolveClose=(allow:boolean)=>{setClosing(false);window.popaiDesktop?.resolveClose?.(allow);};
-  useEffect(()=>{let desktop:ReturnType<typeof connectDesktop>|undefined;try{if(window.popaiDesktop)desktop=connectDesktop(engine,window.popaiDesktop);engine.start();window.__POPAI_READY__=true;}catch(error){setFailure(error instanceof Error?error.message:String(error));}return()=>desktop?.dispose();},[engine]);
-  return <><div id="app"><MenuBar/><Workspace engine={engine} onAI={()=>setDialog('ai')} onEffects={()=>setDialog('effects')}/><EditorSurface/><Status engine={engine}/></div><EnginePortals/>{dialog==='ai'&&<AIComposer engine={engine} onClose={()=>setDialog(null)}/>} {dialog==='effects'&&<EffectsLab engine={engine} onClose={()=>setDialog(null)}/>} {failure&&<div className="platform-fatal" role="alert"><h2>The editor could not start</h2><p>{failure}</p><p>Your original projects have not been replaced.</p></div>}{closing&&<UnsavedCloseDialog name={engine.read().name} onKeepEditing={()=>resolveClose(false)} onDiscard={()=>resolveClose(true)}/>}</>;
+  useEffect(()=>{let desktop:ReturnType<typeof connectDesktop>|undefined;try{if(window.popaiDesktop)desktop=connectDesktop(engine,window.popaiDesktop);engine.start();setStarted(true);window.__POPAI_READY__=true;}catch(error){setFailure(error instanceof Error?error.message:String(error));}return()=>desktop?.dispose();},[engine]);
+  const [workspace,setWorkspace]=useState<'animation'|'composition'>('animation'),[started,setStarted]=useState(false);
+  useEffect(()=>{if(started)engine.setCompositionWorkspace(workspace==='composition');},[engine,started,workspace]);
+  const tabs=<div className="workspace-tabs" role="tablist" aria-label="Workspace"><button role="tab" aria-selected={workspace==='animation'} onClick={()=>setWorkspace('animation')} title="Draw, rig and animate">Animation</button><button role="tab" aria-selected={workspace==='composition'} disabled={!started} onClick={()=>setWorkspace('composition')} title="Compositing: footage, effects, masks, tracking and precomps">Composition</button></div>;
+  return <><div id="app" className={workspace==='composition'?'composition-open':''}><MenuBar tabs={tabs}/><Workspace engine={engine} onAI={()=>setDialog('ai')} onEffects={()=>setDialog('effects')}/><EditorSurface/><Status engine={engine}/>{started&&<CompositionWorkspace host={engine.compositionHost()} active={workspace==='composition'}/>}</div><EnginePortals/>{dialog==='ai'&&<AIComposer engine={engine} onClose={()=>setDialog(null)}/>} {dialog==='effects'&&<EffectsLab engine={engine} onClose={()=>setDialog(null)}/>} {failure&&<div className="platform-fatal" role="alert"><h2>The editor could not start</h2><p>{failure}</p><p>Your original projects have not been replaced.</p></div>}{closing&&<UnsavedCloseDialog name={engine.read().name} onKeepEditing={()=>resolveClose(false)} onDiscard={()=>resolveClose(true)}/>}</>;
 }

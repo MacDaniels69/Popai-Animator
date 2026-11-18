@@ -2039,7 +2039,7 @@ function zoomAt(sx, sy, k) {
   requestDraw();
 }
 function fitView() {
-  const r = Stage.cv.getBoundingClientRect();
+  const r = Stage.cv.getBoundingClientRect(); if (r.width < 80 || r.height < 80) return requestDraw(); // stage hidden (e.g. Composition open): keep the current view
   S.view.zoom = Math.min((r.width - 60) / S.doc.w, (r.height - 60) / S.doc.h); S.view.panX = 0; S.view.panY = 0; S.view.rot = 0; requestDraw();
 }
 
@@ -4163,6 +4163,7 @@ async function openProjectFile(file) {
 async function loadProjectJSON(txt) {
   if (typeof txt !== 'string' || txt.length > 150 * 1024 * 1024) throw new Error('Project exceeds 150 MiB import budget');
   const j = JSON.parse(txt), d = validateProject(j);
+  if (d.composition && typeof window !== 'undefined' && window.__popaiValidateComposition) window.__popaiValidateComposition(d.composition);
   if (S.dirtyDoc && !window.confirm("Replace the current unsaved project? Save it first if needed.")) return false;
   if (!d.layers || !d.camera) throw new Error('not a Popai Animator project');
   const fresh = newDoc(); for (const k in fresh) if (d[k] === undefined) d[k] = fresh[k];
@@ -4649,6 +4650,7 @@ function shortcutsDialog() {
 function keyName(e) { let k = e.key.toLowerCase(); if (k === ' ') k = 'space'; return (e.ctrlKey || e.metaKey ? 'ctrl+' : '') + (e.shiftKey && (k.length > 1 || /^[a-z0-9<>]$/.test(k)) ? 'shift+' : '') + (e.altKey ? 'alt+' : '') + k; }
 function initKeys() {
   document.addEventListener('keydown', (e) => {
+    if (window.__popaiCompositionOpen) return; // the Composition workspace has its own keys
     if ($('#modal').classList.contains('show')) return;
     const tag = document.activeElement.tagName;
     if (/INPUT|TEXTAREA|SELECT/.test(tag) && !(e.ctrlKey && /^[zsy]$/i.test(e.key))) return;
@@ -4680,6 +4682,7 @@ function initKeys() {
     }
   });
   document.addEventListener('keyup', (e) => {
+    if (window.__popaiCompositionOpen) return;
     if (e.key === ' ' && Stage.space) {
       Stage.space = false; setCursor();
       if (performance.now() - Stage.spaceT < 220 && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !$('#modal').classList.contains('show')) { if (S.tool === 'bindpts') runCmd('rig.bindpts'); else togglePlay(); }
@@ -4827,7 +4830,7 @@ function validateProject(j) {
   const finite=(v,a,b)=>typeof v==='number'&&Number.isFinite(v)&&v>=a&&v<=b;
   const safeId=v=>typeof v==='string'&&/^[a-zA-Z0-9_-]{1,120}$/.test(v);
   const safeTree=(v,depth=0)=>{if(depth>160)throw new Error('Document nesting limit');if(v&&typeof v==='object')for(const k of Object.keys(v)){if(['__proto__','prototype','constructor'].includes(k))throw new Error('Unsafe document property');safeTree(v[k],depth+1);}};safeTree(d);
-  for(const m of Object.values(d.media||{}))if(!m||!['image','audio'].includes(m.type)||typeof m.url!=='string'||!(m.url.startsWith('data:'+m.type+'/')||m.url.startsWith('data:application/octet-stream;')))throw new Error('Invalid embedded media');
+  for(const m of Object.values(d.media||{}))if(!m||!['image','audio','video'].includes(m.type)||typeof m.url!=='string'||!(m.url.startsWith('data:'+m.type+'/')||m.url.startsWith('data:application/octet-stream;')))throw new Error('Invalid embedded media');
   if(!Array.isArray(d.styles)||!Array.isArray(d.palette)||!Array.isArray(d.markers))throw new Error('Invalid document collections');
   for(const s of d.styles)if(!safeId(s.id)||!isColor(s.fill)||!isColor(s.stroke)||!finite(s.width,0,10000))throw new Error('Invalid shared style');
   for(const s of d.styles)if(s.defines!==undefined&&(typeof s.defines!=='object'||Array.isArray(s.defines)||Object.entries(s.defines).some(([k,v])=>!['fill','stroke','width','fillOn','strokeOn'].includes(k)||typeof v!=='boolean')))throw new Error('Invalid style definition list');
@@ -7625,5 +7628,49 @@ window.PopaiRuntime={
   applyAIPlan(token){const pending=platformPlan;if(!pending||pending.token!==token)throw Error('Generate a fresh plan');if(pending.epoch!==documentEpoch||pending.signature!==sceneSignature())throw Error('The scene changed; generate a fresh plan');const errors=pending.plan.cmds.map(validateCmd).filter(Boolean);if(errors.length)throw Error(errors.join('; '));
     const commands=pending.plan.cmds.filter(c=>c.op!=='lipsync');if(commands.length&&edit('AI: '+pending.text.slice(0,50),()=>commands.forEach(c=>applyCmd(c)))===false)throw Error('Changes were rolled back');platformPlan=null;if(pending.plan.cmds.some(c=>c.op==='lipsync'))openLipSync();platformNotify();},
 };
+
+/* ---------- Composition workspace (compositing mode) ----------
+   The React Composition workspace reaches the editor only through this host. It never repurposes
+   Animation channels: composition data lives in S.doc.composition, media in S.doc.media. */
+let compositionOpen=false,compositionEpoch=0;const compositionListeners=new Set();
+const compositionNotify=()=>{for(const fn of compositionListeners)fn();};
+{const draw=drawNow;drawNow=function(){if(!compositionOpen)return draw();const stage=UI.stage,timeline=UI.timeline;UI.stage=null;UI.timeline=null;try{draw();}finally{UI.stage=stage;UI.timeline=timeline;}compositionNotify();};}
+{const refresh=refreshAll;refreshAll=function(){refresh();compositionNotify();};}
+const compositionHost={
+  read:()=>({doc:S.doc,revision:REV,document:documentEpoch,frame:S.frame}),
+  subscribe:(listener)=>{compositionListeners.add(listener);return()=>{compositionListeners.delete(listener);};},
+  edit:(label,change)=>{const ok=edit(label,()=>{change(S.doc);if(S.doc.composition&&window.__popaiValidateComposition)window.__popaiValidateComposition(S.doc.composition);});if(ok===false)throw Error(label+' was not applied');compositionNotify();},
+  evaluate:(channel,frame)=>evalChannel(channel,frame),
+  renderSource:async(frame,layer)=>{
+    if(layer&&!findLayer(layer))throw Error('The referenced Animation layer no longer exists');
+    const c=document.createElement('canvas');c.width=S.doc.w;c.height=S.doc.h;
+    renderScene(c.getContext('2d'),frame,M.t(c.width/2,c.height/2),{export:true,...(layer?{only:layer}:{})});
+    return c;
+  },
+  applyEffect:(canvas,effect,frame)=>{const def=FX[effect.type];if(!def)throw Error('Unsupported effect '+effect.type);const ctx=canvas.getContext('2d');ctx.save();
+    try{def.apply(canvas,effect.p,1,{f:frame,view:M.I(),W:canvas.width,H:canvas.height,vs:1,export:true,noTrail:true},{p:{},ch:{},fx:[]},{});}finally{ctx.restore();}},
+  command:(id)=>runCmd(id),
+  pause:()=>{if(S.playing)stopPlay();},
+  download:(blob,name)=>download(blob,name),
+  zip:(files)=>makeZip(files),
+};
+Object.assign(window.PopaiRuntime,{
+  compositionHost(){return compositionHost;},
+  setCompositionWorkspace(active){
+    const opening=!!active&&!compositionOpen,closing=!active&&compositionOpen;
+    compositionOpen=!!active;window.__popaiCompositionOpen=compositionOpen;if(compositionOpen&&S.playing)stopPlay();
+    if(opening)compositionEpoch=documentEpoch;
+    compositionNotify();
+    // A project opened while the stage was hidden was fitted to a zero-size view; fit it again now it is visible.
+    if(closing)requestAnimationFrame(()=>{if(compositionEpoch!==documentEpoch||!(S.view.zoom>0))fitView();requestDraw();});
+  },
+  /** PNG of the camera view at the playhead, for the .popai file's File Explorer thumbnail. */
+  async captureThumbnail(maxDimension=512){
+    if(!S.doc)return new Uint8Array(0);
+    const scale=Math.min(1,clamp(Number(maxDimension)||512,64,1024)/Math.max(S.doc.w,S.doc.h));
+    const c=renderFrameCanvas(S.frame,scale,false),blob=await canvasBlob(c,'image/png');
+    return blob?new Uint8Array(await blob.arrayBuffer()):new Uint8Array(0);
+  },
+});
 
 })();

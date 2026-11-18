@@ -28,9 +28,13 @@ jobs:
             . -> target
             ui/src-tauri -> target
       - name: Explorer thumbnail provider (.popai files)
+        shell: pwsh
         run: |
           cargo test --release -p popai-format -p popai-thumbnails
+          # static C runtime: Explorer can load the DLL on PCs without the Visual C++ runtime installed
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
           cargo build --release -p popai-thumbnails
+          if (-not (Test-Path target/release/popai_thumbnails.dll)) { throw "popai_thumbnails.dll was not built" }
       - name: Engine compatibility tests
         run: cargo test --release -p popai-core
       - name: Install interface packages

@@ -38,3 +38,47 @@ window.PopaiRuntime={
   applyAIPlan(token){const pending=platformPlan;if(!pending||pending.token!==token)throw Error('Generate a fresh plan');if(pending.epoch!==documentEpoch||pending.signature!==sceneSignature())throw Error('The scene changed; generate a fresh plan');const errors=pending.plan.cmds.map(validateCmd).filter(Boolean);if(errors.length)throw Error(errors.join('; '));
     const commands=pending.plan.cmds.filter(c=>c.op!=='lipsync');if(commands.length&&edit('AI: '+pending.text.slice(0,50),()=>commands.forEach(c=>applyCmd(c)))===false)throw Error('Changes were rolled back');platformPlan=null;if(pending.plan.cmds.some(c=>c.op==='lipsync'))openLipSync();platformNotify();},
 };
+
+/* ---------- Composition workspace (compositing mode) ----------
+   The React Composition workspace reaches the editor only through this host. It never repurposes
+   Animation channels: composition data lives in S.doc.composition, media in S.doc.media. */
+let compositionOpen=false,compositionEpoch=0;const compositionListeners=new Set();
+const compositionNotify=()=>{for(const fn of compositionListeners)fn();};
+{const draw=drawNow;drawNow=function(){if(!compositionOpen)return draw();const stage=UI.stage,timeline=UI.timeline;UI.stage=null;UI.timeline=null;try{draw();}finally{UI.stage=stage;UI.timeline=timeline;}compositionNotify();};}
+{const refresh=refreshAll;refreshAll=function(){refresh();compositionNotify();};}
+const compositionHost={
+  read:()=>({doc:S.doc,revision:REV,document:documentEpoch,frame:S.frame}),
+  subscribe:(listener)=>{compositionListeners.add(listener);return()=>{compositionListeners.delete(listener);};},
+  edit:(label,change)=>{const ok=edit(label,()=>{change(S.doc);if(S.doc.composition&&window.__popaiValidateComposition)window.__popaiValidateComposition(S.doc.composition);});if(ok===false)throw Error(label+' was not applied');compositionNotify();},
+  evaluate:(channel,frame)=>evalChannel(channel,frame),
+  renderSource:async(frame,layer)=>{
+    if(layer&&!findLayer(layer))throw Error('The referenced Animation layer no longer exists');
+    const c=document.createElement('canvas');c.width=S.doc.w;c.height=S.doc.h;
+    renderScene(c.getContext('2d'),frame,M.t(c.width/2,c.height/2),{export:true,...(layer?{only:layer}:{})});
+    return c;
+  },
+  applyEffect:(canvas,effect,frame)=>{const def=FX[effect.type];if(!def)throw Error('Unsupported effect '+effect.type);const ctx=canvas.getContext('2d');ctx.save();
+    try{def.apply(canvas,effect.p,1,{f:frame,view:M.I(),W:canvas.width,H:canvas.height,vs:1,export:true,noTrail:true},{p:{},ch:{},fx:[]},{});}finally{ctx.restore();}},
+  command:(id)=>runCmd(id),
+  pause:()=>{if(S.playing)stopPlay();},
+  download:(blob,name)=>download(blob,name),
+  zip:(files)=>makeZip(files),
+};
+Object.assign(window.PopaiRuntime,{
+  compositionHost(){return compositionHost;},
+  setCompositionWorkspace(active){
+    const opening=!!active&&!compositionOpen,closing=!active&&compositionOpen;
+    compositionOpen=!!active;window.__popaiCompositionOpen=compositionOpen;if(compositionOpen&&S.playing)stopPlay();
+    if(opening)compositionEpoch=documentEpoch;
+    compositionNotify();
+    // A project opened while the stage was hidden was fitted to a zero-size view; fit it again now it is visible.
+    if(closing)requestAnimationFrame(()=>{if(compositionEpoch!==documentEpoch||!(S.view.zoom>0))fitView();requestDraw();});
+  },
+  /** PNG of the camera view at the playhead, for the .popai file's File Explorer thumbnail. */
+  async captureThumbnail(maxDimension=512){
+    if(!S.doc)return new Uint8Array(0);
+    const scale=Math.min(1,clamp(Number(maxDimension)||512,64,1024)/Math.max(S.doc.w,S.doc.h));
+    const c=renderFrameCanvas(S.frame,scale,false),blob=await canvasBlob(c,'image/png');
+    return blob?new Uint8Array(await blob.arrayBuffer()):new Uint8Array(0);
+  },
+});

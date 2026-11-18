@@ -300,6 +300,7 @@ function shortcutsDialog() {
 function keyName(e) { let k = e.key.toLowerCase(); if (k === ' ') k = 'space'; return (e.ctrlKey || e.metaKey ? 'ctrl+' : '') + (e.shiftKey && (k.length > 1 || /^[a-z0-9<>]$/.test(k)) ? 'shift+' : '') + (e.altKey ? 'alt+' : '') + k; }
 function initKeys() {
   document.addEventListener('keydown', (e) => {
+    if (window.__popaiCompositionOpen) return; // the Composition workspace has its own keys
     if ($('#modal').classList.contains('show')) return;
     const tag = document.activeElement.tagName;
     if (/INPUT|TEXTAREA|SELECT/.test(tag) && !(e.ctrlKey && /^[zsy]$/i.test(e.key))) return;
@@ -331,6 +332,7 @@ function initKeys() {
     }
   });
   document.addEventListener('keyup', (e) => {
+    if (window.__popaiCompositionOpen) return;
     if (e.key === ' ' && Stage.space) {
       Stage.space = false; setCursor();
       if (performance.now() - Stage.spaceT < 220 && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !$('#modal').classList.contains('show')) { if (S.tool === 'bindpts') runCmd('rig.bindpts'); else togglePlay(); }

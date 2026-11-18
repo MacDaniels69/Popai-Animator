@@ -1,7 +1,7 @@
 {
   "name": "popai-animator",
   "productName": "Popai Animator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Popai animation editor \u2014 TypeScript, React and Tauri (Rust)",

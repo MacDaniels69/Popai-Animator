@@ -71,3 +71,12 @@ body.in-action #tlAction{padding:4px 8px;border-radius:2px;font-size:11px}
 
 /* brand */
 #menubar .brand-icon{width:24px;height:24px;display:block;border-radius:5px}
+
+/* Composition workspace (compositing mode): replaces the animation panels, keeps the menu bar */
+#app.composition-open{grid-template-rows:36px minmax(0,1fr)!important}
+#app.composition-open>:not(#menubar):not(#composition-workspace){display:none!important}
+#app.composition-open #modeSeg,#app.composition-open #menus{display:none}
+#menubar .workspace-tabs{display:flex;align-self:stretch;gap:2px;margin:0 8px 0 auto}
+#menubar .workspace-tabs button{border:0;border-bottom:2px solid transparent;background:none;color:var(--dim,#9aa3b2);padding:0 12px;cursor:pointer;font:inherit}
+#menubar .workspace-tabs button[aria-selected="true"]{border-bottom-color:var(--acc,#ff8a3d);color:var(--txt,#e6e9ef)}
+#menubar .workspace-tabs button:disabled{opacity:.4;cursor:default}

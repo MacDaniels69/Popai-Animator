@@ -1130,7 +1130,7 @@ function zoomAt(sx, sy, k) {
   requestDraw();
 }
 function fitView() {
-  const r = Stage.cv.getBoundingClientRect();
+  const r = Stage.cv.getBoundingClientRect(); if (r.width < 80 || r.height < 80) return requestDraw(); // stage hidden (e.g. Composition open): keep the current view
   S.view.zoom = Math.min((r.width - 60) / S.doc.w, (r.height - 60) / S.doc.h); S.view.panX = 0; S.view.panY = 0; S.view.rot = 0; requestDraw();
 }
 

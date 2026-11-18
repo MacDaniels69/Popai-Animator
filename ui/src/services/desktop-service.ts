@@ -3,12 +3,15 @@ export function connectDesktop(engine:EngineRuntime,desktop:DesktopBridge){
   let saving:Promise<void>|null=null,recovering=false,lastSignature='',lastMeta='',disposed=false;
   const save=(saveAs=false)=>{
     if(saving)return saving;
-    saving=(async()=>{const capture=engine.captureSave(),result=await desktop.saveProject({...capture,saveAs});if(result.canceled)return;
+    saving=(async()=>{const capture=engine.captureSave();let thumbnail:Uint8Array|undefined;try{thumbnail=await engine.captureThumbnail();}catch{thumbnail=undefined;}const result=await desktop.saveProject({...capture,saveAs,thumbnail});if(result.canceled)return;
       const current=engine.acknowledgeSave(capture);engine.showMessage(current?'Project saved':'Saved captured version; newer edits are still unsaved');})().finally(()=>{saving=null;});return saving;
   };
   engine.setSaveHandler(()=>save());
-  engine.setOpenHandler(async()=>{const opened=await desktop.openProject();if(opened.canceled)return;
-    if(await engine.openProject(opened.text)){await desktop.bindOpenedProject({documentId:engine.read().documentId,openToken:opened.openToken});lastSignature='';engine.showMessage('Opened '+opened.name);}});
+  const openFrom=async(opened:Awaited<ReturnType<DesktopBridge['openProject']>>)=>{if(opened.canceled)return;
+    if(await engine.openProject(opened.text)){await desktop.bindOpenedProject({documentId:engine.read().documentId,openToken:opened.openToken});lastSignature='';engine.showMessage('Opened '+opened.name);}};
+  engine.setOpenHandler(async()=>openFrom(await desktop.openProject()));
+  // A .popai file double-clicked in File Explorer starts the app with that file.
+  if(desktop.startupProject)void desktop.startupProject().then(openFrom).catch(error=>engine.showMessage('Could not open the project: '+(error instanceof Error?error.message:String(error)),true));
   const unsubscribe=engine.subscribe(()=>{const s=engine.read(),meta=JSON.stringify([s.dirty,s.name]);if(meta!==lastMeta){lastMeta=meta;desktop.setDirty({dirty:s.dirty,name:s.name});}});
   const nativeCommands=desktop.onCommand(command=>{void(async()=>{try{
     if(command==='file.saveas')await save(true);

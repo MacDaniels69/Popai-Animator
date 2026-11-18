@@ -85,6 +85,7 @@ async function openProjectFile(file) {
 async function loadProjectJSON(txt) {
   if (typeof txt !== 'string' || txt.length > 150 * 1024 * 1024) throw new Error('Project exceeds 150 MiB import budget');
   const j = JSON.parse(txt), d = validateProject(j);
+  if (d.composition && typeof window !== 'undefined' && window.__popaiValidateComposition) window.__popaiValidateComposition(d.composition);
   if (S.dirtyDoc && !window.confirm("Replace the current unsaved project? Save it first if needed.")) return false;
   if (!d.layers || !d.camera) throw new Error('not a Popai Animator project');
   const fresh = newDoc(); for (const k in fresh) if (d[k] === undefined) d[k] = fresh[k];

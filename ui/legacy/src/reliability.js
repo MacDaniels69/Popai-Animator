@@ -112,7 +112,7 @@ function validateProject(j) {
   const finite=(v,a,b)=>typeof v==='number'&&Number.isFinite(v)&&v>=a&&v<=b;
   const safeId=v=>typeof v==='string'&&/^[a-zA-Z0-9_-]{1,120}$/.test(v);
   const safeTree=(v,depth=0)=>{if(depth>160)throw new Error('Document nesting limit');if(v&&typeof v==='object')for(const k of Object.keys(v)){if(['__proto__','prototype','constructor'].includes(k))throw new Error('Unsafe document property');safeTree(v[k],depth+1);}};safeTree(d);
-  for(const m of Object.values(d.media||{}))if(!m||!['image','audio'].includes(m.type)||typeof m.url!=='string'||!(m.url.startsWith('data:'+m.type+'/')||m.url.startsWith('data:application/octet-stream;')))throw new Error('Invalid embedded media');
+  for(const m of Object.values(d.media||{}))if(!m||!['image','audio','video'].includes(m.type)||typeof m.url!=='string'||!(m.url.startsWith('data:'+m.type+'/')||m.url.startsWith('data:application/octet-stream;')))throw new Error('Invalid embedded media');
   if(!Array.isArray(d.styles)||!Array.isArray(d.palette)||!Array.isArray(d.markers))throw new Error('Invalid document collections');
   for(const s of d.styles)if(!safeId(s.id)||!isColor(s.fill)||!isColor(s.stroke)||!finite(s.width,0,10000))throw new Error('Invalid shared style');
   for(const s of d.styles)if(s.defines!==undefined&&(typeof s.defines!=='object'||Array.isArray(s.defines)||Object.entries(s.defines).some(([k,v])=>!['fill','stroke','width','fillOn','strokeOn'].includes(k)||typeof v!=='boolean')))throw new Error('Invalid style definition list');

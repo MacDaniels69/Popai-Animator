@@ -17,12 +17,19 @@ export interface EngineRuntime {
   loadDemo(): void;
   planAI(text: string): Promise<AIPlanPreview>;
   applyAIPlan(token: string): void;
+  /** Composition workspace host (compositing mode). */
+  compositionHost(): import('../composition/model').EditorHost;
+  setCompositionWorkspace(active: boolean): void;
+  /** PNG of the camera view at the playhead, stored in .popai files for File Explorer thumbnails. */
+  captureThumbnail(maxDimension?: number): Promise<Uint8Array>;
 }
 export interface DesktopBridge {
   info(): Promise<{ version: string; platform: string }>;
   openProject(): Promise<{ canceled: true } | { canceled: false; name: string; text: string; openToken: string }>;
   bindOpenedProject(input: { documentId: string; openToken: string }): Promise<void>;
-  saveProject(input: { documentId: string; name: string; text: string; saveAs?: boolean }): Promise<{ canceled: boolean; name?: string }>;
+  saveProject(input: { documentId: string; name: string; text: string; saveAs?: boolean; thumbnail?: Uint8Array }): Promise<{ canceled: boolean; name?: string }>;
+  /** A project Windows asked the app to open (double-clicked .popai file). */
+  startupProject?(): Promise<{ canceled: true } | { canceled: false; name: string; text: string; openToken: string }>;
   saveVideo?(input: { name: string; bytes: Uint8Array }): Promise<{ canceled: boolean; name?: string }>;
   writeRecovery(input: { documentId: string; text: string }): Promise<void>;
   readRecovery(): Promise<string | null>;
