@@ -23,6 +23,9 @@ pub struct ShapeOut {
     #[serde(rename = "strokeOn")]
     pub stroke_on: bool,
     pub subpaths: Vec<SubPath>,
+    /// Liquid shape group: {"g": group id, "op": "combine" | "subtract" | "intersect"}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lq: Option<serde_json::Value>,
 }
 #[derive(Serialize, Debug, Clone)]
 pub struct ImageOut {

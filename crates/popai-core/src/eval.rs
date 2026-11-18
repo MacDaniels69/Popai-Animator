@@ -486,7 +486,7 @@ impl<'a> Eval<'a> {
         }
         out
     }
-    fn trace(&self, l: &Layer, path: &crate::model::Path, pp: &BTreeMap<String, [f64; 2]>) -> Option<SubPath> {
+    fn trace(&self, l: &Layer, path: &crate::model::Path, pp: &BTreeMap<String, [f64; 2]>, f: f64) -> Option<SubPath> {
         let ids: Vec<&String> = path.pts.iter().filter(|id| pp.contains_key(*id)).collect();
         let n = ids.len() as isize;
         if n < 2 {
@@ -505,14 +505,35 @@ impl<'a> Eval<'a> {
         let cv = |i: isize| pts.get(ids[idx(i)]).and_then(|p| p.c).unwrap_or(1.0);
         let segs_n = if closed { n } else { n - 1 };
         let mut segs = Vec::with_capacity(segs_n as usize);
+        // explicit Bézier handles (point offsets) override the automatic curvature on their side
+        let handles = |i: isize| -> Option<Vec<f64>> {
+            let id = ids[idx(i)];
+            match val(l, &format!("ph:{id}"), f) {
+                Val::Arr(v) if v.len() == 4 => Some(v),
+                _ => None,
+            }
+        };
         for i in 0..segs_n {
             let (a, b, c, d) = (get(i - 1), get(i), get(i + 1), get(i + 2));
             let (k1, k2) = (cv(i) / 6.0, cv(i + 1) / 6.0);
-            if k1 == 0.0 && k2 == 0.0 {
-                segs.push(vec![c[0], c[1]]);
-            } else {
-                segs.push(vec![b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1, c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2, c[0], c[1]]);
+            let (hb, hc) = (handles(i), handles(i + 1));
+            if hb.is_none() && hc.is_none() {
+                if k1 == 0.0 && k2 == 0.0 {
+                    segs.push(vec![c[0], c[1]]);
+                } else {
+                    segs.push(vec![b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1, c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2, c[0], c[1]]);
+                }
+                continue;
             }
+            let c1 = match &hb {
+                Some(h) => [b[0] + h[2], b[1] + h[3]],
+                None => [b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1],
+            };
+            let c2 = match &hc {
+                Some(h) => [c[0] + h[0], c[1] + h[1]],
+                None => [c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2],
+            };
+            segs.push(vec![c1[0], c1[1], c2[0], c2[1], c[0], c[1]]);
         }
         Some(SubPath { closed, start: get(0), segs })
     }
@@ -521,16 +542,16 @@ impl<'a> Eval<'a> {
             .paths
             .iter()
             .filter_map(|pid| l.paths.as_ref().and_then(|ps| ps.iter().find(|p| &p.id == pid)))
-            .filter_map(|p| self.trace(l, p, pp))
+            .filter_map(|p| self.trace(l, p, pp, f))
             .collect();
         if let Some(st) = sh.style_id.as_deref().and_then(|id| self.doc.style(id)) {
-            return ShapeOut { fill: Some(st.fill.clone()), stroke: Some(st.stroke.clone()), width: Some(st.width), fill_on: st.fill_on, stroke_on: st.stroke_on, subpaths };
+            return ShapeOut { fill: Some(st.fill.clone()), stroke: Some(st.stroke.clone()), width: Some(st.width), fill_on: st.fill_on, stroke_on: st.stroke_on, subpaths, lq: sh.extra.get("lq").filter(|v| v.is_object()).cloned() };
         }
         let sv = |k: &str| match val(l, &format!("sh:{}:{k}", sh.id), f) {
             Val::Str(s) => Some(s),
             _ => None,
         };
-        ShapeOut { fill: sv("fill"), stroke: sv("stroke"), width: val(l, &format!("sh:{}:width", sh.id), f).num(), fill_on: sh.fill_on, stroke_on: sh.stroke_on, subpaths }
+        ShapeOut { fill: sv("fill"), stroke: sv("stroke"), width: val(l, &format!("sh:{}:width", sh.id), f).num(), fill_on: sh.fill_on, stroke_on: sh.stroke_on, subpaths, lq: sh.extra.get("lq").filter(|v| v.is_object()).cloned() }
     }
 
     // ---------------- camera ----------------

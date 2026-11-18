@@ -190,6 +190,11 @@ pub fn base_get(o: &Layer, path: &str) -> Option<Val> {
     let (kind, id, prop) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
     match kind {
         "pt" => o.pts.as_ref()?.get(id).map(|p| Val::Arr(vec![p.x, p.y])),
+        // Bézier handles of a vector point: [in x, in y, out x, out y], offsets from the point
+        "ph" => o.pts.as_ref()?.get(id).and_then(|p| p.extra.get("h")).and_then(|h| {
+            let v: Vec<f64> = h.as_array()?.iter().filter_map(|x| x.as_f64()).collect();
+            if v.len() == 4 { Some(Val::Arr(v)) } else { None }
+        }),
         "bone" => {
             let b = o.bone(id)?;
             Some(match prop {

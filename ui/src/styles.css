@@ -286,3 +286,11 @@ svg.ti .af{fill:var(--icoacc)}
 .kfp .row2{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .kfp .row2 input[type=number]{width:70px}
 .kfp span input[type=number]{width:70px}
+
+/* Select shape: shapes of the layer + liquid shapes */
+#toolopts .shapelist{display:inline-flex;gap:2px;flex-wrap:wrap;max-width:520px}
+#toolopts .shapelist .btn{display:inline-flex;align-items:center;gap:5px;padding:2px 7px}
+#toolopts .shapelist .btn.on{background:var(--acc);color:#1b1206;border-color:var(--acc2)}
+#toolopts .shapelist .sw{width:11px;height:11px;border-radius:3px;border:2px solid;display:inline-block}
+#toolopts .shapelist i{font-style:normal;font-weight:700;color:#63e6be}
+#toolopts .shapelist .btn.on i{color:#1b1206}

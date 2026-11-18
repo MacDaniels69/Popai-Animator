@@ -63,6 +63,12 @@ export const TOOL_ICONS: Record<string, string> = {
   text: svg('<path d="M5 7V4.5h14V7M12 4.5v15M9 19.5h6"/><path class="a" d="M17.5 12.5v7"/>'),
 
   // ---------- Edit ----------
+  // Select shape: a filled shape picked by the pointer
+  selshape: svg('<path d="M3.5 12.5c0-5 4-8.5 8.5-8.5 3.5 0 5.5 2 5.5 4.5" fill="currentColor" fill-opacity=".3"/><path d="M3.5 12.5c0 3.7 2.7 6.5 6.5 6.5" fill="none"/>' +
+    '<path d="M3.5 12.5c0-5 4-8.5 8.5-8.5 3.5 0 5.5 2 5.5 4.5M3.5 12.5c0 3.7 2.7 6.5 6.5 6.5"/>' + cursor(12.5, 10.5)),
+  // Create shape: a path's points getting a fill (checkered) — "make these points a shape"
+  createshape: svg('<path d="M4 18L7 5l11 2 2 11z" fill="currentColor" fill-opacity=".22"/><path d="M4 18L7 5l11 2 2 11z" stroke-dasharray="2 1.6"/>' +
+    node(4, 18, 'af') + node(7, 5, 'af') + node(18, 7, 'af') + node(20, 18, 'af') + '<path class="a" d="M11.5 9.5v6M8.5 12.5h6" stroke-width="1.8"/>'),
   // Curvature: a curve with its smoothness handle
   curvature: svg('<path d="M3 19C6 6 18 6 21 19"/><path class="a" d="M5 9.2h14"/>' + node(12, 9.2) +
     '<circle class="a" cx="5" cy="9.2" r="1.3"/><circle class="a" cx="19" cy="9.2" r="1.3"/>'),

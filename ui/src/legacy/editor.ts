@@ -187,6 +187,9 @@ const S = {
   selLayers: [], // ids, last = primary
   selPts: new Set(),
   selShape: null,
+  showBz: true, // Curvature tool: show Bézier handles of the selected points
+  fixedBz: false, // keep explicit handles unchanged when points are rotated / scaled
+  selShapes: new Set(), // Select Shape tool: several shapes (Shift-click) for Liquid Shapes
   selBone: null,
   selBones: new Set(), // multi-selection for Select Bone / Reparent
   selKeys: new Set(), // `${ownerId}|${path}|${frame}`
@@ -283,6 +286,7 @@ function baseGet(o, path) {
   if (path.indexOf(':') < 0) { const v = o.p[path]; return v === undefined && (path === 'rx' || path === 'ry') ? 0 : v; }
   const [kind, id, prop] = path.split(':');
   if (kind === 'pt') { const p = o.pts && o.pts[id]; return p ? [p.x, p.y] : undefined; }
+  if (kind === 'ph') { const p = o.pts && o.pts[id]; return p && Array.isArray(p.h) && p.h.length === 4 ? p.h : undefined; }
   if (kind === 'bone') {
     const b = o.bones && o.bones.find((b) => b.id === id); if (!b) return undefined;
     return prop === 'p' ? [b.x, b.y] : prop === 'a' ? b.a : prop === 's' ? (b.s ?? 1) : b[prop];
@@ -294,6 +298,7 @@ function baseSet(o, path, v) {
   if (path.indexOf(':') < 0) { o.p[path] = v; return; }
   const [kind, id, prop] = path.split(':');
   if (kind === 'pt') { const p = o.pts[id]; if (p) { p.x = v[0]; p.y = v[1]; } return; }
+  if (kind === 'ph') { const p = o.pts[id]; if (p) { if (Array.isArray(v) && v.length === 4) p.h = v.slice(); else delete p.h; } return; }
   if (kind === 'bone') {
     const b = o.bones.find((b) => b.id === id); if (!b) return;
     if (prop === 'p') { b.x = v[0]; b.y = v[1]; } else if (prop === 'a') b.a = v; else if (prop === 's') b.s = v; else b[prop] = v;
@@ -548,22 +553,41 @@ function deformedPts(L, f, lc) {
   }
   return out;
 }
-function tracePath(ctx, L, path, P) {
+// explicit Bézier handles of a point at frame f: [in x, in y, out x, out y] (offsets), or undefined (automatic)
+function handlesOf(L, id, f) { const v = val(L, 'ph:' + id, f); return Array.isArray(v) && v.length === 4 ? v : undefined; }
+function tracePath(ctx, L, path, P, f = S.frame) {
   const ids = path.pts.filter((id) => P[id]); const n = ids.length;
   if (n < 2) return;
   const closed = path.closed && n > 2;
-  const get = (i) => P[ids[closed ? (i + n) % n : clamp(i, 0, n - 1)]];
-  const cv = (i) => { const p = L.pts[ids[closed ? (i + n) % n : clamp(i, 0, n - 1)]]; return p && p.c !== undefined ? p.c : 1; };
+  const at = (i) => ids[closed ? (i + n) % n : clamp(i, 0, n - 1)];
+  const get = (i) => P[at(i)];
+  const cv = (i) => { const p = L.pts[at(i)]; return p && p.c !== undefined ? p.c : 1; };
   const p0 = get(0); ctx.moveTo(p0[0], p0[1]);
   const segs = closed ? n : n - 1;
   for (let i = 0; i < segs; i++) {
     const a = get(i - 1), b = get(i), c = get(i + 1), d = get(i + 2);
-    const k1 = cv(i) / 6, k2 = cv(i + 1) / 6;
-    if (k1 === 0 && k2 === 0) { ctx.lineTo(c[0], c[1]); continue; }
-    ctx.bezierCurveTo(b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1, c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2, c[0], c[1]);
+    const k1 = cv(i) / 6, k2 = cv(i + 1) / 6, hb = handlesOf(L, at(i), f), hc = handlesOf(L, at(i + 1), f);
+    if (!hb && !hc) {
+      if (k1 === 0 && k2 === 0) { ctx.lineTo(c[0], c[1]); continue; }
+      ctx.bezierCurveTo(b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1, c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2, c[0], c[1]);
+      continue;
+    }
+    const c1 = hb ? [b[0] + hb[2], b[1] + hb[3]] : [b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1];
+    const c2 = hc ? [c[0] + hc[0], c[1] + hc[1]] : [c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2];
+    ctx.bezierCurveTo(c1[0], c1[1], c2[0], c2[1], c[0], c[1]);
   }
   if (closed) ctx.closePath();
 }
+// handles a point currently has (explicit, or the automatic ones from its curvature), in layer space
+function effectiveHandles(L, id, P, f = S.frame) {
+  const h = handlesOf(L, id, f); if (h) return h.slice();
+  const pa = L.paths.find((q) => q.pts.includes(id)); if (!pa || !P[id]) return [0, 0, 0, 0];
+  const ids = pa.pts.filter((q) => P[q]), n = ids.length, j = ids.indexOf(id), closed = pa.closed && n > 2;
+  const at = (i) => P[ids[closed ? (i + n) % n : clamp(i, 0, n - 1)]];
+  const a = at(j - 1), c = at(j + 1), k = (L.pts[id].c ?? 1) / 6;
+  return [-(c[0] - a[0]) * k, -(c[1] - a[1]) * k, (c[0] - a[0]) * k, (c[1] - a[1]) * k];
+}
+function clearHandles(L, id) { delete L.pts[id].h; delete L.ch['ph:' + id]; }
 function shapeStyle(L, sh, f) {
   const st = sh.styleId && S.doc.styles.find((s) => s.id === sh.styleId);
   if (st) return { fill: st.fill, stroke: st.stroke, width: st.width, fillOn: st.fillOn, strokeOn: st.strokeOn, from: st.name };
@@ -699,6 +723,55 @@ function fxDefaults(type) { const p = {}; for (const [k, d] of Object.entries(FX
 function fxParamsAt(L, e, f) { const p = {}; for (const k in e.p) p[k] = val(L, 'fx:' + e.id + ':' + k, f); return p; }
 
 // ---------- scene rendering ----------
+// ---------- shape painting (shared by both renderers), incl. Liquid Shapes ----------
+// items: { trace(ctx), fill, stroke, width, fillOn, strokeOn, lq }
+// A liquid group (shapes sharing lq.g) is drawn where its lowest shape is, in that shape's style:
+//   combine = union of all members · subtract = lowest minus the others · intersect = lowest ∩ (union of others).
+// Outlines follow the combined outline (drawn at double width, then the inner half covered), so cuts get an edge too.
+function paintShapes(ctx, items) {
+  const done = new Set();
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i], g = it.lq && it.lq.g;
+    if (!g) { paintOne(ctx, it); continue; }
+    if (done.has(g)) continue; done.add(g);
+    const mem = items.filter((q) => q.lq && q.lq.g === g);
+    if (mem.length < 2) { paintOne(ctx, it); continue; }
+    paintLiquid(ctx, mem, it.lq.op || 'combine');
+  }
+}
+function paintOne(ctx, it) {
+  ctx.beginPath(); it.trace(ctx);
+  if (it.fillOn) { ctx.fillStyle = it.fill; ctx.fill('evenodd'); }
+  if (it.strokeOn && it.width > 0) { ctx.lineWidth = it.width; ctx.strokeStyle = it.stroke; ctx.stroke(); }
+}
+function paintLiquid(ctx, mem, op) {
+  const base = mem[0], others = mem.slice(1), w = base.strokeOn && base.width > 0 ? base.width : 0, T = ctx.getTransform();
+  const off = Pool.get(ctx.canvas.width, ctx.canvas.height), o = off.getContext('2d');
+  o.setTransform(T); o.lineJoin = 'round'; o.lineCap = 'round'; o.globalCompositeOperation = 'source-over'; o.globalAlpha = 1;
+  const path = (list) => { o.beginPath(); for (const q of list) q.trace(o); };
+  const fillEach = (list, style) => { o.fillStyle = style; for (const q of list) { o.beginPath(); q.trace(o); o.fill('evenodd'); } };
+  const strokeEach = (list, style, lw) => { o.strokeStyle = style; o.lineWidth = lw; for (const q of list) { o.beginPath(); q.trace(o); o.stroke(); } };
+  if (op === 'combine') {
+    if (w) strokeEach(mem, base.stroke, 2 * w);
+    if (base.fillOn) fillEach(mem, base.fill); else { o.globalCompositeOperation = 'destination-out'; fillEach(mem, '#000'); }
+  } else if (op === 'subtract') {
+    if (w) strokeEach([base], base.stroke, 2 * w);
+    if (base.fillOn) fillEach([base], base.fill); else { o.globalCompositeOperation = 'destination-out'; fillEach([base], '#000'); o.globalCompositeOperation = 'source-over'; }
+    if (w) { o.save(); path([base]); o.clip('evenodd'); strokeEach(others, base.stroke, 2 * w); o.restore(); }
+    o.globalCompositeOperation = 'destination-out'; fillEach(others, '#000');
+  } else { // intersect
+    const fat = (list, style) => { fillEach(list, style); if (w) strokeEach(list, style, 2 * w); };
+    fat([base], w ? base.stroke : base.fill);
+    o.globalCompositeOperation = 'destination-in';
+    const tmp = Pool.get(off.width, off.height), t = tmp.getContext('2d'); t.setTransform(T); t.lineJoin = 'round';
+    for (const q of others) { t.beginPath(); q.trace(t); t.fillStyle = '#000'; t.fill('evenodd'); if (w) { t.lineWidth = 2 * w; t.strokeStyle = '#000'; t.stroke(); } }
+    o.setTransform(1, 0, 0, 1, 0, 0); o.drawImage(tmp, 0, 0); o.setTransform(T); Pool.put(tmp);
+    o.globalCompositeOperation = base.fillOn ? 'source-over' : 'destination-out';
+    o.save(); path([base]); o.clip('evenodd'); fillEach(others, base.fill); o.restore();
+  }
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(off, 0, 0); ctx.restore();
+  Pool.put(off);
+}
 function legacyRenderScene(ctx, f, view, opts = {}) {
   const R = {
     f, view, cam: camFn(f), rec: opts.rec || null, export: !!opts.export, W: ctx.canvas.width, H: ctx.canvas.height,
@@ -829,16 +902,13 @@ function drawNodeContent(ctx, n, R, full) {
   switch (n.kind) {
     case 'vector': {
       M.set(ctx, full); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      for (const sh of n.shapes || []) {
-        ctx.beginPath();
+      paintShapes(ctx, (n.shapes || []).map((sh) => ({ ...sh, trace: (c) => {
         for (const sp of sh.subpaths) {
-          ctx.moveTo(sp.start[0], sp.start[1]);
-          for (const g of sp.segs) g.length === 2 ? ctx.lineTo(g[0], g[1]) : ctx.bezierCurveTo(g[0], g[1], g[2], g[3], g[4], g[5]);
-          if (sp.closed) ctx.closePath();
+          c.moveTo(sp.start[0], sp.start[1]);
+          for (const g of sp.segs) g.length === 2 ? c.lineTo(g[0], g[1]) : c.bezierCurveTo(g[0], g[1], g[2], g[3], g[4], g[5]);
+          if (sp.closed) c.closePath();
         }
-        if (sh.fillOn) { ctx.fillStyle = sh.fill; ctx.fill('evenodd'); }
-        if (sh.strokeOn && sh.width > 0) { ctx.lineWidth = sh.width; ctx.strokeStyle = sh.stroke; ctx.stroke(); }
-      }
+      } })));
       break;
     }
     case 'image': {
@@ -910,13 +980,10 @@ function drawContent(ctx, L, R, lc) {
       const P = (lc.P = deformedPts(L, R.f, lc));
       M.set(ctx, full);
       ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      for (const sh of L.shapes) {
+      paintShapes(ctx, L.shapes.map((sh) => {
         const st = shapeStyle(L, sh, R.f);
-        ctx.beginPath();
-        for (const pid of sh.paths) { const path = L.paths.find((p) => p.id === pid); if (path) tracePath(ctx, L, path, P); }
-        if (st.fillOn) { ctx.fillStyle = st.fill; ctx.fill('evenodd'); }
-        if (st.strokeOn && st.width > 0) { ctx.lineWidth = st.width; ctx.strokeStyle = st.stroke; ctx.stroke(); }
-      }
+        return { ...st, lq: sh.lq, trace: (c) => { for (const pid of sh.paths) { const path = L.paths.find((p) => p.id === pid); if (path) tracePath(c, L, path, P, R.f); } } };
+      }));
       break;
     }
     case 'image': {
@@ -1329,10 +1396,16 @@ function drawHandles(ctx, bb, color = '#ff8a3d') {
     ctx.fill(); ctx.stroke();
   }
 }
-const POINT_TOOLS = new Set(['points', 'pen', 'curvature', 'freehand', 'fill', 'shape', 'rect', 'ellipse', 'polygon']);
+const POINT_TOOLS = new Set(['createshape', 'points', 'pen', 'curvature', 'freehand', 'fill', 'shape', 'rect', 'ellipse', 'polygon']);
 const BONE_TOOLS = new Set(['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset', 'physics', 'force']);
 function drawOverlays(ctx) {
+  Stage.bzh = [];
   const dpr = Stage.dpr, sel = selLayer();
+  if (S.tool === 'createshape' && sel) { const plan = createShapePlan(sel); if (plan) {
+    const e = lcOf(sel); M.set(ctx, e.full); ctx.beginPath(); for (const pa of plan.paths) tracePath(ctx, sel, pa, e.P);
+    ctx.setTransform(1, 0, 0, 1, 0, 0); if (plan.fill) { ctx.fillStyle = hatchPattern(ctx); ctx.fill('evenodd'); }
+    ctx.strokeStyle = plan.stroke ? '#ffd166' : 'rgba(255,209,102,.5)'; ctx.lineWidth = (plan.stroke ? 3 : 1.5) * dpr; ctx.stroke();
+  } }
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.lineJoin = 'round';
   // motion path of selected layer
   if (sel && S.showPaths && (S.tool === 'select' || S.tool === 'bonemanip') && Object.keys(sel.ch).some((k) => k === 'x' || k === 'y')) {
@@ -1358,9 +1431,22 @@ function drawOverlays(ctx) {
       M.set(ctx, e.full);
       ctx.beginPath(); for (const path of L.paths) tracePath(ctx, L, path, e.P);
       ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = showPts ? 'rgba(80,160,255,.95)' : 'rgba(80,160,255,.45)'; ctx.lineWidth = 1 * dpr; ctx.stroke();
-      if (S.selShape) {
-        const sh = L.shapes.find((s) => s.id === S.selShape);
+      for (const sid of selShapeIds()) {
+        const sh = L.shapes.find((s) => s.id === sid);
         if (sh) { M.set(ctx, e.full); ctx.beginPath(); for (const pid of sh.paths) { const pa = L.paths.find((p) => p.id === pid); if (pa) tracePath(ctx, L, pa, e.P); } ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#ff8a3d'; ctx.lineWidth = 2 * dpr; ctx.setLineDash([5 * dpr, 4 * dpr]); ctx.stroke(); ctx.setLineDash([]); }
+      }
+      if (S.showBz && (S.tool === 'curvature' || S.tool === 'points' || S.tool === 'pen') && S.selPts.size && S.selPts.size <= 60) {
+        for (const pid of S.selPts) {
+          if (!e.P[pid]) continue; const h = effectiveHandles(L, pid, e.P), pv = e.P[pid], own = !!handlesOf(L, pid, S.frame);
+          const p = M.ap(e.full, pv[0], pv[1]);
+          for (const side of [0, 1]) {
+            const q = M.ap(e.full, pv[0] + h[side * 2], pv[1] + h[side * 2 + 1]); if (Math.hypot(q[0] - p[0], q[1] - p[1]) < 2 * dpr) continue;
+            ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = own ? '#ffa94d' : 'rgba(255,169,77,.6)'; ctx.lineWidth = dpr;
+            ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+            ctx.fillStyle = own ? '#ffa94d' : '#1b1e24'; ctx.beginPath(); ctx.arc(q[0], q[1], 4 * dpr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+            if (Stage.bzh) Stage.bzh.push({ L, id: pid, side, x: q[0], y: q[1] });
+          }
+        }
       }
       if (showPts) {
         for (const pid in e.P) {
@@ -1407,6 +1493,14 @@ function drawOverlays(ctx) {
   if (Stage.preview) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (Stage.preview.type === 'poly') { ctx.strokeStyle = S.newStyle.stroke; ctx.lineWidth = Math.max(1, S.newStyle.width * S.view.zoom * dpr); ctx.lineCap = 'round'; ctx.beginPath(); Stage.preview.pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke(); }
+    if (Stage.preview.type === 'bucket') {
+      const pv = Stage.preview, w = TOOLS.fill.paintOpts();
+      if (pv.poly) { ctx.beginPath(); pv.poly.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); }
+      else if (pv.shape) { const e = lcOf(pv.L); M.set(ctx, e.full); ctx.beginPath(); for (const pid of pv.shape.paths) { const pa = pv.L.paths.find((p) => p.id === pid); if (pa) tracePath(ctx, pv.L, pa, e.P); } ctx.setTransform(1, 0, 0, 1, 0, 0); }
+      if (w.fill) { ctx.globalAlpha = 0.55; ctx.fillStyle = S.newStyle.fill; ctx.fill('evenodd'); ctx.globalAlpha = 1; }
+      ctx.lineWidth = w.stroke ? Math.max(2, S.newStyle.width * S.view.zoom * dpr) : 1.5 * dpr; ctx.strokeStyle = w.stroke ? S.newStyle.stroke : '#ffffff'; ctx.setLineDash(w.stroke ? [] : [5 * dpr, 4 * dpr]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (Stage.preview.type === 'lasso') { const pts = Stage.preview.pts; ctx.strokeStyle = '#fff'; ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.lineWidth = dpr; ctx.fillStyle = 'rgba(80,160,255,.12)'; ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.setLineDash([]); }
     if (Stage.preview.type === 'marquee') { const [x0, y0, x1, y1] = Stage.preview.r; ctx.strokeStyle = '#fff'; ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.lineWidth = dpr; ctx.fillStyle = 'rgba(80,160,255,.12)'; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0); ctx.setLineDash([]); }
   }
   // camera tool indicator
@@ -1539,7 +1633,7 @@ function addShape(L, pathIds, style = S.newStyle, over = {}) {
   L.shapes.push(sh); return sh;
 }
 function deletePoints(L, ids) {
-  for (const id of ids) { delete L.pts[id]; delete L.ch['pt:' + id]; }
+  for (const id of ids) { delete L.pts[id]; delete L.ch['pt:' + id]; delete L.ch['ph:' + id]; }
   for (const pa of L.paths) pa.pts = pa.pts.filter((p) => L.pts[p]);
   const dead = new Set(L.paths.filter((pa) => pa.pts.length < 2).map((p) => p.id));
   L.paths = L.paths.filter((pa) => !dead.has(pa.id));
@@ -1581,8 +1675,8 @@ function hitSegment(L, sx, sy) {
 const TOOLS = {};
 const TOOL_GROUPS = [
   ['Select', ['select', 'rotxy', 'points']],
-  ['Draw', ['pen', 'freehand', 'shape', 'text']],
-  ['Edit', ['curvature', 'fill']],
+  ['Draw', ['pen', 'freehand', 'shape', 'curvature', 'text']],
+  ['Fill', ['selshape', 'createshape', 'fill']],
   ['Bone', ['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset']],
   ['FX', ['emitter']],
   ['Camera', ['camera']],
@@ -1591,7 +1685,7 @@ const TOOL_GROUPS = [
 function defTool(id, t) { TOOLS[id] = { id, ...t }; }
 // Which tools apply depends on: selected layer type + editing mode + current selection.
 // Tools never move; unavailable ones are dimmed and explain why.
-const TOOLS_ALWAYS = new Set(['select', 'text', 'emitter', 'camera', 'pan', 'zoom', 'orbit']);
+const TOOLS_ALWAYS = new Set(['selshape', 'select', 'text', 'emitter', 'camera', 'pan', 'zoom', 'orbit']);
 const TOOLS_DRAW = new Set(['pen', 'freehand', 'shape', 'rect', 'ellipse', 'polygon']);
 function toolAvail(id) {
   if (TOOLS_ALWAYS.has(id)) return null;
@@ -1665,59 +1759,92 @@ function setCursor() { const t = TOOLS[S.tool]; Stage.cv.style.cursor = Stage.sp
 
 function startDrag(e, data) { Stage.drag = { sx: Stage.mouse[0], sy: Stage.mouse[1], moved: false, shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey, ...data }; }
 
-// --- Select / transform layer
+// --- Select / transform layer (Moho's Transform Layer)
+// The cursor shows what a drag will do before you press: inside the box = move, a handle = scale (corner: both
+// axes, side: one axis), just outside the box (a band ~10% of its size) = rotate, farther out = move again.
+const ROT_CURSOR = `url("data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M5 12a7 7 0 1 0 2-5" fill="none" stroke="black" stroke-width="4" stroke-linecap="round"/><path d="M5 12a7 7 0 1 0 2-5" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"/><path d="M3 3v6h6" fill="white" stroke="black" stroke-width="1.2" stroke-linejoin="round"/></svg>')}") 12 12, crosshair`;
+function tfZone(L, sx, sy) {
+  const bb = screenBBox(L); if (!bb) return null;
+  const lc = lcOf(L), o = M.ap(lc.full, L.p.ox || 0, L.p.oy || 0);
+  if (Math.hypot(sx - o[0], sy - o[1]) < 8 * Stage.dpr) return { k: 'pivot' };
+  const h = hitHandle(bb, sx, sy); if (h) return { k: h.k === 'rot' ? 'rot' : 'scale', h: h.k };
+  if (sx >= bb[0] && sx <= bb[2] && sy >= bb[1] && sy <= bb[3]) return { k: 'move' };
+  const band = Math.max(12 * Stage.dpr, 0.1 * Math.max(bb[2] - bb[0], bb[3] - bb[1]));
+  if (sx >= bb[0] - band && sx <= bb[2] + band && sy >= bb[1] - band && sy <= bb[3] + band) return { k: 'rot' };
+  return { k: 'far' };
+}
+const SCALE_CURSOR = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize' };
 defTool('select', {
-  icon: '➤', name: 'Select / Transform layer', key: 'V', hint: 'Click to select · drag to move · handles scale/rotate · drag the ⊕ pivot to move it · Shift-click adds',
+  icon: '➤', name: 'Transform layer', key: 'V',
+  hint: 'Inside the box: move (Shift = straight, Alt = in/out in depth, Shift+Alt = depth keeping its size) · corner handles: scale (Shift = unequal) · side handles: stretch one way (Shift = squash & stretch) · just outside the box: rotate (Shift = 45° steps) · drag the ⊕ to move the pivot · click another layer to select it',
+  hover(sx, sy) {
+    const L = selLayer(); let c = 'default';
+    if (L && !L.lock) { const z = tfZone(L, sx, sy); if (z) c = z.k === 'scale' ? SCALE_CURSOR[z.h] || 'nwse-resize' : z.k === 'rot' ? ROT_CURSOR : z.k === 'pivot' ? 'crosshair' : 'move'; }
+    else if (hitTestLayers(sx, sy)) c = 'pointer';
+    Stage.cv.style.cursor = c;
+  },
   down(e, sx, sy) {
-    const sel = selLayer();
-    if (sel && !sel.lock) {
-      const lc0 = lcOf(sel), o = M.ap(lc0.full, sel.p.ox || 0, sel.p.oy || 0);
-      if (Math.hypot(sx - o[0], sy - o[1]) < 8 * Stage.dpr) { beginEdit('Move pivot'); startDrag(e, { mode: 'pivot', L: sel, inv: M.inv(lc0.full) }); return; }
-      const h = hitHandle(screenBBox(sel), sx, sy);
-      if (h) { this.beginTf(e, sel, h.k === 'rot' ? 'rot' : 'scale', h.k); return; }
-    }
+    const sel = selLayer(), z = sel && !sel.lock ? tfZone(sel, sx, sy) : null;
+    if (z && z.k === 'pivot') { beginEdit('Move pivot'); startDrag(e, { mode: 'pivot', L: sel, inv: M.inv(lcOf(sel).full) }); return; }
+    if (z && (z.k === 'scale' || z.k === 'rot')) { this.beginTf(e, sel, z.k, z.h); return; }
     const hit = hitTestLayers(sx, sy);
-    if (hit) {
+    if (hit && (!z || z.k !== 'move' || !S.selLayers.includes(hit.L.id))) {
       if (e.shiftKey) { S.selLayers = S.selLayers.includes(hit.L.id) ? S.selLayers.filter((i) => i !== hit.L.id) : [...S.selLayers, hit.L.id]; }
       else if (!S.selLayers.includes(hit.L.id)) S.selLayers = [hit.L.id];
       else S.selLayers = [...S.selLayers.filter((i) => i !== hit.L.id), hit.L.id];
       S.selShape = hit.shape ? hit.shape.id : null;
       refreshAll();
       this.beginTf(e, hit.L, 'move');
-    } else if (sel && !e.shiftKey) {
-      const bb = screenBBox(sel);
-      if (sx >= bb[0] && sx <= bb[2] && sy >= bb[1] && sy <= bb[3]) { this.beginTf(e, sel, 'move'); return; }
-      S.selLayers = []; S.selShape = null; refreshAll();
+      return;
     }
+    if (sel && z) { this.beginTf(e, sel, 'move', null, z.k === 'far'); if (e.shiftKey && hit && S.selLayers.length > 1) Stage.drag.toggleOff = hit.L.id; return; } // inside the box, or far outside (Moho): move
+    S.selLayers = []; S.selShape = null; refreshAll();
   },
-  beginTf(e, L, mode, handle) {
+  beginTf(e, L, mode, handle, far) {
     const targets = mode === 'move' ? S.selLayers.map((id) => findLayer(id)).filter((l) => l && !l.lock) : [L];
     beginEdit(mode === 'move' ? 'Move layer' : mode === 'rot' ? 'Rotate layer' : 'Scale layer');
-    const o = M.ap(lcOf(L).full, L.p.ox || 0, L.p.oy || 0);
-    startDrag(e, { mode, handle, L, o, targets: targets.map((T) => ({ T, x: val(T, 'x', S.frame), y: val(T, 'y', S.frame), rot: val(T, 'rot', S.frame), sx: val(T, 'sx', S.frame), sy: val(T, 'sy', S.frame), inv: M.inv(parentFull(T)) })) });
+    const full = lcOf(L).full, o = M.ap(full, L.p.ox || 0, L.p.oy || 0);
+    startDrag(e, { mode, handle, L, o, far, inv0: M.inv(full), targets: targets.map((T) => ({ T, x: val(T, 'x', S.frame), y: val(T, 'y', S.frame), z: val(T, 'z', S.frame) || 0, rot: val(T, 'rot', S.frame), sx: val(T, 'sx', S.frame), sy: val(T, 'sy', S.frame), inv: M.inv(parentFull(T)) })) });
   },
   move(e, sx, sy) {
     const d = Stage.drag; if (!d) return;
     const dx = sx - d.sx, dy = sy - d.sy;
-    if (d.mode === 'pivot') { const q = M.ap(d.inv, sx, sy); d.L.p.ox = round(q[0]); d.L.p.oy = round(q[1]); requestDraw(); return; }
+    if (d.mode === 'pivot') { const q = M.ap(d.inv, sx, sy); d.L.p.ox = round(q[0]); d.L.p.oy = round(q[1]); REV++; requestDraw(); return; }
     if (d.mode === 'move') {
-      for (const t of d.targets) { let v = M.apv(t.inv, dx, dy); if (e.shiftKey) { if (Math.abs(v[0]) > Math.abs(v[1])) v[1] = 0; else v[0] = 0; } setVal(t.T, 'x', round(t.x + v[0])); setVal(t.T, 'y', round(t.y + v[1])); }
+      for (const t of d.targets) {
+        if (e.altKey) { // in / out in depth (drag down = nearer)
+          const nz = round(t.z + (dy / Stage.dpr) * 2); setVal(t.T, 'z', nz);
+          if (e.shiftKey) { const D = V3.CAM_D, k = (D - nz) / (D - t.z || 1); setVal(t.T, 'sx', round(t.sx * k, 3)); setVal(t.T, 'sy', round(t.sy * k, 3)); }
+          continue;
+        }
+        let v = M.apv(t.inv, dx, dy); if (e.shiftKey) { if (Math.abs(v[0]) > Math.abs(v[1])) v[1] = 0; else v[0] = 0; }
+        setVal(t.T, 'x', round(t.x + v[0])); setVal(t.T, 'y', round(t.y + v[1]));
+      }
     } else if (d.mode === 'rot') {
       const a0 = Math.atan2(d.sy - d.o[1], d.sx - d.o[0]), a1 = Math.atan2(sy - d.o[1], sx - d.o[0]);
-      let r = d.targets[0].rot + (a1 - a0) / DEG; if (e.shiftKey) r = Math.round(r / 15) * 15;
-      setVal(d.L, 'rot', round(r));
+      let r = d.targets[0].rot + (a1 - a0) / DEG; if (e.shiftKey) r = Math.round(r / 45) * 45;
+      setVal(d.L, 'rot', round(r, 2));
     } else {
-      const t = d.targets[0], h = d.handle;
-      const d0 = Math.hypot(d.sx - d.o[0], d.sy - d.o[1]) || 1, d1 = Math.hypot(sx - d.o[0], sy - d.o[1]);
-      let k = d1 / d0;
-      if (h === 'n' || h === 's') setVal(d.L, 'sy', round(t.sy * k, 3));
-      else if (h === 'e' || h === 'w') setVal(d.L, 'sx', round(t.sx * k, 3));
-      else { setVal(d.L, 'sx', round(t.sx * k, 3)); setVal(d.L, 'sy', round(t.sy * k, 3)); }
+      // scale in the layer's own axes, measured from its origin
+      const t = d.targets[0], h = d.handle, ox = d.L.p.ox || 0, oy = d.L.p.oy || 0;
+      const p0 = M.ap(d.inv0, d.sx, d.sy), p1 = M.ap(d.inv0, sx, sy), v0 = [p0[0] - ox, p0[1] - oy], v1 = [p1[0] - ox, p1[1] - oy];
+      const ratio = (a, b) => (Math.abs(a) < 1e-6 ? 1 : b / a);
+      const kx = ratio(v0[0], v1[0]), ky = ratio(v0[1], v1[1]);
+      if (h === 'e' || h === 'w') { setVal(d.L, 'sx', round(t.sx * kx, 3)); if (e.shiftKey) setVal(d.L, 'sy', round(t.sy / (Math.abs(kx) < 0.05 ? 0.05 : kx), 3)); }
+      else if (h === 'n' || h === 's') { setVal(d.L, 'sy', round(t.sy * ky, 3)); if (e.shiftKey) setVal(d.L, 'sx', round(t.sx / (Math.abs(ky) < 0.05 ? 0.05 : ky), 3)); }
+      else if (e.shiftKey) { setVal(d.L, 'sx', round(t.sx * kx, 3)); setVal(d.L, 'sy', round(t.sy * ky, 3)); }
+      else { const k = Math.hypot(v1[0], v1[1]) / (Math.hypot(v0[0], v0[1]) || 1); setVal(d.L, 'sx', round(t.sx * k, 3)); setVal(d.L, 'sy', round(t.sy * k, 3)); }
     }
-    requestDraw();
+    requestDraw(); renderPropsSoon();
   },
-  up() { commitEdit(); },
+  up(e) {
+    const d = Stage.drag;
+    if (d && d.mode === 'move' && d.far && !d.moved) { cancelEdit(); S.selLayers = []; S.selShape = null; refreshAll(); return; } // a plain click far away deselects
+    if (d && d.toggleOff && !d.moved) { cancelEdit(); S.selLayers = S.selLayers.filter((i) => i !== d.toggleOff); refreshAll(); return; } // Shift-click a selected layer: unselect it
+    commitEdit(); refreshAll();
+  },
 });
+function tfSet(k, v) { const ls = S.selLayers.map(findLayer).filter((l) => l && !l.lock); if (!ls.length) return; edit('Transform layer', () => { for (const L of ls) setVal(L, k, v); }); }
 
 // --- Points
 defTool('points', {
@@ -1743,9 +1870,9 @@ defTool('points', {
   },
   beginPts(e, L, mode, bb) {
     beginEdit(mode === 'move' ? 'Move points' : mode === 'rot' ? 'Rotate points' : 'Scale points');
-    const start = {}; for (const id of S.selPts) start[id] = val(L, 'pt:' + id, S.frame);
+    const start = {}, hs = {}; for (const id of S.selPts) { start[id] = val(L, 'pt:' + id, S.frame); const h = handlesOf(L, id, S.frame); if (h) hs[id] = h; }
     let c = [0, 0]; const ids = [...S.selPts]; ids.forEach((id) => { c[0] += start[id][0] / ids.length; c[1] += start[id][1] / ids.length; });
-    startDrag(e, { mode, L, start, c, inv: M.inv(lcOf(L).full), cs: M.ap(lcOf(L).full, c[0], c[1]) });
+    startDrag(e, { mode, L, start, hs, c, inv: M.inv(lcOf(L).full), cs: M.ap(lcOf(L).full, c[0], c[1]) });
   },
   move(e, sx, sy) {
     const d = Stage.drag; if (!d) return;
@@ -1765,9 +1892,11 @@ defTool('points', {
       const a = Math.atan2(sy - d.cs[1], sx - d.cs[0]) - Math.atan2(d.sy - d.cs[1], d.sx - d.cs[0]);
       const m = M.chain(M.t(d.c[0], d.c[1]), M.r(a), M.t(-d.c[0], -d.c[1]));
       for (const id in d.start) { const p = M.ap(m, d.start[id][0], d.start[id][1]); setVal(L, 'pt:' + id, [round(p[0]), round(p[1])]); }
+      if (!S.fixedBz) for (const id in d.hs) { const h = d.hs[id], ca = Math.cos(a), sa = Math.sin(a); setVal(L, 'ph:' + id, [0, 2].flatMap((i) => [round(h[i] * ca - h[i + 1] * sa, 2), round(h[i] * sa + h[i + 1] * ca, 2)])); }
     } else {
       const k = Math.hypot(sx - d.cs[0], sy - d.cs[1]) / (Math.hypot(d.sx - d.cs[0], d.sy - d.cs[1]) || 1);
       for (const id in d.start) setVal(L, 'pt:' + id, [round(d.c[0] + (d.start[id][0] - d.c[0]) * k), round(d.c[1] + (d.start[id][1] - d.c[1]) * k)]);
+      if (!S.fixedBz) for (const id in d.hs) setVal(L, 'ph:' + id, d.hs[id].map((v) => round(v * k, 2)));
     }
     requestDraw();
   },
@@ -1915,9 +2044,96 @@ defTool('orbit', {
 });
 function renderPropsSoon() { clearTimeout(renderPropsSoon.t); renderPropsSoon.t = setTimeout(() => { if (currentTab === 'props') refreshAll(); }, 120); }
 
+// --- Select shape (Moho): pick individual shapes of a vector layer; Shift-click picks several for Liquid Shapes
+function selShapeIds() { return S.selShape ? (S.selShapes.has(S.selShape) ? [...S.selShapes] : [S.selShape]) : []; }
+function pickShape(L, id, add) {
+  if (!add || !S.selLayers.includes(L.id)) S.selShapes = new Set();
+  if (S.selShape && !S.selShapes.size) S.selShapes.add(S.selShape);
+  if (add && S.selShapes.has(id) && S.selShapes.size > 1) { S.selShapes.delete(id); S.selShape = [...S.selShapes].pop(); }
+  else { S.selShapes.add(id); S.selShape = id; }
+  S.selLayers = [L.id]; S.camSel = false;
+}
+defTool('selshape', {
+  icon: '◩', name: 'Select shape', key: 'G', cursor: 'pointer',
+  hint: 'Click a shape to select it · Shift-click to select several · then Combine, Subtract or Intersect them as Liquid Shapes in the bar above (live: they follow every point and bone move)',
+  down(e, sx, sy) {
+    const hit = hitTestLayers(sx, sy);
+    if (hit && hit.L.type === 'vector' && hit.shape) pickShape(hit.L, hit.shape.id, e.shiftKey);
+    else if (!e.shiftKey) { S.selShape = null; S.selShapes = new Set(); }
+    refreshAll();
+  },
+});
+const LIQUID_OPS = [['combine', 'Combine', 'Join the shapes into one outline (union)'], ['subtract', 'Subtract', 'Cut the upper shapes out of the lowest one'], ['intersect', 'Intersect', 'Keep only where the lowest shape overlaps the others']];
+function makeLiquid(op) {
+  const L = selLayer(), ids = selShapeIds(); if (!L || L.type !== 'vector' || ids.length < 2) return toast('Select two or more shapes (Shift-click with Select shape)');
+  edit('Liquid shapes: ' + op, () => {
+    const mem = L.shapes.filter((sh) => ids.includes(sh.id)), old = new Set(mem.map((sh) => sh.lq && sh.lq.g).filter(Boolean));
+    for (const sh of L.shapes) if (sh.lq && old.has(sh.lq.g) && !ids.includes(sh.id)) delete sh.lq; // leftovers of a regrouped set
+    const at = L.shapes.indexOf(mem[0]); L.shapes = L.shapes.filter((sh) => !ids.includes(sh.id)); L.shapes.splice(at, 0, ...mem); // keep the group together
+    const g = uid('lq'); for (const sh of mem) sh.lq = { g, op };
+  });
+}
+function releaseLiquid() {
+  const L = selLayer(); if (!L) return; const gs = new Set(L.shapes.filter((sh) => selShapeIds().includes(sh.id) && sh.lq).map((sh) => sh.lq.g));
+  if (!gs.size) return toast('The selected shapes are not liquid');
+  edit('Release liquid shapes', () => { for (const sh of L.shapes) if (sh.lq && gs.has(sh.lq.g)) delete sh.lq; });
+}
+
+// --- Create shape (Moho): give selected points a visible fill and/or outline
+// Select the boundary points (drag a box, or lasso; Shift adds, Ctrl switches box/lasso), check the preview,
+// then press Create shape (or tap Space). Only paths whose points are all selected take part.
+function createShapePlan(L) {
+  if (!L || L.type !== 'vector' || !S.selPts.size) return null;
+  const paths = L.paths.filter((pa) => pa.pts.length >= 2 && pa.pts.every((id) => S.selPts.has(id)));
+  if (!paths.length) return null;
+  const o = TOOLS.createshape.opts, closed = paths.some((pa) => pa.closed && pa.pts.length > 2);
+  const fill = o.paint !== 'stroke' && closed, stroke = o.paint !== 'fill' || !closed;
+  return { paths, closed, fill, stroke };
+}
+function commitCreateShape() {
+  const L = selLayer(), plan = createShapePlan(L);
+  if (!plan) return toast('Select all the points of a path first (drag a box or lasso around them)', 'err');
+  edit('Create shape', () => { S.selShape = addShape(L, plan.paths.map((p) => p.id), S.newStyle, { fillOn: plan.fill, strokeOn: plan.stroke }).id; });
+  if (TOOLS.createshape.opts.paint !== 'stroke' && !plan.closed) toast('Created an outline only — a fill needs a closed path', 'ok');
+}
+let _hatch = null;
+function hatchPattern(ctx) {
+  if (!_hatch) { const c = document.createElement('canvas'); c.width = c.height = 12; const x = c.getContext('2d'); x.fillStyle = 'rgba(255,255,255,.35)'; x.fillRect(0, 0, 6, 6); x.fillRect(6, 6, 6, 6); x.fillStyle = 'rgba(80,160,255,.35)'; x.fillRect(6, 0, 6, 6); x.fillRect(0, 6, 6, 6); _hatch = c; }
+  return ctx.createPattern(_hatch, 'repeat');
+}
+defTool('createshape', {
+  icon: '◪', name: 'Create shape', key: 'U', cursor: 'crosshair',
+  hint: 'Drag a box (or lasso) around the points of a path · Shift adds · Ctrl switches box/lasso · checkered = will be filled · press Create shape or tap Space',
+  opts: { lasso: false, paint: 'both' },
+  down(e, sx, sy) {
+    const L = selLayer(); if (!L || L.type !== 'vector') return toast('Select a vector layer');
+    const pid = hitPoint(L, sx, sy);
+    if (pid) { if (e.shiftKey) { S.selPts.has(pid) ? S.selPts.delete(pid) : S.selPts.add(pid); } else S.selPts = new Set([pid]); refreshAll(); return; }
+    const lasso = this.opts.lasso !== (e.ctrlKey || e.metaKey);
+    if (!e.shiftKey) S.selPts = new Set();
+    startDrag(e, { L, lasso, base: new Set(S.selPts) });
+    Stage.preview = lasso ? { type: 'lasso', pts: [[sx, sy]] } : { type: 'marquee', r: [sx, sy, sx, sy] };
+    refreshAll();
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    const lc = lcOf(d.L), sel = new Set(d.base);
+    if (d.lasso) {
+      const pts = Stage.preview.pts, l = pts[pts.length - 1]; if (Math.hypot(sx - l[0], sy - l[1]) > 3) pts.push([sx, sy]);
+      const poly = new Path2D(); pts.forEach((p, i) => (i ? poly.lineTo(p[0], p[1]) : poly.moveTo(p[0], p[1]))); poly.closePath(); _hitCtx.setTransform(1, 0, 0, 1, 0, 0);
+      for (const id in lc.P) { const p = M.ap(lc.full, lc.P[id][0], lc.P[id][1]); if (_hitCtx.isPointInPath(poly, p[0], p[1])) sel.add(id); }
+    } else {
+      const r = [Math.min(d.sx, sx), Math.min(d.sy, sy), Math.max(d.sx, sx), Math.max(d.sy, sy)]; Stage.preview = { type: 'marquee', r };
+      for (const id in lc.P) { const p = M.ap(lc.full, lc.P[id][0], lc.P[id][1]); if (p[0] >= r[0] && p[0] <= r[2] && p[1] >= r[1] && p[1] <= r[3]) sel.add(id); }
+    }
+    S.selPts = sel; requestDraw();
+  },
+  up() { Stage.preview = null; refreshAll(); },
+});
+
 // --- Create shape: one tool for rectangle, ellipse and polygon/star (pick the shape in the bar above)
 defTool('shape', {
-  icon: '▭', name: 'Create shape', key: 'R', cursor: 'crosshair',
+  icon: '▭', name: 'Draw shape', key: 'R', cursor: 'crosshair',
   hint: 'Pick Rectangle, Ellipse or Polygon in the bar above, then drag to draw · Shift = equal proportions · Alt = from center · E = ellipse, Y = polygon',
   opts: { kind: 'rect' },
   down(e, sx, sy) { TOOLS[this.opts.kind].down(e, sx, sy); },
@@ -1939,22 +2155,51 @@ defTool('text', {
 
 // --- Curvature
 defTool('curvature', {
-  icon: '⌒', name: 'Curvature', key: 'C', cursor: 'ns-resize', hint: 'Drag a point up/down to change its curvature · double-click toggles corner/smooth',
+  icon: '⌒', name: 'Curvature', key: 'C', cursor: 'ew-resize',
+  hint: 'Drag a point left/right to change its curvature · with Show Bézier handles on, drag a handle end to shape the curve (Alt = move one side only) · Peak / Smooth reset the handles · double-click toggles corner/smooth',
   down(e, sx, sy) {
     const L = selLayer(); if (!L || L.type !== 'vector') return toast('Select a vector layer');
+    if (S.showBz) {
+      const h = (Stage.bzh || []).find((q) => q.L === L && Math.hypot(q.x - sx, q.y - sy) < 7 * Stage.dpr);
+      if (h) {
+        beginEdit('Bézier handle'); const lc = lcOf(L);
+        startDrag(e, { mode: 'handle', L, id: h.id, side: h.side, h0: effectiveHandles(L, h.id, lc.P), inv: M.inv(lc.full), P: lc.P[h.id].slice() });
+        return;
+      }
+    }
     const pid = hitPoint(L, sx, sy); if (!pid) return;
     if (!S.selPts.has(pid)) S.selPts = new Set([pid]);
     beginEdit('Curvature'); const start = {}; for (const id of S.selPts) start[id] = L.pts[id].c ?? 1;
-    startDrag(e, { L, start, t: performance.now() });
+    startDrag(e, { mode: 'curv', L, start, t: performance.now() });
   },
-  move(e, sx, sy) { const d = Stage.drag; if (!d) return; const dv = -(sy - d.sy) / (100 * Stage.dpr); for (const id in d.start) d.L.pts[id].c = round(clamp(d.start[id] + dv, 0, 2.5), 3); requestDraw(); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    if (d.mode === 'handle') {
+      const m = M.ap(d.inv, sx, sy), v = [m[0] - d.P[0], m[1] - d.P[1]], h = d.h0.slice(), o = d.side ? 0 : 2;
+      h[d.side ? 2 : 0] = round(v[0], 2); h[d.side ? 3 : 1] = round(v[1], 2);
+      if (!e.altKey) { // keep the curve smooth through the point: the other handle points the opposite way, keeping its length
+        const len = Math.hypot(d.h0[o], d.h0[o + 1]), l2 = Math.hypot(v[0], v[1]) || 1;
+        h[o] = round((-v[0] / l2) * len, 2); h[o + 1] = round((-v[1] / l2) * len, 2);
+      }
+      if (handlesOf(d.L, d.id, 0) === undefined && S.frame !== 0) { // first custom handles: start from the automatic ones at the setup pose
+        const rest = {}; for (const id in d.L.pts) rest[id] = [d.L.pts[id].x, d.L.pts[id].y]; d.L.pts[d.id].h = effectiveHandles(d.L, d.id, rest, 0).map((x) => round(x, 2));
+      }
+      setVal(d.L, 'ph:' + d.id, h); requestDraw(); return;
+    }
+    const dv = (sx - d.sx) / (100 * Stage.dpr); for (const id in d.start) d.L.pts[id].c = round(clamp(d.start[id] + dv, 0, 2.5), 3); REV++; requestDraw();
+  },
   up() { commitEdit(); },
-  dbl(e, sx, sy) { const L = selLayer(); if (!L || L.type !== 'vector') return; const pid = hitPoint(L, sx, sy); if (!pid) return; edit('Toggle corner', () => { L.pts[pid].c = (L.pts[pid].c ?? 1) > 0.05 ? 0 : 1; }); },
+  dbl(e, sx, sy) { const L = selLayer(); if (!L || L.type !== 'vector') return; const pid = hitPoint(L, sx, sy); if (!pid) return; edit('Toggle corner', () => { L.pts[pid].c = (L.pts[pid].c ?? 1) > 0.05 ? 0 : 1; clearHandles(L, pid); }); },
 });
 
 // --- Paint bucket
+// Paint bucket (Moho): Vector = fill an existing closed path (no new points) · Trace = build a new shape around the
+// clicked area as you see it (works across crossings and several paths) · Recolor = change an existing shape.
+// Fill / Stroke / Both chooses what is painted. Press to preview, release to apply (drag off and back to cancel: Esc).
 defTool('fill', {
-  icon: '🪣', name: 'Paint bucket', key: 'B', cursor: 'cell', hint: 'Click inside a closed path to fill it with the current style · Shift = stroke color only · Alt = pick style (eyedropper)',
+  icon: '🪣', name: 'Paint bucket', key: 'B', cursor: 'cell',
+  hint: 'Click inside an area to fill it · hold the mouse to preview, release to apply · Vector uses existing closed paths, Trace builds a new shape around what you see, Recolor changes an existing shape · Alt = pick style',
+  opts: { mode: 'vector', paint: 'fill', reduce: 2, expand: 1, allLayers: false },
   down(e, sx, sy) {
     const hit = hitTestLayers(sx, sy);
     if (e.altKey) {
@@ -1962,28 +2207,96 @@ defTool('fill', {
       return;
     }
     let L = selLayer(); if (!L || L.type !== 'vector') { if (hit && hit.L.type === 'vector') L = hit.L; else return toast('Select a vector layer'); }
+    if (L.lock) return toast('Layer is locked', 'err');
+    const o = this.opts, plan = o.mode === 'recolor' ? this.planRecolor(L, hit) : o.mode === 'trace' ? this.planTrace(L, sx, sy) : this.planVector(L, sx, sy, hit);
+    if (!plan || plan.err) return plan && toast(plan.err, 'err');
+    Stage.preview = { type: 'bucket', poly: plan.poly || null, shape: plan.sh || null, L };
+    startDrag(e, { plan, L }); requestDraw();
+  },
+  up() { const d = Stage.drag; Stage.preview = null; if (d && d.plan) edit('Paint bucket', () => d.plan.apply()); refreshAll(); },
+  paintOpts() { const p = this.opts.paint; return { fill: p !== 'stroke', stroke: p !== 'fill' }; },
+  paint(L, sh) {
+    const w = this.paintOpts(); if (sh.styleId) sh.styleId = null;
+    if (w.fill) { setVal(L, 'sh:' + sh.id + ':fill', S.newStyle.fill); sh.fillOn = true; }
+    if (w.stroke) { setVal(L, 'sh:' + sh.id + ':stroke', S.newStyle.stroke); setVal(L, 'sh:' + sh.id + ':width', S.newStyle.width); sh.strokeOn = true; }
+    S.selShape = sh.id;
+  },
+  planRecolor(L, hit) {
+    if (!hit || hit.L !== L || !hit.shape) return { err: 'Click on a shape to recolor it' };
+    return { sh: hit.shape, apply: () => this.paint(L, hit.shape) };
+  },
+  planVector(L, sx, sy, hit) {
     const e2 = lcOf(L); M.set(_hitCtx, e2.full);
     const cands = L.paths.filter((pa) => pa.closed).map((pa) => { const p = new Path2D(); tracePath(p, L, pa, e2.P); return { pa, p }; }).filter((c) => _hitCtx.isPointInPath(c.p, sx, sy));
     if (!cands.length) {
-      if (hit && hit.L === L && hit.shape) return edit('Recolor shape', () => this.paint(L, hit.shape, e.shiftKey));
-      return toast('No closed path here — close the path first (Pen: click its first point)', 'err');
+      if (hit && hit.L === L && hit.shape) return { sh: hit.shape, apply: () => this.paint(L, hit.shape) };
+      return { err: 'No closed path here. Close the path first, or switch the Paint bucket to Trace to fill what you see.' };
     }
     const area = (pa) => { let a = 0; const ids = pa.pts; for (let i = 0; i < ids.length; i++) { const p = e2.P[ids[i]], q = e2.P[ids[(i + 1) % ids.length]]; a += p[0] * q[1] - q[0] * p[1]; } return Math.abs(a); };
     cands.sort((a, b) => area(a.pa) - area(b.pa));
-    const pa = cands[0].pa;
-    edit('Fill', () => {
-      const sh = L.shapes.find((s) => s.paths.includes(pa.id));
-      if (sh) this.paint(L, sh, e.shiftKey);
-      else S.selShape = addShape(L, [pa.id], S.newStyle, { fillOn: true }).id;
-    });
+    const pa = cands[0].pa, w = this.paintOpts(), sh = L.shapes.find((s) => s.paths.length === 1 && s.paths[0] === pa.id);
+    const poly = pa.pts.filter((id) => e2.P[id]).map((id) => M.ap(e2.full, e2.P[id][0], e2.P[id][1]));
+    return { poly, apply: () => { if (sh) this.paint(L, sh); else S.selShape = addShape(L, [pa.id], S.newStyle, { fillOn: w.fill, strokeOn: w.stroke }).id; } };
   },
-  paint(L, sh, strokeOnly) {
-    if (sh.styleId) sh.styleId = null;
-    if (strokeOnly) { setVal(L, 'sh:' + sh.id + ':stroke', S.newStyle.stroke); sh.strokeOn = true; }
-    else { setVal(L, 'sh:' + sh.id + ':fill', S.newStyle.fill); sh.fillOn = true; }
-    S.selShape = sh.id;
+  // Trace: flood the clicked colour in the stage picture, outline the region, simplify it into new points
+  planTrace(L, sx, sy) {
+    const o = this.opts, W = Stage.cv.width, Hh = Stage.cv.height;
+    const cv = Pool.get(W, Hh), cx = cv.getContext('2d');
+    renderScene(cx, S.frame, viewM(), { export: true, only: o.allLayers ? null : L.id, swOverride: switchOverrides() });
+    const img = cx.getImageData(0, 0, W, Hh).data; Pool.put(cv);
+    const x0 = Math.round(sx), y0 = Math.round(sy); if (x0 < 0 || y0 < 0 || x0 >= W || y0 >= Hh) return null;
+    const at = (x, y) => (y * W + x) * 4, s0 = at(x0, y0), c0 = [img[s0], img[s0 + 1], img[s0 + 2], img[s0 + 3]];
+    const same = (i) => Math.abs(img[i + 3] - c0[3]) <= 40 && (c0[3] < 20 || (Math.abs(img[i] - c0[0]) <= 40 && Math.abs(img[i + 1] - c0[1]) <= 40 && Math.abs(img[i + 2] - c0[2]) <= 40));
+    let mask = new Uint8Array(W * Hh); const st = [y0 * W + x0]; mask[st[0]] = 1; let leak = false, count = 0;
+    while (st.length) {
+      const k = st.pop(), x = k % W, y = (k - x) / W; count++;
+      if (x === 0 || y === 0 || x === W - 1 || y === Hh - 1) { leak = true; break; }
+      for (const n of [k - 1, k + 1, k - W, k + W]) if (!mask[n] && same(n * 4)) { mask[n] = 1; st.push(n); }
+    }
+    if (leak) return { err: 'This area is open — it leaks out to the edge of the view. Close the gap (or zoom out so the whole area is visible).' };
+    if (count < 12) return { err: 'That area is too small to fill' };
+    const grow = (m, steps) => { for (let s = 0; s < Math.abs(steps); s++) { const n = new Uint8Array(m); for (let y = 1; y < Hh - 1; y++) for (let x = 1; x < W - 1; x++) { const k = y * W + x, v = m[k - 1] | m[k + 1] | m[k - W] | m[k + W], a = m[k - 1] & m[k + 1] & m[k - W] & m[k + W]; n[k] = steps > 0 ? m[k] | v : m[k] & a; } m = n; } return m; };
+    mask = grow(mask, Math.round(o.expand * Stage.dpr));
+    // outer boundary (Moore neighbour tracing, clockwise from the top-left pixel)
+    let first = -1; for (let k = 0; k < mask.length; k++) if (mask[k]) { first = k; break; }
+    if (first < 0) return { err: 'Nothing to fill' };
+    const DX = [1, 1, 0, -1, -1, -1, 0, 1], DY = [0, 1, 1, 1, 0, -1, -1, -1];
+    const fx = first % W, fy = (first - fx) / W; let cxp = fx, cyp = fy, dir = 0; const ring = [];
+    do {
+      ring.push([cxp, cyp]); let found = false;
+      for (let k = 0; k < 8; k++) { const d = (dir + 6 + k) % 8, nx = cxp + DX[d], ny = cyp + DY[d]; if (nx >= 0 && ny >= 0 && nx < W && ny < Hh && mask[ny * W + nx]) { cxp = nx; cyp = ny; dir = d; found = true; break; } }
+      if (!found) break;
+    } while (!(cxp === fx && cyp === fy) && ring.length < 400000);
+    const tol = (0.8 + o.reduce) * Stage.dpr, simp = rdp([...ring, ring[0]], tol); simp.pop();
+    if (simp.length < 3) return { err: 'That area is too small to fill' };
+    const poly = simp.map(([x, y]) => [x + 0.5, y + 0.5]);
+    const w = this.paintOpts();
+    return { poly, apply: () => {
+      const inv = M.inv(lcOf(L).full), n = poly.length;
+      const ids = poly.map((p, i) => {
+        const a = poly[(i + n - 1) % n], b = poly[(i + 1) % n], t1 = Math.atan2(p[1] - a[1], p[0] - a[0]), t2 = Math.atan2(b[1] - p[1], b[0] - p[0]);
+        let turn = Math.abs(t2 - t1); if (turn > Math.PI) turn = 2 * Math.PI - turn;
+        const q = M.ap(inv, p[0], p[1]); return addPoint(L, round(q[0], 1), round(q[1], 1), turn > 0.9 ? 0 : 1);
+      });
+      const pa = { id: uid('pa'), pts: ids, closed: true }; L.paths.push(pa);
+      const sh = addShape(L, [pa.id], S.newStyle, { fillOn: w.fill, strokeOn: w.stroke });
+      if (w.fill && !w.stroke) { L.shapes.pop(); L.shapes.unshift(sh); } // a traced fill goes under the line art
+      S.selShape = sh.id; S.selPts = new Set();
+      toast(`Traced a new shape with ${ids.length} points`, 'ok');
+    } };
   },
 });
+// Ramer–Douglas–Peucker simplification of an open polyline
+function rdp(pts, tol) {
+  if (pts.length < 3) return pts.slice();
+  const keep = new Uint8Array(pts.length); keep[0] = keep[pts.length - 1] = 1; const st = [[0, pts.length - 1]];
+  while (st.length) {
+    const [a, b] = st.pop(); let best = -1, bd = tol; const [ax, ay] = pts[a], [bx, by] = pts[b], dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy || 1;
+    for (let i = a + 1; i < b; i++) { const t = clamp(((pts[i][0] - ax) * dx + (pts[i][1] - ay) * dy) / L2, 0, 1), d = Math.hypot(pts[i][0] - ax - t * dx, pts[i][1] - ay - t * dy); if (d > bd) { bd = d; best = i; } }
+    if (best > 0) { keep[best] = 1; st.push([a, best], [best, b]); }
+  }
+  return pts.filter((_, i) => keep[i]);
+}
 
 // ===================== Bone tools (Moho order) =====================
 const BONE_SVG = '<path d="M4.5 19.5 L8 12.8 L19.5 4.5 L11.2 16 Z" fill="currentColor" fill-opacity=".38"/><circle cx="4.5" cy="19.5" r="1.7"/>';
@@ -2370,6 +2683,7 @@ function initStage() {
     const d = Stage.drag;
     if (d) { if (!d.moved && Math.hypot(sx - d.sx, sy - d.sy) > 2) d.moved = true; if (d.moved) TOOLS[S.tool].move(e, sx, sy); }
     else if (S.tool === 'pen' && Stage.pen) requestDraw();
+    else if (!panDrag && !Stage.space && TOOLS[S.tool] && TOOLS[S.tool].hover) TOOLS[S.tool].hover(sx, sy);
   });
   const end = (e) => {
     if (panDrag) { panDrag = null; setCursor(); return; }
@@ -2533,6 +2847,45 @@ function renderToolOpts() {
     <label title="New-shape stroke"><input type="checkbox" data-o="strokeOn" ${ns.strokeOn ? 'checked' : ''}>Stroke <input type="color" data-o="stroke" value="${ns.stroke}"></label>
     <label>Width <input type="number" data-o="width" value="${ns.width}" min="0" step="0.5"></label>`;
   let opts = '';
+  if (S.tool === 'createshape') {
+    const o = TOOLS.createshape.opts, plan = createShapePlan(selLayer());
+    opts += `<span class="seg"><button class="btn ${!o.lasso ? 'on' : ''}" data-cs="lasso:0" title="Drag a rectangle to select points">Box</button><button class="btn ${o.lasso ? 'on' : ''}" data-cs="lasso:1" title="Draw around points to select them">Lasso</button></span>` +
+      '<span class="seg">' + [['fill', 'Fill'], ['stroke', 'Stroke'], ['both', 'Both']].map(([k, n]) => `<button class="btn ${o.paint === k ? 'on' : ''}" data-cs="paint:${k}">${n}</button>`).join('') + '</span>' +
+      `<button class="btn pri" data-cmd="shape.createsel" ${plan ? '' : 'disabled'} title="Space">Create shape</button>` +
+      `<span class="chip">${plan ? (plan.fill ? 'Checkered = will be filled' : plan.closed ? 'Outline only' : 'Open path: outline only (a fill needs a closed path)') : 'Select all the points of a path'}</span>`;
+  }
+  if (S.tool === 'select' && selLayer()) {
+    const L = selLayer(), f = S.frame, n = (k, lab, step, w = 58, t = '') => `<label title="${t}">${lab} <input type="number" data-tf="${k}" value="${round(val(L, k, f) ?? 0, 2)}" step="${step}" style="width:${w}px"></label>`;
+    opts += n('x', 'X', 1) + n('y', 'Y', 1) + n('z', 'Z', 1, 58, 'Depth: positive = nearer the camera') + n('sx', 'Scale X', 0.05) + n('sy', 'Scale Y', 0.05) + n('rot', 'Angle', 1, 58, 'Rotation Z in degrees') +
+      `<button class="btn" data-tfa="reset" title="Position 0, scale 1, angle 0 (keyed at this frame)">Reset</button><button class="btn" data-tfa="flipH" title="Flip horizontally">⇋ Flip H</button><button class="btn" data-tfa="flipV" title="Flip vertically">⇵ Flip V</button>` +
+      `<label title="Show the layer's motion path on the stage"><input type="checkbox" data-tfa="path" ${S.showPaths ? 'checked' : ''}>Show path</label>`;
+  }
+  if (S.tool === 'fill') {
+    const o = TOOLS.fill.opts, seg = (key, list) => '<span class="seg">' + list.map(([k, n, t]) => `<button class="btn ${o[key] === k ? 'on' : ''}" data-bucket="${key}:${k}" title="${t}">${n}</button>`).join('') + '</span>';
+    opts += seg('mode', [['vector', 'Vector', 'Fill an existing closed path — no new points'], ['trace', 'Trace', 'Build a new shape around the area you click, as you see it (works across crossings and separate lines)'], ['recolor', 'Recolor', 'Change the colour of an existing shape']]) +
+      seg('paint', [['fill', 'Fill', 'Paint the inside'], ['stroke', 'Stroke', 'Paint the outline'], ['both', 'Both', 'Paint inside and outline']]);
+    if (o.mode === 'trace') opts += `<label title="Fewer points: a smoother, simpler outline">Point reduction <input type="number" data-bucketn="reduce" value="${o.reduce}" min="0" max="12" step="1" style="width:46px"></label><label title="Grow (or shrink, negative) the traced area in pixels — 1-2 slips the fill under the outline">Pixel expansion <input type="number" data-bucketn="expand" value="${o.expand}" min="-4" max="8" step="1" style="width:46px"></label><label title="Trace what all visible layers show, not just this layer"><input type="checkbox" data-bucketc="allLayers" ${o.allLayers ? 'checked' : ''}>All visible layers</label>`;
+  }
+  if (S.tool === 'curvature' || S.tool === 'points') {
+    opts += `<label title="Show the Bézier handles of the selected points so you can drag them"><input type="checkbox" data-bzopt="showBz" ${S.showBz ? 'checked' : ''}>Show Bézier handles</label>` +
+      `<label title="Keep custom handles exactly as they are when points are rotated or scaled"><input type="checkbox" data-bzopt="fixedBz" ${S.fixedBz ? 'checked' : ''}>Fixed handles</label>` +
+      `<button class="btn" data-cmd="pts.corner" title="Sharp corner — resets custom handles">Peak</button><button class="btn" data-cmd="pts.smooth" title="Smooth curve — resets custom handles">Smooth</button>`;
+  }
+  if (S.tool === 'selshape') {
+    const L = selLayer();
+    if (!L || L.type !== 'vector' || !L.shapes.length) opts += '<span class="chip">Click a shape on the stage to select it</span>';
+    else {
+      const ids = selShapeIds(), lqOf = (sh) => (sh.lq && L.shapes.filter((q) => q.lq && q.lq.g === sh.lq.g).length > 1 ? sh.lq : null);
+      opts += '<span class="shapelist">' + L.shapes.map((sh, i) => { const st = shapeStyle(L, sh, S.frame), lq = lqOf(sh);
+        return `<button class="btn ${ids.includes(sh.id) ? 'on' : ''}" data-pickshape="${sh.id}" title="${esc(sh.name || 'Shape ' + (i + 1))}${lq ? ' · liquid: ' + lq.op : ''} — Shift-click adds"><span class="sw" style="background:${st.fillOn ? st.fill : 'transparent'};border-color:${st.strokeOn ? st.stroke : '#666'}"></span>${esc(sh.name || 'Shape ' + (i + 1))}${lq ? ' <i>' + (lq.op === 'subtract' ? '−' : lq.op === 'intersect' ? '∩' : '∪') + '</i>' : ''}</button>`; }).join('') + '</span>';
+      if (ids.length) {
+        opts += '<span class="sep"></span><span class="chip" title="Liquid Shapes: live boolean combinations that keep following points, bones and animation">Liquid shapes</span>' +
+          LIQUID_OPS.map(([k, n, t]) => `<button class="btn" data-liquid="${k}" title="${t}" ${ids.length < 2 ? 'disabled' : ''}>${n}</button>`).join('') +
+          (L.shapes.some((sh) => ids.includes(sh.id) && lqOf(sh)) ? '<button class="btn" data-liquid="release" title="Turn them back into separate shapes">Release</button>' : '') +
+          `<span class="sep"></span><button class="btn" data-cmd="shape.up" title="Raise shape">▲</button><button class="btn" data-cmd="shape.down" title="Lower shape">▼</button><button class="btn" data-cmd="shape.rename">Rename</button><button class="btn" data-tab="style">Style…</button><button class="btn" data-cmd="shape.del">Delete</button>`;
+      }
+    }
+  }
   if (S.tool === 'shape') opts += '<span class="seg shapepick">' + [['rect', 'Rectangle'], ['ellipse', 'Ellipse'], ['polygon', 'Polygon / star']].map(([k, n]) => `<button class="btn ${TOOLS.shape.opts.kind === k ? 'on' : ''}" data-shape="${k}" title="${n}">${TOOL_ICONS[k]}${n}</button>`).join('') + '</span>';
   if (['pen', 'freehand', 'shape', 'rect', 'ellipse', 'polygon', 'fill'].includes(S.tool)) opts += styleCtl;
   if (S.tool === 'pen') opts += `<label><input type="checkbox" data-pen="smooth" ${TOOLS.pen.opts.smooth ? 'checked' : ''}>Smooth points</label><button class="btn" id="penDone">Finish path ⏎</button>`;
@@ -2598,6 +2951,26 @@ function renderToolOpts() {
     on('vactive', 'onchange', (e) => { const v = e.target.value; e.target.blur(); edit('Active construction', () => setVal(Bt, 'vit', v, S.frame, true)); });
     on('offreset', 'onclick', () => edit('Reset offsets', () => Bt.bones.forEach((b) => { b.ox = 0; b.oy = 0; })));
   }
+  el.querySelectorAll('[data-cs]').forEach((b) => (b.onclick = () => { const [k, v] = b.dataset.cs.split(':'); TOOLS.createshape.opts[k] = k === 'lasso' ? v === '1' : v; el._h = ''; renderToolOpts(); requestDraw(); }));
+  el.querySelectorAll('[data-tf]').forEach((i) => { i.onchange = () => { const v = +i.value; if (isFinite(v)) tfSet(i.dataset.tf, v); el._h = ''; }; i.onkeydown = (e) => e.stopPropagation(); });
+  el.querySelectorAll('[data-tfa]').forEach((b) => {
+    const a = b.dataset.tfa;
+    if (a === 'path') b.onchange = () => { S.showPaths = b.checked; el._h = ''; requestDraw(); };
+    else b.onclick = () => {
+      const ls = S.selLayers.map(findLayer).filter((l) => l && !l.lock); if (!ls.length) return;
+      edit(a === 'reset' ? 'Reset transform' : 'Flip layer', () => { for (const L of ls) {
+        if (a === 'reset') { for (const [k, v] of [['x', 0], ['y', 0], ['rot', 0], ['sx', 1], ['sy', 1]]) setVal(L, k, v); }
+        else { const k = a === 'flipH' ? 'sx' : 'sy'; setVal(L, k, -(val(L, k, S.frame) ?? 1)); }
+      } });
+      el._h = '';
+    };
+  });
+  el.querySelectorAll('[data-bucket]').forEach((b) => (b.onclick = () => { const [k, v] = b.dataset.bucket.split(':'); TOOLS.fill.opts[k] = v; el._h = ''; renderToolOpts(); }));
+  el.querySelectorAll('[data-bucketn]').forEach((i) => (i.onchange = () => { TOOLS.fill.opts[i.dataset.bucketn] = +i.value; el._h = ''; }));
+  el.querySelectorAll('[data-bucketc]').forEach((i) => (i.onchange = () => { TOOLS.fill.opts[i.dataset.bucketc] = i.checked; el._h = ''; }));
+  el.querySelectorAll('[data-bzopt]').forEach((i) => (i.onchange = () => { S[i.dataset.bzopt] = i.checked; el._h = ''; requestDraw(); }));
+  el.querySelectorAll('[data-pickshape]').forEach((b) => (b.onclick = (e) => { const L = selLayer(); if (L) { pickShape(L, b.dataset.pickshape, e.shiftKey); refreshAll(); } }));
+  el.querySelectorAll('[data-liquid]').forEach((b) => (b.onclick = () => (b.dataset.liquid === 'release' ? releaseLiquid() : makeLiquid(b.dataset.liquid))));
   el.querySelectorAll('[data-shape]').forEach((b) => (b.onclick = () => { TOOLS.shape.opts.kind = b.dataset.shape; el._h = ''; renderToolOpts(); }));
   const pd = $('#penDone'); if (pd) pd.onclick = () => finishPen(false);
   const ep = $('#emPreset'); if (ep) ep.onchange = () => (TOOLS.emitter.opts.preset = ep.value);
@@ -4604,11 +4977,15 @@ cmd('layer.up', 'Draw', 'Raise layer', () => edit('Raise layer', () => { const L
 cmd('layer.down', 'Draw', 'Lower layer', () => edit('Lower layer', () => { const L = selLayer(), s = siblingsOf(L.id), i = s.indexOf(L); if (i < s.length - 1) { s.splice(i, 1); s.splice(i + 1, 0, L); } }), { k: 'Ctrl+↓', keys: 'ctrl+arrowdown', en: needLayer });
 cmd('pts.del', 'Draw', 'Delete selected points', () => edit('Delete points', () => { deletePoints(selLayer(), [...S.selPts]); S.selPts = new Set(); }), { en: needPts });
 cmd('pts.close', 'Draw', 'Close / open selected path', () => edit('Close path', () => { const L = selLayer(); for (const pa of L.paths) if (pa.pts.some((p) => S.selPts.has(p))) pa.closed = !pa.closed; }), { en: needPts, kw: 'weld join' });
-cmd('pts.smooth', 'Draw', 'Make selected points smooth', () => edit('Smooth points', () => { for (const id of S.selPts) selLayer().pts[id].c = 1; }), { en: needPts, kw: 'curvature' });
-cmd('pts.corner', 'Draw', 'Make selected points sharp corners', () => edit('Corner points', () => { for (const id of S.selPts) selLayer().pts[id].c = 0; }), { en: needPts, kw: 'curvature peak' });
+cmd('pts.smooth', 'Draw', 'Smooth: make selected points smooth (resets their handles)', () => edit('Smooth points', () => { const L = selLayer(); for (const id of S.selPts) { L.pts[id].c = 1; clearHandles(L, id); } }), { en: needPts, kw: 'curvature bezier handles' });
+cmd('pts.corner', 'Draw', 'Peak: make selected points sharp corners (resets their handles)', () => edit('Peak points', () => { const L = selLayer(); for (const id of S.selPts) { L.pts[id].c = 0; clearHandles(L, id); } }), { en: needPts, kw: 'curvature peak corner bezier' });
 cmd('pts.flipH', 'Draw', 'Flip points horizontally', () => flipPts(0), { en: needPts, kw: 'mirror' });
 cmd('pts.flipV', 'Draw', 'Flip points vertically', () => flipPts(1), { en: needPts, kw: 'mirror' });
+cmd('shape.createsel', 'Draw', 'Create shape from the selected points (Create shape tool)', () => commitCreateShape(), { kw: 'fill outline create shape' });
 cmd('shape.create', 'Draw', 'Create shape from selected points', () => edit('Create shape', () => { const L = selLayer(); const pa = L.paths.filter((p) => p.pts.some((i) => S.selPts.has(i))); if (pa.length) S.selShape = addShape(L, pa.map((p) => p.id)).id; }), { en: needPts, kw: 'fill' });
+cmd('shape.rename', 'Draw', 'Rename shape', () => { const L = selLayer(), sh = L && L.shapes.find((s) => s.id === S.selShape); if (sh) askText('Rename shape', 'Name', sh.name || 'Shape ' + (L.shapes.indexOf(sh) + 1)).then((n) => n && edit('Rename shape', () => (sh.name = n))); }, { en: () => (S.selShape ? false : 'Select a shape') });
+for (const [k, n, t] of LIQUID_OPS) cmd('shape.liquid.' + k, 'Draw', 'Liquid shapes: ' + n, () => makeLiquid(k), { kw: 'boolean union cut merge ' + t });
+cmd('shape.liquid.release', 'Draw', 'Liquid shapes: release', () => releaseLiquid(), { kw: 'boolean separate' });
 cmd('shape.del', 'Draw', 'Delete selected shape', () => edit('Delete shape', () => { const L = selLayer(); L.shapes = L.shapes.filter((s) => s.id !== S.selShape); deleteChannelsMatching(L, (k) => k.startsWith('sh:' + S.selShape + ':')); S.selShape = null; }), { en: needShape });
 cmd('shape.up', 'Draw', 'Raise shape', () => edit('Raise shape', () => { const L = selLayer(), i = L.shapes.findIndex((s) => s.id === S.selShape); if (i < L.shapes.length - 1) { const [s] = L.shapes.splice(i, 1); L.shapes.splice(i + 1, 0, s); } }), { en: needShape });
 cmd('shape.down', 'Draw', 'Lower shape', () => edit('Lower shape', () => { const L = selLayer(), i = L.shapes.findIndex((s) => s.id === S.selShape); if (i > 0) { const [s] = L.shapes.splice(i, 1); L.shapes.splice(i - 1, 0, s); } }), { en: needShape });
@@ -4888,7 +5265,7 @@ function initKeys() {
   document.addEventListener('keyup', (e) => {
     if (e.key === ' ' && Stage.space) {
       Stage.space = false; setCursor();
-      if (performance.now() - Stage.spaceT < 220 && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !$('#modal').classList.contains('show')) togglePlay();
+      if (performance.now() - Stage.spaceT < 220 && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !$('#modal').classList.contains('show')) { if (S.tool === 'createshape' && createShapePlan(selLayer())) commitCreateShape(); else togglePlay(); }
     }
   });
 }
@@ -4917,7 +5294,7 @@ function boot() {
 }
 function updateUndoButtons() { $('#btnUndo').disabled = !H.undo.length; $('#btnRedo').disabled = !H.redo.length; $('#btnUndo').title = H.undo.length ? 'Undo: ' + H.undo[H.undo.length - 1].label + ' (Ctrl+Z)' : 'Nothing to undo'; $('#btnRedo').title = H.redo.length ? 'Redo: ' + H.redo[H.redo.length - 1].label : 'Nothing to redo'; }
 window.PopaiTest = { particleList, newDoc, mkLayer, mouthKit, applyParticlePreset, vShape, vEllipse, vRect, setKey, sortBones, autoBindPoints, fxDefaults, uid, layerLocalM, evalLC }; // read-only hooks for compatibility tests
-window.PopaiApp = { ENGINE, Scenes: () => Scenes, legacyRenderScene, renderSceneAsync, drawScene, snapshot, REV: () => REV, boneScreen, simulateBones, boneFrames, setMode, toolAvail, swSetActive, switchState, contentBox, S, H, CMDS, runCmd, edit, setFrame, setTool, findLayer, allLayers, renderScene, parseAI, applyCmd, demoProject, startDoc, val, TL, Stage, loadProjectJSON, serialize, analyzeSpeech, Jobs, openLipSync };
+window.PopaiApp = { screenBBox, mkLayer, addPoint, addShape, uid, selLayer, lcOf, M, selShapeIds, ENGINE, Scenes: () => Scenes, legacyRenderScene, renderSceneAsync, drawScene, snapshot, REV: () => REV, boneScreen, simulateBones, boneFrames, setMode, toolAvail, swSetActive, switchState, contentBox, S, H, CMDS, runCmd, edit, setFrame, setTool, findLayer, allLayers, renderScene, parseAI, applyCmd, demoProject, startDoc, val, TL, Stage, loadProjectJSON, serialize, analyzeSpeech, Jobs, openLipSync };
 boot();
 
 }
