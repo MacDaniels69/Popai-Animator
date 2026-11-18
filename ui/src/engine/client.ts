@@ -105,8 +105,8 @@ export class SceneStore {
   static BATCH = 8;
   /** true if a fresh scene for these options is cached */
   has(o: SceneOpts) { const e = this.cache.get(SceneStore.key(o)); return !!e && e.rev === this.src.getRev(); }
-  static key(o: SceneOpts) { return JSON.stringify([o.frame, !!o.export, o.only || '', !!o.noTrail, o.swOverride || {}, !!o.noCamera, o.root || '']); }
-  static slot(o: SceneOpts) { return JSON.stringify([!!o.export, o.only || '', !!o.noTrail, !!o.noCamera, o.root || '']); }
+  static key(o: SceneOpts) { return JSON.stringify([o.frame, !!o.export, o.only || '', !!o.noTrail, o.swOverride || {}, !!o.noCamera, o.root || '', !!o.want3d]); }
+  static slot(o: SceneOpts) { return JSON.stringify([!!o.export, o.only || '', !!o.noTrail, !!o.noCamera, o.root || '', !!o.want3d]); }
 
   /** Fresh scene if available, else the latest scene for this view (possibly stale), else null. */
   get(o: SceneOpts): SceneNode[] | null {

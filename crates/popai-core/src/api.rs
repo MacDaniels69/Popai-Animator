@@ -36,6 +36,7 @@ fn opts_from(v: &Json) -> SceneOpts {
         sw_override: swo,
         no_camera: b("noCamera"),
         root: s("root"),
+        want3d: b("want3d"),
     }
 }
 
@@ -64,7 +65,7 @@ impl Engine {
         let s = |k: &str| p.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         match method {
             "version" => Ok(json!({ "engine": "popai-core", "version": ENGINE_VERSION, "rust": true,
-                "features": ["evaluate", "bones", "binding", "physics", "particles", "switch", "camera", "history"] })),
+                "features": ["evaluate", "bones", "binding", "physics", "particles", "switch", "camera", "history", "3d"] })),
             "set_doc" => {
                 let doc = p.get("doc").ok_or("missing doc")?;
                 let txt = if doc.is_string() { doc.as_str().unwrap().to_string() } else { doc.to_string() };

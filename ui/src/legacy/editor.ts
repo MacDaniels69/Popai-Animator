@@ -7,6 +7,8 @@
 import type { EngineClient } from '../engine/client';
 import { SceneStore } from '../engine/client';
 import { TOOL_ICONS } from './toolIcons';
+import * as V3 from './view3d';
+import LOGO_WORDMARK from '../assets/popai-wordmark.png';
 
 export function mountEditor(ENGINE: EngineClient) {
 'use strict';
@@ -130,6 +132,9 @@ function evalChannel(ch, f) {
 // ---------- application state (not saved in document) ----------
 const S = {
   doc: null,
+  // 3D workspace: viewing direction of the main view and the extra panes (never keyed, never saved in the project)
+  v3: { dir: 'camera', yaw: 0, pitch: 0, dist: V3.CAM_D, layout: 1,
+    panes: [{ dir: 'top', zoom: 0.2, panX: 0, panY: 0, yaw: 35, pitch: 20, dist: 2600 }, { dir: 'right', zoom: 0.2, panX: 0, panY: 0, yaw: 35, pitch: 20, dist: 2600 }, { dir: 'orbit', zoom: 0.3, panX: 0, panY: 0, yaw: 35, pitch: 20, dist: 2600 }] },
   boneLabels: (() => { try { return localStorage.getItem('popai.boneLabels') !== '0'; } catch { return true; } })(),
   media: {}, // id -> {name, type, url, el(img|audioBuffer)}
   frame: 0,
@@ -234,7 +239,7 @@ function allLayers() { const a = []; walk(S.doc.layers, (L) => { a.push(L); }); 
 
 // ---------- property access (base values + channels) ----------
 function baseGet(o, path) {
-  if (path.indexOf(':') < 0) return o.p[path];
+  if (path.indexOf(':') < 0) { const v = o.p[path]; return v === undefined && (path === 'rx' || path === 'ry') ? 0 : v; }
   const [kind, id, prop] = path.split(':');
   if (kind === 'pt') { const p = o.pts && o.pts[id]; return p ? [p.x, p.y] : undefined; }
   if (kind === 'bone') {
@@ -675,13 +680,14 @@ function sceneOpts(f, opts = {}) {
   if (opts.export) o.export = true;
   if (opts.only) o.only = opts.only;
   if (opts.noTrail) o.noTrail = true;
+  if (opts.want3d) o.want3d = true;
   if (opts.swOverride && Object.keys(opts.swOverride).length) o.swOverride = opts.swOverride;
   return o;
 }
 function renderScene(ctx, f, view, opts = {}) {
-  if (!useRust()) return legacyRenderScene(ctx, f, view, opts);
+  if (!useRust()) return opts.proj3 ? null : legacyRenderScene(ctx, f, view, opts); // other directions need the Rust engine
   const nodes = Scenes.get(sceneOpts(f, opts));
-  if (!nodes) return legacyRenderScene(ctx, f, view, opts); // only before the engine's first answer
+  if (!nodes) return opts.proj3 ? null : legacyRenderScene(ctx, f, view, opts); // only before the engine's first answer
   return drawScene(ctx, nodes, f, view, opts);
 }
 async function renderSceneAsync(ctx, f, view, opts = {}) {
@@ -689,7 +695,7 @@ async function renderSceneAsync(ctx, f, view, opts = {}) {
   return drawScene(ctx, await Scenes.fetch(sceneOpts(f, opts)), f, view, opts);
 }
 function drawScene(ctx, nodes, f, view, opts = {}) {
-  const R = { f, view, rec: opts.rec || null, export: !!opts.export, W: ctx.canvas.width, H: ctx.canvas.height, vs: M.scaleOf(view) };
+  const R = { f, view, rec: opts.rec || null, export: !!opts.export, W: ctx.canvas.width, H: ctx.canvas.height, vs: M.scaleOf(view), v33: V3.aff33(view), P: opts.proj3 ? V3.mulAP(V3.aff33(view), opts.proj3) : null };
   for (const n of nodes) drawNode(ctx, n, R);
   return R;
 }
@@ -700,17 +706,24 @@ function sceneRec(n, full) {
   if (n.active) e.activeChild = n.active;
   return e;
 }
+// homography of a node's plane in this view (null = an ordinary flat layer drawn with its affine `m`)
+function nodeH(n, R) {
+  if (R.P) return n.w3 ? V3.planeH(R.P, n.w3) : null;
+  return n.h ? V3.mul33(R.v33, n.h) : null;
+}
 function drawNode(ctx, n, R) {
-  const full = M.mul(R.view, n.m);
-  if (R.rec && !n.anc) { const e = sceneRec(n, full); if (e) R.rec.push(e); }
+  if (R.P && n.kind === 'particle') return; // particles are shown in the Camera view only
+  let full = M.mul(R.view, n.m), H = nodeH(n, R);
+  if (H) { if (V3.isAffine(H)) { full = V3.hToAff(H); H = null; } else full = V3.linearize(H); }
+  if (R.rec && !n.anc) { const e = sceneRec(n, full); if (e) { e.H = H; R.rec.push(e); } }
   if (n.op <= 0.001) return;
   const ga0 = ctx.globalAlpha; ctx.globalAlpha = ga0 * (n.fade ?? 1);
   const cont = n.kind === 'group' || n.kind === 'switch' || n.kind === 'bone';
   const fxOn = !n.anc && n.fx && n.fx.length > 0;
   const needOff = !n.anc && (fxOn || n.blend !== 'source-over' || (cont && n.op < 0.999) || (n.kind === 'group' && n.mask !== 'none'));
-  if (!needOff) { ctx.globalAlpha *= n.op; drawNodeContent(ctx, n, R, full); ctx.globalAlpha = ga0; return; }
+  if (!needOff) { ctx.globalAlpha *= n.op; drawNodeOrPlane(ctx, n, R, full, H); ctx.globalAlpha = ga0; return; }
   const off = Pool.get(R.W, R.H), octx = off.getContext('2d');
-  drawNodeContent(octx, n, R, full);
+  drawNodeOrPlane(octx, n, R, full, H);
   octx.setTransform(1, 0, 0, 1, 0, 0); octx.globalAlpha = 1; octx.globalCompositeOperation = 'source-over';
   const sc = R.vs * n.cs;
   for (const e of n.fx || []) {
@@ -730,6 +743,42 @@ function drawGhosts(c, e, R) {
     x.globalCompositeOperation = 'destination-over'; x.globalAlpha = g.alpha; x.drawImage(t, 0, 0);
   }
   x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; Pool.put(t);
+}
+function drawNodeOrPlane(ctx, n, R, full, H) {
+  if (!H || n.kind === 'group' || n.kind === 'switch' || n.kind === 'bone' || n.kind === 'particle') return drawNodeContent(ctx, n, R, full);
+  drawPlane(ctx, n, R, H);
+}
+// local-space bounds of a layer's own artwork [x, y, w, h]
+function nodeBounds(n) {
+  if (n.kind === 'vector') {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, sw = 0;
+    const add = (x, y) => { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; };
+    for (const sh of n.shapes || []) {
+      if (sh.strokeOn && sh.width > sw) sw = sh.width;
+      for (const sp of sh.subpaths) { add(sp.start[0], sp.start[1]); for (const g of sp.segs) for (let i = 0; i < g.length; i += 2) add(g[i], g[i + 1]); }
+    }
+    if (x0 === Infinity) return null;
+    const m = sw / 2 + 2; return [x0 - m, y0 - m, x1 - x0 + 2 * m, y1 - y0 + 2 * m];
+  }
+  if (n.kind === 'image' && n.image) return [-n.image.iw / 2, -n.image.ih / 2, n.image.iw, n.image.ih];
+  if (n.kind === 'text' && n.text) {
+    const t = n.text; _hitCtx.font = `${t.bold ? '700 ' : ''}${t.size}px ${t.font}`;
+    const lines = String(t.text).split('\n'), w = Math.max(...lines.map((l) => _hitCtx.measureText(l).width)), h = lines.length * t.size * 1.15;
+    return [-w / 2 - 6, -h / 2 - 6, w + 12, h + 12];
+  }
+  return null;
+}
+// artwork of a tilted plane: paint it flat, then lay it onto the plane in perspective
+function drawPlane(ctx, n, R, H) {
+  const b = nodeBounds(n); if (!b || b[2] <= 0 || b[3] <= 0) return;
+  const [x0, y0, bw, bh] = b, c = [[x0, y0], [x0 + bw, y0], [x0 + bw, y0 + bh], [x0, y0 + bh]].map(([x, y]) => V3.applyH(H, x, y));
+  if (c.some((q) => q[2] <= 0.02)) return; // behind the eye
+  let k = 0; for (let i = 0; i < 4; i++) { const a = c[i], d = c[(i + 1) % 4]; k = Math.max(k, Math.hypot(d[0] - a[0], d[1] - a[1]) / (i % 2 ? bh : bw)); }
+  k = Math.max(0.02, Math.min(k * 1.15, 4, 2048 / bw, 2048 / bh));
+  const off = Pool.get(Math.max(1, Math.ceil(bw * k)), Math.max(1, Math.ceil(bh * k)));
+  drawNodeContent(off.getContext('2d'), n, R, [k, 0, 0, k, -x0 * k, -y0 * k]);
+  V3.drawWarped(ctx, off, H, x0, y0, bw, bh, k, 0);
+  Pool.put(off);
 }
 function drawNodeContent(ctx, n, R, full) {
   switch (n.kind) {
@@ -1037,6 +1086,12 @@ function renderStage() {
   if (cv.width !== W || cv.height !== Hh) { cv.width = W; cv.height = Hh; }
   const d = S.doc, V = viewM();
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  if (S.v3.dir !== 'camera') { // looking at the scene from another direction: inspection only
+    Stage.rec = [];
+    render3DView(ctx, W, Hh, V, S.v3, dpr, true);
+    renderCrumbs(); $('#hudInfo').textContent = `${Math.round(S.view.zoom * 100)}%  ·  frame ${S.frame}`;
+    renderPanes(); return;
+  }
   ctx.fillStyle = '#2b2e35'; ctx.fillRect(0, 0, W, Hh);
   // frame background + shadow
   M.set(ctx, V); ctx.shadowColor = 'rgba(0,0,0,.45)'; ctx.shadowBlur = 24 * dpr;
@@ -1081,6 +1136,108 @@ function renderStage() {
   }
   renderCrumbs();
   $('#hudInfo').textContent = `${Math.round(S.view.zoom * 100)}%  ·  frame ${S.frame}`;
+  renderPanes();
+}
+
+// ---------- 3D workspace views (Front / Top / Right / Orbit...) ----------
+function camTarget() { const c = S.doc.camera; return { tx: val(c, 'x', S.frame) || 0, ty: val(c, 'y', S.frame) || 0, zoom: val(c, 'zoom', S.frame) || 1, roll: val(c, 'roll', S.frame) || 0 }; }
+function viewProj(st) { const t = camTarget(); return V3.dirProj(st.dir, { yaw: st.yaw, pitch: st.pitch, dist: st.dist, tx: t.tx, ty: t.ty }); }
+function walkNodes(list, fn) { for (const n of list || []) { fn(n); if (n.maskChild) walkNodes([n.maskChild], fn); walkNodes(n.children, fn); } }
+function render3DView(ctx, W, Hh, V, st, dpr, main) {
+  const d = S.doc;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#23262d'; ctx.fillRect(0, 0, W, Hh);
+  if (st.dir === 'camera') { // a pane showing the camera view (no editing overlays)
+    M.set(ctx, V); ctx.fillStyle = d.bg; ctx.fillRect(-d.w / 2, -d.h / 2, d.w, d.h);
+    renderScene(ctx, S.frame, V, { export: true, swOverride: switchOverrides() });
+    ctx.setTransform(1, 0, 0, 1, 0, 0); const c0 = M.ap(V, -d.w / 2, -d.h / 2), c1 = M.ap(V, d.w / 2, d.h / 2);
+    ctx.fillStyle = 'rgba(35,38,45,.85)'; ctx.beginPath(); ctx.rect(0, 0, W, Hh); ctx.rect(c0[0], c0[1], c1[0] - c0[0], c1[1] - c0[1]); ctx.fill('evenodd');
+    dirLabel(ctx, 'CAMERA', dpr); return;
+  }
+  const P = viewProj(st), PV = V3.mulAP(V3.aff33(V), P), t = camTarget();
+  // floor grid under the picture (y = half the frame height), so depth is easy to read
+  ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,.06)'; ctx.lineWidth = 1; ctx.beginPath();
+  const gy = t.ty + d.h / 2, span = 4000, stp = 250;
+  for (let a = -span; a <= span; a += stp) {
+    const l1 = [V3.projPt(PV, t.tx + a, gy, -span), V3.projPt(PV, t.tx + a, gy, span * 0.4)], l2 = [V3.projPt(PV, t.tx - span, gy, a), V3.projPt(PV, t.tx + span, gy, a)];
+    for (const [p, q] of [l1, l2]) if (p && q && a <= span * 0.4 + 1) { ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); }
+  }
+  ctx.stroke(); ctx.restore();
+  renderScene(ctx, S.frame, V, { want3d: true, proj3: P, export: S.outputOnly, swOverride: switchOverrides() });
+  // layer planes as outlines (a plane seen edge-on is just a line), selected layer highlighted
+  const nodes = useRust() ? Scenes.get(sceneOpts(S.frame, { want3d: true, export: S.outputOnly, swOverride: switchOverrides() })) : null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.lineWidth = Math.max(1, dpr);
+  walkNodes(nodes, (n) => {
+    if (!n.w3 || n.anc) return; const b = nodeBounds(n); if (!b) return;
+    const H = V3.planeH(PV, n.w3), [x0, y0, bw, bh] = b;
+    const c = [[x0, y0], [x0 + bw, y0], [x0 + bw, y0 + bh], [x0, y0 + bh]].map(([x, y]) => V3.applyH(H, x, y)); if (c.some((q) => q[2] <= 0.02)) return;
+    const sel = S.selLayers.includes(n.id); ctx.strokeStyle = sel ? '#ff8a3d' : 'rgba(120,170,255,.55)';
+    ctx.beginPath(); c.forEach((q, i) => (i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]))); ctx.closePath(); ctx.stroke();
+    if (sel) { const L = findLayer(n.id); const o = V3.applyH(H, 0, 0); ctx.fillStyle = '#ff8a3d'; ctx.font = `600 ${10 * dpr}px Inter, system-ui, sans-serif`; if (L) ctx.fillText(L.name, o[0] + 6 * dpr, o[1] - 6 * dpr); }
+  });
+  // the render camera: its frame on the picture plane and lines to the eye
+  const hw = d.w / 2 / t.zoom, hh = d.h / 2 / t.zoom, a = (t.roll * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+  const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => V3.projPt(PV, t.tx + x * ca - y * sa, t.ty + x * sa + y * ca, 0));
+  const eye = V3.projPt(PV, t.tx, t.ty, V3.CAM_D);
+  ctx.strokeStyle = '#ffd166'; ctx.setLineDash([5 * dpr, 4 * dpr]); ctx.beginPath();
+  if (corners.every(Boolean)) { corners.forEach((q, i) => (i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]))); ctx.closePath(); }
+  if (eye) for (const q of corners) if (q) { ctx.moveTo(eye[0], eye[1]); ctx.lineTo(q[0], q[1]); }
+  ctx.stroke(); ctx.setLineDash([]);
+  if (eye) { ctx.fillStyle = '#ffd166'; ctx.beginPath(); ctx.arc(eye[0], eye[1], 4 * dpr, 0, Math.PI * 2); ctx.fill(); ctx.font = `600 ${10 * dpr}px Inter, system-ui, sans-serif`; ctx.fillText('Camera', eye[0] + 7 * dpr, eye[1] + 4 * dpr); }
+  dirLabel(ctx, (V3.DIRS.find((x) => x[0] === st.dir) || ['', st.dir])[1].toUpperCase() + (main ? '  ·  view only — no keys are made. Shift+Home returns to Camera' : ''), dpr, main ? 48 : 18);
+}
+function dirLabel(ctx, txt, dpr, y = 18) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = `600 ${11 * dpr}px Inter, system-ui, sans-serif`; ctx.fillText(txt, 10 * dpr, y * dpr); }
+function paneView(cv, st, dpr) { const z = st.zoom * dpr; return M.chain(M.t(cv.width / 2 + st.panX * dpr, cv.height / 2 + st.panY * dpr), M.s(z)); }
+function renderPanes() {
+  const n = S.v3.layout === 4 ? 3 : S.v3.layout === 2 ? 1 : 0;
+  $$('#panes .pane').forEach((el, i) => {
+    el.style.display = i < n ? '' : 'none'; if (i >= n) return;
+    const cv = el.querySelector('canvas'), r = cv.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
+    const W = Math.max(10, Math.round(r.width * dpr)), Hh = Math.max(10, Math.round(r.height * dpr));
+    if (cv.width !== W || cv.height !== Hh) { cv.width = W; cv.height = Hh; }
+    const st = S.v3.panes[i]; if (st.zoom === null) fitPane(cv, st);
+    render3DView(cv.getContext('2d'), W, Hh, paneView(cv, st, dpr), st, dpr, false);
+  });
+}
+function fitPane(cv, st) { const r = cv.getBoundingClientRect(); st.zoom = st.dir === 'camera' ? Math.min((r.width - 30) / S.doc.w, (r.height - 30) / S.doc.h) : Math.min(r.width, r.height) / 4200; st.panX = 0; st.panY = 0; }
+const ORBIT_FROM = { camera: [0, 0], front: [0, 0], back: [180, 0], top: [0, 89], bottom: [0, -89], left: [-90, 0], right: [90, 0] };
+function setViewDir(dir) {
+  if (dir === 'orbit' && S.v3.dir !== 'orbit') { const o = ORBIT_FROM[S.v3.dir] || [30, 18]; S.v3.yaw = o[0] || 30; S.v3.pitch = o[1] || 18; S.v3.dist = V3.CAM_D * 1.6; }
+  S.v3.dir = dir; const sel = $('#viewDir'); if (sel) sel.value = dir;
+  if (dir !== 'camera' && S.view.zoom > 0.6) S.view.zoom = 0.35;
+  if (dir === 'camera') fitView();
+  requestDraw();
+}
+function setViewLayout(n) {
+  S.v3.layout = n; const w = $('#stagewrap'); w.classList.remove('lay1', 'lay2', 'lay4'); w.classList.add('lay' + n);
+  $$('[data-layout]').forEach((b) => b.classList.toggle('on', +b.dataset.layout === n));
+  S.v3.panes.forEach((p) => (p.zoom = null)); requestAnimationFrame(() => { requestDraw(); });
+}
+function initPanes() {
+  const wrap = $('#stagewrap'), box = document.createElement('div'); box.id = 'panes'; wrap.appendChild(box); wrap.classList.add('lay1');
+  S.v3.panes.forEach((st, i) => {
+    const el = document.createElement('div'); el.className = 'pane p' + i; el.style.display = 'none';
+    el.innerHTML = `<canvas></canvas><div class="panebar"><select title="Viewing direction of this pane (does not animate)">${V3.DIRS.map(([k, n]) => `<option value="${k}" ${k === st.dir ? 'selected' : ''}>${n}</option>`).join('')}</select><button class="ib sm" title="Fit">⤢</button></div>`;
+    box.appendChild(el);
+    const cv = el.querySelector('canvas'), sel = el.querySelector('select');
+    sel.onchange = () => { st.dir = sel.value; st.zoom = null; sel.blur(); requestDraw(); };
+    el.querySelector('button').onclick = () => { st.zoom = null; requestDraw(); };
+    let drag = null;
+    cv.addEventListener('pointerdown', (e) => { cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, panX: st.panX, panY: st.panY, yaw: st.yaw, pitch: st.pitch, orbit: st.dir === 'orbit' && e.button === 0 && !e.shiftKey }; });
+    cv.addEventListener('pointermove', (e) => {
+      if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (drag.orbit) { st.yaw = drag.yaw + dx * 0.35; st.pitch = clamp(drag.pitch + dy * 0.35, -89, 89); } else { st.panX = drag.panX + dx; st.panY = drag.panY + dy; }
+      requestDraw();
+    });
+    cv.addEventListener('pointerup', () => (drag = null));
+    cv.addEventListener('wheel', (e) => { e.preventDefault(); if (st.zoom === null) return; st.zoom = clamp(st.zoom * Math.exp(-e.deltaY * 0.0015), 0.01, 20); requestDraw(); }, { passive: false });
+  });
+  const hud = $('#stagehud');
+  const h = document.createElement('span'); h.className = 'v3ctl';
+  h.innerHTML = `<select id="viewDir" title="Viewing direction — look at the scene from the front, top, side or orbit around it. Changing it never makes keys.">${V3.DIRS.map(([k, n]) => `<option value="${k}">${n}</option>`).join('')}</select>` +
+    [[1, '▢', 'One view'], [2, '◫', 'Two views'], [4, '⊞', 'Four views']].map(([n, ic, t]) => `<button class="ib sm ${n === 1 ? 'on' : ''}" data-layout="${n}" title="${t}">${ic}</button>`).join('');
+  hud.insertBefore(h, hud.firstChild);
+  $('#viewDir').onchange = (e) => { setViewDir(e.target.value); e.target.blur(); };
+  $$('[data-layout]').forEach((b) => (b.onclick = () => setViewLayout(+b.dataset.layout)));
 }
 
 // ---------- overlays (editor-only, never rendered on export) ----------
@@ -1149,7 +1306,7 @@ function drawOverlays(ctx) {
   for (const id of S.selLayers) {
     const L = findLayer(id); if (!L) continue;
     if (L.type === 'vector') {
-      const e = lcOf(L); if (!e.P) continue;
+      const e = lcOf(L); if (!e.P || e.H) continue; // turned in space: outlines would not line up with the perspective drawing
       const showPts = POINT_TOOLS.has(S.tool) || S.tool === 'bind' || S.tool === 'bindpts' || S.tool === 'strength';
       const showW = showPts && S.selBone && boneLayerFor(L) && boneLayerFor(L).bones.some((b) => b.id === S.selBone);
       const flexW = showW && !L.bindBone ? (() => { const lc = lcOf(L); const sg = flexSegs(lc.B); return (pid) => { const w = flexWeights(sg, M.ap(lc.relPts, L.pts[pid].x, L.pts[pid].y)), t = w.reduce((a, q) => a + q[1], 0), m = w.find((q) => q[0] === S.selBone); return m ? m[1] / t : t ? 0 : null; }; })() : null;
@@ -1378,18 +1535,18 @@ function hitSegment(L, sx, sy) {
 // ---------- tools ----------
 const TOOLS = {};
 const TOOL_GROUPS = [
-  ['Select', ['select', 'points']],
+  ['Select', ['select', 'rotxy', 'points']],
   ['Draw', ['pen', 'freehand', 'shape', 'text']],
   ['Edit', ['curvature', 'fill']],
   ['Bone', ['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset']],
   ['FX', ['emitter']],
   ['Camera', ['camera']],
-  ['View', ['pan', 'zoom']],
+  ['View', ['pan', 'zoom', 'orbit']],
 ];
 function defTool(id, t) { TOOLS[id] = { id, ...t }; }
 // Which tools apply depends on: selected layer type + editing mode + current selection.
 // Tools never move; unavailable ones are dimmed and explain why.
-const TOOLS_ALWAYS = new Set(['select', 'text', 'emitter', 'camera', 'pan', 'zoom']);
+const TOOLS_ALWAYS = new Set(['select', 'text', 'emitter', 'camera', 'pan', 'zoom', 'orbit']);
 const TOOLS_DRAW = new Set(['pen', 'freehand', 'shape', 'rect', 'ellipse', 'polygon']);
 function toolAvail(id) {
   if (TOOLS_ALWAYS.has(id)) return null;
@@ -1407,6 +1564,7 @@ function toolAvail(id) {
     if (L.type === 'text') return 'Text layers keep editable letters, so they have no points';
     return `${T} layers have no vector points`;
   }
+  if (id === 'rotxy') { if (!L) return 'Select a layer to turn it in space'; if (L.type === 'audio') return 'Sound layers have no position in space'; return null; }
   if (BONE_TOOLS.has(id)) {
     const B = activeBoneLayer();
     if (!B) return 'Bone tools work on a Bone Group — select one (or artwork inside it). Rig ▸ New bone group creates one.';
@@ -1683,6 +1841,34 @@ primTool('polygon', '⬠', 'Polygon / star', 'Y', (x, y, w, h) => {
   for (let i = 0; i < m; i++) { const a = (i / m) * Math.PI * 2 - Math.PI / 2, r = star && i % 2 ? 0.45 : 1; out.push([cx + (Math.cos(a) * w * r) / 2, cy + (Math.sin(a) * h * r) / 2, 0]); }
   return out;
 });
+
+// --- Rotate layer XY: turn / tilt the layer's plane in space (Moho's Rotate Layer XY)
+defTool('rotxy', {
+  icon: '⟲', name: 'Rotate layer XY', key: 'X', cursor: 'move',
+  hint: 'Drag left/right to turn the layer (Rotation Y), up/down to tilt it (Rotation X) · Shift snaps to 15° · keys at the playhead like any transform · position it in depth with Position Z',
+  down(e, sx, sy) { const L = selLayer(); if (!L) return; beginEdit('Rotate layer XY'); startDrag(e, { L, rx: val(L, 'rx', S.frame) || 0, ry: val(L, 'ry', S.frame) || 0 }); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return; const k = 0.4 / Stage.dpr;
+    let ry = d.ry + (sx - d.sx) * k, rx = d.rx - (sy - d.sy) * k;
+    if (e.shiftKey) { ry = Math.round(ry / 15) * 15; rx = Math.round(rx / 15) * 15; }
+    setVal(d.L, 'ry', round(ry, 1)); setVal(d.L, 'rx', round(rx, 1)); requestDraw(); renderPropsSoon();
+  },
+  up() { commitEdit(); },
+});
+// --- Orbit workspace: look at the scene from any angle (never animates)
+defTool('orbit', {
+  icon: '◎', name: 'Orbit workspace', key: '', cursor: 'grab',
+  hint: 'Drag to look at the scene from any angle — it changes only your view, never the animation · Alt-drag moves in and out · Shift+Home returns to the Camera view',
+  down(e, sx, sy) { if (S.v3.dir !== 'orbit') setViewDir('orbit'); startDrag(e, { yaw: S.v3.yaw, pitch: S.v3.pitch, dist: S.v3.dist }); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return; const k = 0.35 / Stage.dpr;
+    if (e.altKey) S.v3.dist = clamp(d.dist * Math.exp((sy - d.sy) / (180 * Stage.dpr)), 200, 40000);
+    else { S.v3.yaw = d.yaw + (sx - d.sx) * k; S.v3.pitch = clamp(d.pitch + (sy - d.sy) * k, -89, 89); }
+    requestDraw();
+  },
+  up() {},
+});
+function renderPropsSoon() { clearTimeout(renderPropsSoon.t); renderPropsSoon.t = setTimeout(() => { if (currentTab === 'props') refreshAll(); }, 120); }
 
 // --- Create shape: one tool for rectangle, ellipse and polygon/star (pick the shape in the bar above)
 defTool('shape', {
@@ -2129,6 +2315,7 @@ function initStage() {
     if (e.button !== 0) return;
     if (S.playing) stopPlay();
     const why = toolAvail(S.tool); if (why) return toast(why, 'err');
+    if (S.v3.dir !== 'camera' && !['pan', 'zoom', 'orbit', 'rotxy'].includes(S.tool)) return toast('This view is for checking depth and angles — editing happens in the Camera view (Shift+Home, or pick Camera at the bottom right)', 'err');
     const t = TOOLS[S.tool];
     if (t && t.down) t.down(e, sx, sy);
   });
@@ -2162,6 +2349,7 @@ function initStage() {
   // toolbar
   const tb = $('#toolbar');
   for (const id in TOOL_ICONS) if (TOOLS[id]) TOOLS[id].icon = TOOL_ICONS[id];
+  initPanes();
   for (const [g, ids] of TOOL_GROUPS) {
     const lab = document.createElement('div'); lab.className = 'tg'; lab.dataset.group = g; lab.textContent = g; tb.appendChild(lab);
     for (const id of ids) {
@@ -2377,7 +2565,7 @@ function renderToolOpts() {
 const TL = { cv: null, ctx: null, dpr: 1, ppf: 14, scrollX: 0, scrollY: 0, mode: 'dope', rows: [], drag: null, NAMEW: 0, RULER: 24, clip: null, curveView: null };
 
 // ---------- channel naming / grouping ----------
-const CH_LABEL = { x: 'Position X', y: 'Position Y', z: 'Depth Z', rot: 'Rotation', sx: 'Scale X', sy: 'Scale Y', opacity: 'Opacity', sw: 'Switch', color: 'Color', zoom: 'Zoom', roll: 'Roll', shake: 'Shake', shakeFreq: 'Shake freq', gain: 'Gain' };
+const CH_LABEL = { x: 'Position X', y: 'Position Y', z: 'Position Z', rot: 'Rotation Z', rx: 'Rotation X', ry: 'Rotation Y', sx: 'Scale X', sy: 'Scale Y', opacity: 'Opacity', sw: 'Switch', color: 'Color', zoom: 'Zoom', roll: 'Roll', shake: 'Shake', shakeFreq: 'Shake freq', gain: 'Gain' };
 function channelGroups(o) {
   const groups = new Map();
   const add = (key, label, path) => { if (!groups.has(key)) groups.set(key, { key, label, paths: [] }); groups.get(key).paths.push(path); };
@@ -3144,13 +3332,14 @@ function layerProps(L) {
   h += sec(`${LAYER_TYPES[L.type].icon} ${esc(LAYER_TYPES[L.type].name)} layer${multi ? ` <span style="color:var(--faint)">(+${S.selLayers.length - 1} more selected)</span>` : ''}`,
     fieldRow('Name', `<input type="text" data-lf="name" value="${esc(L.name)}">`) +
     fieldRow('Blend mode', sel_('blend', [['source-over', 'Normal'], ['multiply', 'Multiply'], ['screen', 'Screen'], ['overlay', 'Overlay'], ['lighter', 'Add'], ['darken', 'Darken'], ['lighten', 'Lighten'], ['color-dodge', 'Color dodge'], ['difference', 'Difference']], L.blend, 'data-lsel="blend"')) +
-    fieldRow('Render', `<label><input type="checkbox" data-lchk="render" ${L.render ? 'checked' : ''}> include in export</label>`));
+    fieldRow('Render', `<label><input type="checkbox" data-lchk="render" ${L.render ? 'checked' : ''}> include in export</label>`) +
+    (L.type === 'group' || L.type === 'bone' ? fieldRow('Depth sort', `<label title="Layers inside draw by their distance from the camera instead of their order in the Layers panel"><input type="checkbox" data-lchk="depthSort" ${L.depthSort ? 'checked' : ''}> sort children by depth</label>`) : ''));
   if (multi) {
     const ls = S.selLayers.map((id) => findLayer(id)).filter((l) => l && l.type !== 'audio');
-    if (ls.length) h += sec(`Transform · ${ls.length} layers`, multiRow(ls, 'x', 'Position X') + multiRow(ls, 'y', 'Position Y') + multiRow(ls, 'z', 'Depth Z') + multiRow(ls, 'rot', 'Rotation') +
+    if (ls.length) h += sec(`Transform · ${ls.length} layers`, multiRow(ls, 'x', 'Position X') + multiRow(ls, 'y', 'Position Y') + multiRow(ls, 'z', 'Position Z') + multiRow(ls, 'rx', 'Rotation X') + multiRow(ls, 'ry', 'Rotation Y') + multiRow(ls, 'rot', 'Rotation Z') +
       multiRow(ls, 'sx', 'Scale X', 0.01) + multiRow(ls, 'sy', 'Scale Y', 0.01) + multiRow(ls, 'opacity', 'Opacity', 0.01) +
       `<div class="note" style="grid-column:1/-1"><b>Mixed</b> means the selected layers differ; typing a value sets it on all of them. Effects below belong to “${esc(L.name)}”.</div>`);
-  } else if (L.type !== 'audio') h += sec('Transform', numRow(L, 'x', 'Position X') + numRow(L, 'y', 'Position Y') + numRow(L, 'z', 'Depth Z') + numRow(L, 'rot', 'Rotation', { unit: '°' }) +
+  } else if (L.type !== 'audio') h += sec('Transform', numRow(L, 'x', 'Position X') + numRow(L, 'y', 'Position Y') + numRow(L, 'z', 'Position Z') + numRow(L, 'rx', 'Rotation X', { unit: '°' }) + numRow(L, 'ry', 'Rotation Y', { unit: '°' }) + numRow(L, 'rot', 'Rotation Z', { unit: '°' }) +
     numRow(L, 'sx', 'Scale X', { step: 0.01 }) + numRow(L, 'sy', 'Scale Y', { step: 0.01 }) + numRow(L, 'opacity', 'Opacity', { step: 0.01, min: 0, max: 1 }) +
     fieldRow('Pivot', `<input type="number" data-piv="ox" value="${round(L.p.ox || 0)}" title="Pivot X (content space)" style="width:50%"><input type="number" data-piv="oy" value="${round(L.p.oy || 0)}" title="Pivot Y" style="width:50%">`) +
     `<div class="btnrow" style="grid-column:1/-1"><button class="btn" data-cmd="layer.pivotcenter">Centre pivot on artwork</button><span class="note" style="margin:0">or drag the ⊕ on stage with Select</span></div>`);
@@ -4378,6 +4567,11 @@ cmd('view.100', 'View', 'Zoom 100%', () => { S.view.zoom = 1; requestDraw(); }, 
 cmd('view.zin', 'View', 'Zoom in', () => zoomAt(Stage.cv.width / 2, Stage.cv.height / 2, 1.25), { k: '+', keys: '=|+' });
 cmd('view.zout', 'View', 'Zoom out', () => zoomAt(Stage.cv.width / 2, Stage.cv.height / 2, 0.8), { k: '-', keys: '-' });
 cmd('view.output', 'View', 'Output only (hide overlays)', () => { S.outputOnly = !S.outputOnly; $('[data-view=output]').classList.toggle('on', S.outputOnly); requestDraw(); }, { k: 'O', keys: 'o' });
+cmd('view.camera3d', 'View', 'Camera view (leave Top / Side / Orbit)', () => setViewDir('camera'), { k: 'Shift+Home', keys: 'shift+home' });
+for (const [k, n] of V3.DIRS) if (k !== 'camera') cmd('view.dir.' + k, 'View', 'Look from: ' + n, () => setViewDir(k), { kw: '3d view direction workspace angle' });
+cmd('view.split1', 'View', 'One view', () => setViewLayout(1), { kw: 'viewport layout split' });
+cmd('view.split2', 'View', 'Two views (Camera + Top)', () => setViewLayout(2), { kw: 'viewport layout split' });
+cmd('view.split4', 'View', 'Four views (Camera, Top, Right, Orbit)', () => setViewLayout(4), { kw: 'viewport layout split quad' });
 cmd('view.paths', 'View', 'Toggle motion paths', () => { S.showPaths = !S.showPaths; requestDraw(); });
 // Window
 for (const [t, n] of [['props', 'Properties'], ['style', 'Style'], ['switch', 'Switch'], ['ai', 'AI assistant'], ['jobs', 'Jobs']]) cmd('win.' + t, 'Window', n + ' panel', () => setTab(t));
@@ -4471,9 +4665,11 @@ async function projectSettings() {
   const r = await modal('Project settings', `<div class="form"><label>Name</label><input type="text" name="name" value="${esc(d.name)}">
     <label>Width</label><input type="number" name="w" value="${d.w}"><label>Height</label><input type="number" name="h" value="${d.h}">
     <label>Frame rate</label><input type="number" name="fps" value="${d.fps}"><label>End frame</label><input type="number" name="end" value="${d.end}">
-    <label>Background</label><input type="color" name="bg" value="${d.bg}"></div>`, [{ label: 'Cancel', value: false }, { label: 'Apply', value: true, pri: true }]);
+    <label>Background</label><input type="color" name="bg" value="${d.bg}">
+    <label>Depth</label><label style="text-align:left" title="Top-level layers draw by distance from the camera instead of their order in the Layers panel"><input type="checkbox" name="depthSort" ${d.depthSort ? 'checked' : ''}> Sort layers by depth</label>
+    <label></label><label style="text-align:left" title="Use the true distance from the camera to each layer's origin (helps with turned planes)"><input type="checkbox" name="depthSortTrue" ${d.depthSortTrue ? 'checked' : ''}> Sort by true distance</label></div>`, [{ label: 'Cancel', value: false }, { label: 'Apply', value: true, pri: true }]);
   if (!r || !r.v) return;
-  edit('Project settings', () => { const o = r.data; d.name = o.name || d.name; d.w = Math.max(16, o.w | 0); d.h = Math.max(16, o.h | 0); d.fps = clamp(o.fps | 0, 1, 120); d.end = Math.max(1, o.end | 0); d.bg = o.bg; });
+  edit('Project settings', () => { const o = r.data; d.name = o.name || d.name; d.w = Math.max(16, o.w | 0); d.h = Math.max(16, o.h | 0); d.fps = clamp(o.fps | 0, 1, 120); d.end = Math.max(1, o.end | 0); d.bg = o.bg; d.depthSort = !!o.depthSort; d.depthSortTrue = !!o.depthSortTrue; });
   updateTitle(); renderTLBar(); fitView();
 }
 const PRESETS = [['HD 1280×720', 1280, 720], ['Full HD 1920×1080', 1920, 1080], ['Square 1080×1080', 1080, 1080], ['Vertical 1080×1920', 1080, 1920], ['4K 3840×2160', 3840, 2160]];
@@ -4496,7 +4692,7 @@ function startDoc(d) {
 async function recoverAutosave() { const s = lsGet('popai.autosave'); if (!s) return; try { await loadProjectJSON(s); toast('Recovered autosave', 'ok'); } catch (e) { toast('Autosave unreadable', 'err'); } }
 function showHome() {
   const t = lsGet('popai.autosave.t');
-  modal('', `<div class="homein"><div class="hero"><span style="font-size:42px;color:var(--acc)">◆</span><div><div class="big">Popai <b>Animator</b></div><div class="note" style="margin:2px 0 0">2D animation studio — vectors, bones, switches, lip sync, effects and an AI assistant. Runs entirely in your browser.</div></div></div>
+  modal('', `<div class="homein"><div class="hero"><img src="${LOGO_WORDMARK}" alt="Popai Animator" style="height:64px;margin-right:6px"><div><div class="big" style="display:none">Popai <b>Animator</b></div><div class="note" style="margin:2px 0 0">2D animation studio — vectors, bones, switches, lip sync, effects and an AI assistant. Runs entirely in your browser.</div></div></div>
     <div class="grid">
       <div class="card" data-h="new"><h5>＋ New project</h5><p>Choose resolution and frame rate.</p></div>
       <div class="card" data-h="demo"><h5>✦ Demo scene</h5><p>A rigged character that talks, waves, jumps — with dust, trail and camera shake. Great to explore.</p></div>

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { EngineClient } from './engine/client';
 import { mountEditor } from './legacy/editor';
+import wordmark from './assets/popai-wordmark.png';
 
 /** Shows which engine evaluates frames, with the last round-trip time. */
 function EngineBadge({ engine }: { engine: EngineClient }) {
@@ -33,7 +34,7 @@ export function App({ engine }: { engine: EngineClient }) {
     <>
       <div id="app">
         <header id="menubar">
-          <div className="brand"><span className="logo">◆</span> Popai <b>Animator</b></div>
+          <div className="brand"><img className="brand-logo" src={wordmark} alt="Popai Animator" /></div>
           <nav id="menus"></nav>
           <div className="mb-right">
             <EngineBadge engine={engine} />

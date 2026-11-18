@@ -1,3 +1,4 @@
+import appIcon from './assets/popai-icon.png';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { connectEngine } from './engine/client';
@@ -10,3 +11,6 @@ connectEngine().then(async (engine) => {
     if (await invoke<boolean>('selftest_enabled')) (await import('./selftest')).runSelfTest(engine);
   }
 });
+
+// window / tab icon
+{ const l = document.querySelector<HTMLLinkElement>('link[rel=icon]'); if (l) l.href = appIcon; }

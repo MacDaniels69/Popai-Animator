@@ -44,6 +44,8 @@ export interface SceneOpts {
   swOverride?: Record<string, string>;
   noCamera?: boolean;
   root?: string;
+  /** include every layer's 3D plane matrix (views from other directions) */
+  want3d?: boolean;
 }
 
 export interface EngineInfo { engine: string; version: string; rust: boolean; features: string[] }

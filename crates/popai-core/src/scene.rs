@@ -122,6 +122,16 @@ pub struct Node {
     pub active: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<Node>>,
+    /// plane tilted in X/Y: homography (row-major 3x3) from the layer plane to the picture; `m` is then
+    /// only its linear approximation at the layer origin (used for picking)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub h: Option<[f64; 9]>,
+    /// layer plane -> world (4x4, column-major); sent for tilted layers and for views from other directions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub w3: Option<[f64; 16]>,
+    /// layer origin in world space (depth sorting)
+    #[serde(skip)]
+    pub origin: [f64; 3],
 }
 impl Node {
     pub fn new(id: &str, kind: &str, m: Mat, z: f64, op: f64, anc: bool, blend: &str) -> Node {
@@ -147,6 +157,9 @@ impl Node {
             bones: None,
             active: None,
             children: None,
+            h: None,
+            w3: None,
+            origin: [0.0, 0.0, 0.0],
         }
     }
     /// depth-first visit of this node and its descendants (not mask children or ghosts)

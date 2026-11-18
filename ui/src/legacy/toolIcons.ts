@@ -33,6 +33,9 @@ export const TOOL_ICONS: Record<string, string> = {
     '<rect x="8.5" y="8.5" width="12" height="12" rx="1" stroke-dasharray="2 1.8"/>' +
     node(8.5, 20.5, 'af') + node(20.5, 8.5, 'af') + node(20.5, 20.5, 'af') +
     '<path d="M3 2.5v10.5l2.8-2.6 2 4.2 2-1-2-4.1 3.8-.3z" fill="currentColor" stroke="none"/>'),
+  // Rotate layer XY: a layer card turned in space, with the turning arrow
+  rotxy: svg('<path d="M7 5.5l9-2v17l-9-2z" fill="currentColor" fill-opacity=".2"/>' +
+    '<path class="a" d="M3 12c0 2.3 4 4.2 9 4.2s9-1.9 9-4.2"/><path class="a" d="M18.6 17.6l2.3-1.4-1.3-2.4"/>'),
   // Select / transform points: marquee box around a path's points
   points: svg(
     '<rect x="2.5" y="2.5" width="19" height="19" rx="1" stroke-dasharray="2 2" stroke-opacity=".7"/>' +
@@ -119,5 +122,9 @@ export const TOOL_ICONS: Record<string, string> = {
 
   // ---------- View ----------
   pan: svg('<path d="M8 13V5.6a1.5 1.5 0 0 1 3 0V11M11 4.6a1.5 1.5 0 0 1 3 0V11M14 5.6a1.5 1.5 0 0 1 3 0V12M17 8.6a1.5 1.5 0 0 1 3 0V14c0 4-3 7-7 7h-1.2c-2.3 0-3.9-.9-5.3-2.8L3.8 14.6c-.7-1.2.9-2.5 2-1.5L8 15.2"/>'),
+  // Orbit workspace: an eye circling the scene
+  orbit: svg('<rect x="8" y="8" width="8" height="8" rx="1" fill="currentColor" fill-opacity=".2"/>' +
+    '<ellipse class="a" cx="12" cy="12" rx="10" ry="4.5"/><path class="a" d="M19.3 6.5l2 2.3-2.6 1"/>' +
+    '<ellipse class="a" cx="12" cy="12" rx="4.5" ry="10" stroke-opacity=".45"/>'),
   zoom: svg('<circle cx="10" cy="10" r="6.5"/><path d="M14.8 14.8L21 21" stroke-width="2.4"/><path class="a" d="M10 7v6M7 10h6"/>'),
 };

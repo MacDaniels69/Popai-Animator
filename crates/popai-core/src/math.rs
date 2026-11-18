@@ -102,3 +102,43 @@ pub fn dist_to_seg(px: f64, py: f64, a: [f64; 2], b: [f64; 2]) -> f64 {
     let tt = clamp(((px - a[0]) * dx + (py - a[1]) * dy) / l2, 0.0, 1.0);
     (px - (a[0] + tt * dx)).hypot(py - (a[1] + tt * dy))
 }
+
+// ---------------- 3D (layer planes in space) ----------------
+/// 4x4 matrix, column-major (`m[col * 4 + row]`), as in WebGL / wgpu.
+pub type M4 = [f64; 16];
+pub const I4: M4 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+/// A 2D affine (in the layer plane) plus a depth translation, as a 4x4 matrix.
+pub fn m4_from2(m: &Mat, z: f64) -> M4 {
+    [m[0], m[1], 0.0, 0.0, m[2], m[3], 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, m[4], m[5], z, 1.0]
+}
+pub fn m4_mul(a: &M4, b: &M4) -> M4 {
+    let mut o = [0.0; 16];
+    for c in 0..4 {
+        for r in 0..4 {
+            o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+        }
+    }
+    o
+}
+pub fn m4_t(x: f64, y: f64, z: f64) -> M4 {
+    let mut m = I4;
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+    m
+}
+/// Rotation about the X axis (tilts the plane forward / back).
+pub fn m4_rx(a: f64) -> M4 {
+    let (s, c) = (a.sin(), a.cos());
+    [1.0, 0.0, 0.0, 0.0, 0.0, c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+/// Rotation about the Y axis (turns the plane left / right).
+pub fn m4_ry(a: f64) -> M4 {
+    let (s, c) = (a.sin(), a.cos());
+    [c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+/// True when the plane is not parallel to the picture (it has been tilted in X or Y somewhere up its chain).
+pub fn m4_tilted(m: &M4) -> bool {
+    m[2].abs() > 1e-9 || m[6].abs() > 1e-9 || m[8].abs() > 1e-9 || m[9].abs() > 1e-9
+}

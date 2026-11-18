@@ -55,10 +55,13 @@ pub struct Pc<'a> {
     pub b: Option<Rc<BoneCtx<'a>>>,
     pub bound: bool,
     pub in_only: bool,
+    /// 3D versions of `base` / `rel` (layer planes can be tilted in space)
+    pub base3: M4,
+    pub rel3: M4,
 }
 impl<'a> Pc<'a> {
     pub fn root() -> Self {
-        Pc { base: IDENTITY, rel: IDENTITY, z: 0.0, b: None, bound: false, in_only: false }
+        Pc { base: IDENTITY, rel: IDENTITY, z: 0.0, b: None, bound: false, in_only: false, base3: I4, rel3: I4 }
     }
 }
 #[derive(Clone)]
@@ -71,6 +74,10 @@ pub struct Lc<'a> {
     pub z: f64,
     pub b: Option<Rc<BoneCtx<'a>>>,
     pub bound: bool,
+    pub base3: M4,
+    pub rel3: M4,
+    /// layer plane -> world space (3D); equals (`world`, z) when nothing in the chain is tilted
+    pub world3: M4,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +92,31 @@ pub struct Cam {
     identity: bool,
 }
 impl Cam {
+    /// Camera position in world space (it looks down -Z at the picture plane z = 0 from CAM_D).
+    pub fn pos(&self) -> [f64; 3] {
+        [self.x + self.sx, self.y + self.sy, CAM_D]
+    }
+    /// 3x4 projection (row-major) of world points to the picture; matches `m(z)` for planes facing the camera.
+    pub fn proj(&self) -> [[f64; 4]; 3] {
+        if self.identity {
+            return [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        }
+        let a = -(self.roll + self.sr) * DEG;
+        let (c, s) = (a.cos(), a.sin());
+        let (cx, cy, k) = (self.x + self.sx, self.y + self.sy, self.zoom);
+        [[k * c, -k * s, 0.0, -k * (c * cx - s * cy)], [k * s, k * c, 0.0, -k * (s * cx + c * cy)], [0.0, 0.0, -1.0 / CAM_D, 1.0]]
+    }
+    /// Homography (row-major 3x3) taking a layer plane's (x, y) to the picture.
+    pub fn homography(&self, w3: &M4) -> [f64; 9] {
+        let p = self.proj();
+        let mut h = [0.0; 9];
+        for r in 0..3 {
+            for (k, col) in [0usize, 1, 3].iter().enumerate() {
+                h[r * 3 + k] = (0..4).map(|j| p[r][j] * w3[col * 4 + j]).sum();
+            }
+        }
+        h
+    }
     pub fn m(&self, z: f64) -> Mat {
         if self.identity {
             return IDENTITY;
@@ -105,6 +137,8 @@ pub struct SceneOpts {
     pub no_camera: bool,
     /// evaluate a single layer subtree with its real parent context (thumbnails)
     pub root: Option<String>,
+    /// include every layer's 3D plane matrix (`w3`) for viewing the scene from other directions
+    pub want3d: bool,
 }
 
 struct R<'b> {
@@ -116,6 +150,7 @@ struct R<'b> {
     no_trail: bool,
     swo: &'b HashMap<String, String>,
     no_camera: bool,
+    want3d: bool,
 }
 
 fn truthy_str(o: &Option<String>) -> Option<&str> {
@@ -139,6 +174,21 @@ impl<'a> Eval<'a> {
         ])
     }
 
+    /// The layer's own transform in 3D: position X/Y/Z, then Rotation Y (turn), Rotation X (tilt),
+    /// then the in-plane rotation and scale, all about the layer's origin.
+    pub fn layer_local_m3(&self, l: &Layer, f: f64, local: &Mat, z: f64) -> M4 {
+        let (rx, ry) = (num(l, "rx", f, 0.0), num(l, "ry", f, 0.0));
+        if (rx == 0.0 || rx.is_nan()) && (ry == 0.0 || ry.is_nan()) {
+            return m4_from2(local, z);
+        }
+        let ox = l.p.get("ox").map(|v| v.num_or(0.0)).unwrap_or(0.0);
+        let oy = l.p.get("oy").map(|v| v.num_or(0.0)).unwrap_or(0.0);
+        let rest = chain(&[r(num(l, "rot", f, 0.0) * DEG), s(num(l, "sx", f, 1.0), num(l, "sy", f, 1.0)), t(-ox, -oy)]);
+        let tr = m4_t(num(l, "x", f, 0.0) + ox, num(l, "y", f, 0.0) + oy, z);
+        let rot = m4_mul(&m4_ry(if ry.is_nan() { 0.0 } else { ry * DEG }), &m4_rx(if rx.is_nan() { 0.0 } else { rx * DEG }));
+        m4_mul(&tr, &m4_mul(&rot, &m4_from2(&rest, 0.0)))
+    }
+
     pub fn layer_ctx(&self, l: &Layer, f: f64, pc: &Pc<'a>) -> Lc<'a> {
         let local = self.layer_local_m(l, f);
         let rel_pts = mul(&pc.rel, &local);
@@ -149,15 +199,27 @@ impl<'a> Eval<'a> {
             }
         }
         let zv = val(l, "z", f);
+        let zl = if zv.truthy() { zv.num_or(0.0) } else { 0.0 };
+        let local3 = self.layer_local_m3(l, f, &local, zl);
+        let rel_pts3 = m4_mul(&pc.rel3, &local3);
+        let mut rel3 = rel_pts3;
+        if let (Some(bb), Some(b)) = (truthy_str(&l.bind_bone), &pc.b) {
+            if let Some(d) = b.d.get(bb) {
+                rel3 = m4_mul(&m4_from2(d, 0.0), &rel_pts3);
+            }
+        }
         Lc {
             base: pc.base,
             rel_parent: pc.rel,
             rel_pts,
             rel,
             world: mul(&pc.base, &rel),
-            z: pc.z + if zv.truthy() { zv.num_or(0.0) } else { 0.0 },
+            z: pc.z + zl,
             b: pc.b.clone(),
             bound: pc.b.is_some() && (pc.bound || truthy_str(&l.bind_bone).is_some()),
+            base3: pc.base3,
+            rel3,
+            world3: m4_mul(&pc.base3, &rel3),
         }
     }
 
@@ -179,9 +241,9 @@ impl<'a> Eval<'a> {
     fn child_pc(&self, a: &'a Layer, lc: &Lc<'a>, f: f64, in_only: bool) -> Pc<'a> {
         if a.kind == "bone" {
             let (d, cur, rest) = self.bone_deforms(a, f, None);
-            Pc { base: lc.world, rel: IDENTITY, z: lc.z, b: Some(Rc::new(BoneCtx { layer: a, d, cur, rest })), bound: false, in_only }
+            Pc { base: lc.world, rel: IDENTITY, z: lc.z, b: Some(Rc::new(BoneCtx { layer: a, d, cur, rest })), bound: false, in_only, base3: lc.world3, rel3: I4 }
         } else {
-            Pc { base: lc.base, rel: lc.rel, z: lc.z, b: lc.b.clone(), bound: lc.bound, in_only }
+            Pc { base: lc.base, rel: lc.rel, z: lc.z, b: lc.b.clone(), bound: lc.bound, in_only, base3: lc.base3, rel3: lc.rel3 }
         }
     }
 
@@ -584,7 +646,7 @@ impl<'a> Eval<'a> {
             Some(id) => self.doc.chain(id).map(|c| c[..c.len() - 1].iter().map(|l| l.id.clone()).collect()).unwrap_or_default(),
             None => HashSet::new(),
         };
-        let rr = R { f: o.frame, cam: self.cam(o.frame, o.no_camera), export: o.export, only: o.only.as_deref(), only_anc, no_trail: o.no_trail, swo: &o.sw_override, no_camera: o.no_camera };
+        let rr = R { f: o.frame, cam: self.cam(o.frame, o.no_camera), export: o.export, only: o.only.as_deref(), only_anc, no_trail: o.no_trail, swo: &o.sw_override, no_camera: o.no_camera, want3d: o.want3d };
         if let Some(root) = &o.root {
             let Some(chain_l) = self.doc.chain(root) else { return vec![] };
             let mut pc = Pc::root();
@@ -595,7 +657,25 @@ impl<'a> Eval<'a> {
             let target = chain_l[chain_l.len() - 1];
             return self.draw_layer(target, &rr, &pc, true).into_iter().collect();
         }
-        self.draw_list(&self.doc.layers, &rr, &Pc::root())
+        let mut out = self.draw_list(&self.doc.layers, &rr, &Pc::root());
+        if self.flag(&self.doc.extra, "depthSort") {
+            self.depth_sort(&mut out, &rr);
+        }
+        out
+    }
+    fn flag(&self, m: &serde_json::Map<String, serde_json::Value>, k: &str) -> bool {
+        m.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+    /// "Sort layers by depth": farther layers draw first. By default depth is the layer origin's Z;
+    /// with "sort by true distance" it is the distance from the camera to the layer origin.
+    fn depth_sort(&self, nodes: &mut [Node], rr: &R) {
+        if self.flag(&self.doc.extra, "depthSortTrue") {
+            let c = rr.cam.pos();
+            let d = |n: &Node| (0..3).map(|i| (n.origin[i] - c[i]).powi(2)).sum::<f64>();
+            nodes.sort_by(|a, b| d(b).partial_cmp(&d(a)).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            nodes.sort_by(|a, b| a.origin[2].partial_cmp(&b.origin[2]).unwrap_or(std::cmp::Ordering::Equal));
+        }
     }
     fn draw_list(&self, list: &'a [Layer], rr: &R, pc: &Pc<'a>) -> Vec<Node> {
         list.iter().rev().filter_map(|l| self.draw_layer(l, rr, pc, false)).collect()
@@ -620,6 +700,19 @@ impl<'a> Eval<'a> {
         let op = if is_anc { 1.0 } else { num(l, "opacity", f, 1.0) };
         let mut node = Node::new(&l.id, &l.kind, m, lc.z, op, is_anc, &l.blend);
         node.cs = scale_of(&rr.cam.m(lc.z));
+        node.origin = [lc.world3[12], lc.world3[13], lc.world3[14]];
+        let tilted = m4_tilted(&lc.world3);
+        if tilted {
+            let h = rr.cam.homography(&lc.world3);
+            // linear approximation at the layer origin, for picking and handles
+            let w = if h[8].abs() < 1e-9 { 1e-9 } else { h[8] };
+            let w2 = w * w;
+            node.m = [(h[0] * w - h[2] * h[6]) / w2, (h[3] * w - h[5] * h[6]) / w2, (h[1] * w - h[2] * h[7]) / w2, (h[4] * w - h[5] * h[7]) / w2, h[2] / w, h[5] / w];
+            node.h = Some(h);
+        }
+        if tilted || rr.want3d {
+            node.w3 = Some(lc.world3);
+        }
         if l.kind == "group" {
             node.mask = l.mask.clone();
         }
@@ -707,6 +800,11 @@ impl<'a> Eval<'a> {
                     node.children = Some(kids[..kids.len() - 1].iter().rev().filter_map(|k| self.draw_layer(k, rr, &cpc, false)).collect());
                 } else {
                     node.children = Some(self.draw_list(kids, rr, &cpc));
+                }
+                if l.kind != "switch" && self.flag(&l.extra, "depthSort") {
+                    if let Some(ch) = node.children.as_mut() {
+                        self.depth_sort(ch, rr);
+                    }
                 }
             }
             _ => {}
