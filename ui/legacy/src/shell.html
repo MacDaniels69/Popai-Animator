@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Popai Animator</title>
+<style>/*CSS*/</style>
+</head>
+<body>
+<div id="app">
+  <header id="menubar">
+    <div class="brand"><span class="logo">◆</span> Popai <b>Animator</b></div>
+    <nav id="menus"></nav>
+    <div class="mb-right">
+      <div class="seg" id="modeSeg" title="Setup: build the rig and rest pose · Animate: record keys (Tab toggles)"><button data-m="setup">⚙ Setup</button><button data-m="animate">● Animate</button></div>
+      <span id="docname" title="Project settings"></span>
+      <button class="ib" id="btnUndo" title="Undo (Ctrl+Z)">↶</button>
+      <button class="ib" id="btnRedo" title="Redo (Ctrl+Shift+Z)">↷</button>
+      <button class="search-btn" id="btnCmd" title="Command search (Ctrl+Shift+P)">⌕ Search commands… <kbd>Ctrl Shift P</kbd></button>
+    </div>
+  </header>
+  <div id="toolopts"></div>
+  <div id="main">
+    <aside id="toolbar"></aside>
+    <section id="stagewrap">
+      <canvas id="stage"></canvas>
+      <div id="crumbs"></div>
+      <div id="stagehud">
+        <span id="hudInfo"></span>
+        <button class="ib sm" data-view="fit" title="Fit frame (Home)">⤢</button>
+        <button class="ib sm" data-view="100" title="100%">1:1</button>
+        <button class="ib sm toggle" data-view="output" title="Output only — hide editor overlays (O)">◉</button>
+      </div>
+      <div id="dropHint">Drop images, audio or a .popai.json project</div>
+    </section>
+    <aside id="right">
+      <div id="layersPanel" class="panel">
+        <div class="ph"><span>Layers</span>
+          <div class="ph-btns">
+            <button class="ib sm" id="lyAdd" title="New layer">＋</button>
+            <button class="ib sm" id="lyDup" title="Duplicate layer (Ctrl+D)">⧉</button>
+            <button class="ib sm" id="lyGroup" title="Group selected layers (Ctrl+G)">▣</button>
+            <button class="ib sm" id="lyUp" title="Raise layer">▲</button>
+            <button class="ib sm" id="lyDown" title="Lower layer">▼</button>
+            <button class="ib sm" id="lyDel" title="Delete layer">🗑</button>
+          </div>
+        </div>
+        <div id="layerTree"></div>
+      </div>
+      <div id="rsplit" class="hsplit"></div>
+      <div id="sidePanel" class="panel">
+        <div class="tabs" id="sideTabs">
+          <button data-tab="props" class="on">Properties</button>
+          <button data-tab="style">Style</button>
+          <button data-tab="switch">Switch</button>
+          <button data-tab="ai">AI ✦</button>
+          <button data-tab="jobs">Jobs <span id="jobBadge"></span></button>
+        </div>
+        <div id="tabBody"></div>
+      </div>
+    </aside>
+  </div>
+  <div id="tsplit" class="hsplit"></div>
+  <footer id="timeline">
+    <div id="tlbar"></div>
+    <div id="tlcontext" aria-label="Timeline context"></div>
+    <div id="tlwrap"><canvas id="tlcanvas"></canvas></div>
+  </footer>
+</div>
+<div id="menuLayer"></div>
+<div id="modal"></div>
+<div id="toasts"></div>
+<input type="file" id="fileIn" hidden>
+<script>/*JS*/</script>
+</body>
+</html>

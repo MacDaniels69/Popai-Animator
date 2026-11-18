@@ -1,6 +1,6 @@
 [package]
 name = "popai-animator"
-version = "0.2.0"
+version = "0.3.0"
 description = "Popai Animator desktop app"
 edition = "2021"
 
@@ -13,8 +13,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-base64 = "0.22"
 popai-core = { path = "../../crates/popai-core" }
 
 [profile.release]

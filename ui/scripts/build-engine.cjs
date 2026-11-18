@@ -1,0 +1,12 @@
+const fs=require('node:fs'),path=require('node:path');
+const root=path.resolve(__dirname,'..'),source=path.join(root,'legacy','src');
+const order=['core.js','render.js','stage.js','timeline.js','panels.js','ai.js','io.js','main.js','reliability.js','vector-tools.js','layer-settings.js','styles.js','actions.js','camera.js','tilt3d.js','tool-icons.js','compact-ui.js','extras.js'];
+const output=path.join(root,'public','engine');fs.mkdirSync(output,{recursive:true});
+const code='(() => {\n'+order.map(f=>fs.readFileSync(path.join(source,f),'utf8')).join('\n')+'\n'+fs.readFileSync(path.join(root,'src','engine','legacy-adapter.js'),'utf8')+'\n})();';
+fs.writeFileSync(path.join(output,'legacy.js'),code);
+fs.copyFileSync(path.join(source,'style.css'),path.join(output,'legacy.css'));
+const generated=path.join(root,'src','generated');fs.mkdirSync(generated,{recursive:true});
+fs.writeFileSync(path.join(generated,'legacy.js'),code);
+fs.writeFileSync(path.join(generated,'legacy.d.ts'),'export {};\n');
+fs.copyFileSync(path.join(source,'style.css'),path.join(generated,'legacy.css'));
+console.log('Built compatible animation engine ('+code.length+' characters)');

@@ -1,27 +1,38 @@
 {
-  "name": "popai-animator-ui",
+  "name": "popai-animator",
+  "productName": "Popai Animator",
+  "version": "0.3.0",
   "private": true,
-  "version": "0.2.0",
   "type": "module",
+  "description": "Popai animation editor — TypeScript, React and Tauri (Rust)",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "tauri": "tauri",
-    "engine": "cargo run --release --manifest-path ../Cargo.toml -p popai-engine-host -- --port 7878 --ui dist"
+    "dev": "node scripts/build-engine.cjs && vite --host 127.0.0.1",
+    "build": "node scripts/build-engine.cjs && tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:legacy": "node legacy/build.cjs && node legacy/regression.cjs && node legacy/vector-regression.cjs",
+    "check": "tsc --noEmit",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.5",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "@tauri-apps/plugin-dialog": "^2.4.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.5",
-    "@types/react": "^18.3.31",
-    "@types/react-dom": "^18.3.7",
-    "@vitejs/plugin-react": "^4.7.0",
-    "typescript": "^5.9.3",
-    "vite": "^5.4.21",
-    "vite-plugin-singlefile": "^2.3.4"
+    "@types/jsdom": "30.0.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@webgpu/types": "0.1.74",
+    "esbuild": "0.28.2",
+    "jsdom": "31.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }

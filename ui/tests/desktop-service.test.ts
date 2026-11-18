@@ -1,0 +1,10 @@
+import { afterEach,it,expect,vi } from 'vitest';
+import { connectDesktop } from '../src/services/desktop-service';
+import type { DesktopBridge,EngineRuntime } from '../src/engine/contracts';
+function fixture(){let saveHandler:(()=>Promise<void>)|undefined,openHandler:(()=>Promise<void>)|undefined;const capture={documentId:'session:1',signature:'original',name:'Scene',text:'saved-data'};const engine={captureSave:()=>capture,acknowledgeSave:vi.fn(()=>true),setSaveHandler:(fn:()=>Promise<void>)=>{saveHandler=fn;},setOpenHandler:(fn:()=>Promise<void>)=>{openHandler=fn;},showMessage:vi.fn(),subscribe:()=>()=>{},read:()=>({dirty:false,documentId:'session:1'}),openProject:vi.fn(async()=>true),markDirty:vi.fn()} as unknown as EngineRuntime;
+  const desktop={saveProject:vi.fn(async()=>({canceled:false})),openProject:vi.fn(async()=>({canceled:false,name:'Opened',text:'opened-data',openToken:'open-token'})),bindOpenedProject:vi.fn(async()=>{}),onCommand:()=>()=>{},setDirty:vi.fn(),writeRecovery:vi.fn(),readRecovery:vi.fn()} as unknown as DesktopBridge;
+  const connection=connectDesktop(engine,desktop);return {engine,desktop,connection,save:()=>saveHandler!(),open:()=>openHandler!()};}
+afterEach(()=>vi.useRealTimers());
+it('acknowledges only a completed native save',async()=>{vi.useFakeTimers();const f=fixture();await f.save();expect(f.engine.acknowledgeSave).toHaveBeenCalledWith(expect.objectContaining({signature:'original'}));f.connection.dispose();});
+it('does not clear dirty state when the save dialog is cancelled',async()=>{vi.useFakeTimers();const f=fixture();vi.mocked(f.desktop.saveProject).mockResolvedValueOnce({canceled:true});await f.save();expect(f.engine.acknowledgeSave).not.toHaveBeenCalled();f.connection.dispose();});
+it('binds an opened file only after the editor accepted the project',async()=>{vi.useFakeTimers();const f=fixture();vi.mocked(f.engine.openProject).mockResolvedValueOnce(false);await f.open();expect(f.desktop.bindOpenedProject).not.toHaveBeenCalled();await f.open();expect(f.desktop.bindOpenedProject).toHaveBeenCalledWith({documentId:'session:1',openToken:'open-token'});f.connection.dispose();});

@@ -90,6 +90,11 @@ input[type=range]{accent-color:var(--acc)}
 .sec .body{padding:5px 8px;display:grid;grid-template-columns:86px 1fr 22px;gap:4px 6px;align-items:center}
 .sec .body.free{display:block}
 .prow{display:contents}
+.camera-views,.camera-actions,.camera-check,.camera-full{grid-column:1/-1}
+.camera-views,.camera-actions{display:flex;gap:5px;flex-wrap:wrap;margin:3px 0}
+.camera-check{display:flex;align-items:center;gap:7px;line-height:1.5;margin:4px 0}
+.camera-full{justify-self:start;margin:4px 0}
+#toolopts input[data-cam],#toolopts input[data-camlens],#toolopts input[data-camorbit]{width:68px}
 .prow>.pl{color:var(--dim);cursor:ew-resize;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:none}
 .prow>.pl.nodrag{cursor:default}
 .prow>.pv{display:flex;gap:4px;align-items:center;min-width:0}
@@ -235,50 +240,44 @@ body.setup #toolopts{box-shadow:inset 0 -2px 0 var(--acc)}
 #toolbar .tg{grid-column:1/-1;margin:6px 0 1px 2px;text-align:left}
 #toolbar .tg.ctx{color:var(--acc2)}
 #toolbar button{width:30px;height:28px;font-size:14px}
-#toolbar button svg{width:21px;height:21px}
-/* tool icons: light = the object, teal = what the tool does to it */
-:root{--icoacc:#4fd8c4}
-svg.ti .a{stroke:var(--icoacc)}
-svg.ti .af{fill:var(--icoacc)}
-#toolbar button.on svg.ti .a{stroke:#1b1206}
-#toolbar button.on svg.ti .af{fill:#1b1206}
-#toolbar button.na svg.ti .a{stroke:currentColor}
-#toolbar button.na svg.ti .af{fill:currentColor}
+#toolbar button svg{width:20px;height:20px}
 #toolbar button.on svg{color:#1b1206}
 #toolopts .tname svg{width:16px;height:16px;vertical-align:-3px;margin-right:2px}
-/* engine status */
-#root{height:100%}
-.engine-badge{font-size:10.5px;padding:2px 8px;border-radius:10px;border:1px solid var(--line2);white-space:nowrap;font-variant-numeric:tabular-nums;cursor:default}
-.engine-badge.rust{color:#bfe9cf;border-color:#5ccf8a66}
-.engine-badge.legacy{color:#ffd166;border-color:#ffd16666}
+#toolopts .vector-group-name{width:120px;height:22px}
+#toolopts label{flex-shrink:0}
+#toolopts .sep{flex-shrink:0}
+#toolopts input:disabled{opacity:.35;cursor:not-allowed}
 
-/* Create shape: shape picker in the tool bar */
-#toolopts .shapepick{display:inline-flex;gap:2px}
-#toolopts .shapepick .btn{display:inline-flex;align-items:center;gap:4px}
-#toolopts .shapepick .btn svg{width:16px;height:16px}
-#toolopts .shapepick .btn.on{background:var(--acc);color:#1b1206;border-color:var(--acc2)}
-#toolopts .shapepick .btn.on svg.ti .a{stroke:#1b1206}
-#toolopts .shapepick .btn.on svg.ti .af{fill:#1b1206}
+/* Selection-driven timeline, without a second layer tree. */
+#tlcontext{display:flex;align-items:center;gap:8px;min-height:29px;padding:3px 8px;flex:none;border-bottom:1px solid var(--line);overflow-x:auto;white-space:nowrap;background:var(--bg2)}
+#tlcontext .tl-scope{color:var(--acc2);max-width:230px;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
+#tlcontext select{max-width:330px;min-width:160px}#tlcontext label{display:flex;gap:4px;align-items:center;color:var(--dim)}
 
-/* 3D workspace: view direction + split views */
-#stagehud .v3ctl{display:inline-flex;gap:3px;align-items:center;margin-right:4px;padding-right:6px;border-right:1px solid var(--line)}
-#stagehud select{height:22px;font-size:11px;background:var(--panel2);color:var(--txt);border:1px solid var(--line2);border-radius:4px}
-#stagehud .ib.on{background:var(--acc);color:#1b1206}
-#stagewrap.lay2 #stage{right:50%;width:50%}
-#stagewrap.lay4 #stage{right:50%;bottom:50%;width:50%;height:50%}
-#stagewrap.lay2 #stagehud,#stagewrap.lay4 #stagehud{right:calc(50% + 8px)}
-#stagewrap.lay4 #stagehud{bottom:calc(50% + 8px)}
-#panes .pane{position:absolute;background:#23262d;border-left:1px solid var(--line);border-top:1px solid var(--line);overflow:hidden}
-#panes .pane canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
-#panes .panebar{position:absolute;right:6px;top:6px;display:flex;gap:3px;background:rgba(17,19,24,.8);padding:2px 4px;border-radius:5px;border:1px solid var(--line)}
-#panes .panebar select{height:20px;font-size:10.5px;background:var(--panel2);color:var(--txt);border:1px solid var(--line2);border-radius:4px}
-#stagewrap.lay2 #panes .p0{left:50%;right:0;top:0;bottom:0}
-#stagewrap.lay4 #panes .p0{left:50%;right:0;top:0;bottom:50%}
-#stagewrap.lay4 #panes .p1{left:0;right:50%;top:50%;bottom:0}
-#stagewrap.lay4 #panes .p2{left:50%;right:0;top:50%;bottom:0}
+/* Layer Settings window */
+.ls-dlg{width:min(620px,94vw)}
+.ls-tabs{display:flex;flex-wrap:wrap;gap:4px;padding:8px 14px 0}
+.ls-tabs .btn{padding:4px 9px}
+.ls-body{max-height:min(60vh,560px);overflow:auto}
+.ls-row{display:grid;grid-template-columns:minmax(150px,42%) 1fr;align-items:center;gap:10px;margin:5px 0}
+.ls-row textarea{width:100%;resize:vertical}
+.ls-row.ls-check{display:flex;gap:8px}
+.ls-anim{color:var(--acc);font-size:10px}
 
-/* brand */
-.brand-logo{height:30px;display:block;margin:-2px 2px -2px 0}
+/* Style window */
+.sty-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0 8px}
+.sty-seg{display:flex;gap:3px}.sty-seg .btn{padding:3px 8px;font-size:11px}
+.sty-row{display:grid;grid-template-columns:20px 1fr 96px;align-items:center;gap:6px;margin:4px 0}
+.sty-from{color:var(--acc);font-size:10px}
+/* Actions panel */
+.act-cats,.act-tools{display:flex;gap:4px;align-items:center;margin:4px 0}.act-tools input[type=text]{flex:1}
+.act-list{border:1px solid rgba(255,255,255,.08);border-radius:6px;max-height:260px;overflow:auto;margin:6px 0}
+.act-row{display:grid;grid-template-columns:16px 1fr auto;gap:6px;padding:5px 8px;cursor:pointer;user-select:none}
+.act-row:hover{background:rgba(255,255,255,.05)}.act-row.sel{background:rgba(80,160,255,.18)}
+.act-row.main .act-name{font-style:italic}.act-arrow{color:#ff4d4d;font-size:11px}.act-kind{opacity:.65;font-size:11px}
+.act-ref{display:flex;justify-content:space-between;align-items:center;font-size:12px;margin:3px 0}
+.act-banner{border-left:3px solid #ff4d4d;padding-left:8px}
+#tlAction{color:#ff6b6b;font-weight:600;margin-right:10px;white-space:nowrap}
+body.in-action #timeline{box-shadow:inset 0 2px 0 #ff4d4d}
 
 /* Keyframe panel */
 .kfpanel .form.kfp{grid-template-columns:120px 1fr}
@@ -287,10 +286,13 @@ svg.ti .af{fill:var(--icoacc)}
 .kfp .row2 input[type=number]{width:70px}
 .kfp span input[type=number]{width:70px}
 
-/* Select shape: shapes of the layer + liquid shapes */
-#toolopts .shapelist{display:inline-flex;gap:2px;flex-wrap:wrap;max-width:520px}
-#toolopts .shapelist .btn{display:inline-flex;align-items:center;gap:5px;padding:2px 7px}
-#toolopts .shapelist .btn.on{background:var(--acc);color:#1b1206;border-color:var(--acc2)}
-#toolopts .shapelist .sw{width:11px;height:11px;border-radius:3px;border:2px solid;display:inline-block}
-#toolopts .shapelist i{font-style:normal;font-weight:700;color:#63e6be}
-#toolopts .shapelist .btn.on i{color:#1b1206}
+/* minimal two-tone tool icons: light = the object, teal = what the tool does */
+#toolbar button svg.ti{width:20px;height:20px}
+:root{--icoacc:#4fd8c4}
+svg.ti .a{stroke:var(--icoacc)}
+svg.ti .af{fill:var(--icoacc)}
+#toolbar button.on svg.ti .a{stroke:#1b1206}
+#toolbar button.on svg.ti .af{fill:#1b1206}
+#toolbar button.na svg.ti .a{stroke:currentColor}
+#toolbar button.na svg.ti .af{fill:currentColor}
+#toolopts .tname svg{width:16px;height:16px;vertical-align:-3px}

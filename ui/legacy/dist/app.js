@@ -1,0 +1,7589 @@
+(() => {
+/* ===================== Popai Animator — core: utilities, document model, channels, history ===================== */
+'use strict';
+
+// ---------- utilities ----------
+let _idc = 0;
+const uid = (p = '') => p + Date.now().toString(36).slice(-4) + (++_idc).toString(36) + Math.random().toString(36).slice(2, 5);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const DEG = Math.PI / 180;
+const clone = (o) => (o === undefined ? o : JSON.parse(JSON.stringify(o)));
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const round = (v, n = 2) => Math.round(v * 10 ** n) / 10 ** n;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash1(n, seed = 0) { const x = Math.sin(n * 127.1 + seed * 311.7) * 43758.5453; return x - Math.floor(x); }
+function vnoise(t, seed = 0) { const i = Math.floor(t), f = t - i, u = f * f * (3 - 2 * f); return lerp(hash1(i, seed), hash1(i + 1, seed), u) * 2 - 1; }
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+function isColor(v) { return typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v); }
+function hexToRgb(h) { h = (h || '#000000').replace('#', ''); if (h.length === 3) h = h.split('').map((c) => c + c).join(''); const n = parseInt(h.slice(0, 6), 16) || 0; return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function rgbToHex(r, g, b) { return '#' + [r, g, b].map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join(''); }
+function mixColor(a, b, t) { const x = hexToRgb(a), y = hexToRgb(b); return rgbToHex(lerp(x[0], y[0], t), lerp(x[1], y[1], t), lerp(x[2], y[2], t)); }
+function rgba(hex, a) { const c = hexToRgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+
+// ---------- 2D affine matrices [a,b,c,d,e,f] (canvas convention) ----------
+const M = {
+  I: () => [1, 0, 0, 1, 0, 0],
+  mul: (m, n) => [
+    m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+    m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+  ],
+  t: (x, y) => [1, 0, 0, 1, x, y],
+  r: (a) => { const c = Math.cos(a), s = Math.sin(a); return [c, s, -s, c, 0, 0]; },
+  s: (x, y = x) => [x, 0, 0, y, 0, 0],
+  inv: (m) => {
+    const det = m[0] * m[3] - m[1] * m[2] || 1e-12;
+    return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
+  },
+  ap: (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]],
+  apv: (m, x, y) => [m[0] * x + m[2] * y, m[1] * x + m[3] * y],
+  chain: (...ms) => ms.reduce((a, b) => M.mul(a, b)),
+  scaleOf: (m) => Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])),
+  set: (ctx, m) => ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]),
+};
+
+// ---------- interpolation ----------
+function outBounce(t) {
+  const n = 7.5625, d = 2.75;
+  if (t < 1 / d) return n * t * t;
+  if (t < 2 / d) return n * (t -= 1.5 / d) * t + 0.75;
+  if (t < 2.5 / d) return n * (t -= 2.25 / d) * t + 0.9375;
+  return n * (t -= 2.625 / d) * t + 0.984375;
+}
+const EASE = {
+  linear: (t) => t,
+  step: () => 0,
+  ease: (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2),
+  easein: (t) => t * t * t,
+  easeout: (t) => 1 - Math.pow(1 - t, 3),
+  bounce: outBounce,
+  elastic: (t) => (t === 0 || t === 1 ? t : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1),
+};
+const INTERPS = [
+  ['smooth', 'Smooth'], ['linear', 'Linear'], ['ease', 'Ease in/out'], ['easein', 'Ease in'], ['easeout', 'Ease out'],
+  ['bezier', 'Bézier'], ['step', 'Step (hold)'], ['noisy', 'Noisy'], ['cycle', 'Cycle'], ['bounce', 'Bounce'], ['elastic', 'Elastic'],
+];
+const INTERP_COLORS = { smooth: '#7fb4ff', linear: '#ffd166', ease: '#7ee08a', easein: '#5cc2a0', easeout: '#a0e05c', step: '#ff6b6b', bounce: '#d68cff', elastic: '#ff9de2', bezier: '#ffa94d', noisy: '#adb5bd', cycle: '#63e6be' };
+const INTERP_HELP = {
+  smooth: 'Flowing: the curve is shaped by the neighbouring keys', linear: 'Constant speed', ease: 'Starts slowly, speeds up, slows down at the end',
+  easein: 'Soft start', easeout: 'Soft landing', bezier: 'Editable curve handles (shape them in Curves)', step: 'Holds until the next key, then jumps',
+  noisy: 'Irregular wobble between the keys (trembling, shake)', cycle: 'Repeats an earlier range of frames from this key on', bounce: 'Rebounds into the next key', elastic: 'Overshoots and springs into the next key',
+};
+const LABEL_COLORS = [['', 'None'], ['#ff6b6b', 'Red'], ['#ffa94d', 'Orange'], ['#ffd43b', 'Yellow'], ['#69db7c', 'Green'], ['#4dabf7', 'Blue'], ['#da77f2', 'Purple']];
+// Bézier easing: solve x(s) = t by bisection (identical in the Rust engine), then y(s)
+function bezierEase(bz, t) {
+  const x1 = clamp(bz[0], 0, 1), y1 = bz[1], x2 = clamp(bz[2], 0, 1), y2 = bz[3];
+  const cb = (a, b, s) => 3 * (1 - s) * (1 - s) * s * a + 3 * (1 - s) * s * s * b + s * s * s;
+  let lo = 0, hi = 1;
+  for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (cb(x1, x2, mid) < t) lo = mid; else hi = mid; }
+  return cb(y1, y2, (lo + hi) / 2);
+}
+function cycleMap(a, f) {
+  const c = a.cy || 0, target = a.cm === 'rel' ? a.f - c : c, len = a.f - target;
+  if (!(len > 0)) return null;
+  return target + ((((f - a.f) % len) + len) % len);
+}
+
+function mixVal(a, b, t) {
+  if (typeof a === 'number') return a + (b - a) * t;
+  if (Array.isArray(a)) return a.map((v, i) => v + (b[i] - v) * t);
+  if (isColor(a) && isColor(b)) return mixColor(a, b, t);
+  return a;
+}
+function hermite(a, b, ma, mb, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return (2 * t3 - 3 * t2 + 1) * a + (t3 - 2 * t2 + t) * ma + (-2 * t3 + 3 * t2) * b + (t3 - t2) * mb;
+}
+function evalChannel(ch, f) {
+  const k = ch.keys;
+  if (!k.length) return undefined;
+  if (f <= k[0].f) return k[0].v;
+  const last = k[k.length - 1];
+  if (f >= last.f) {
+    if (f > last.f && last.i === 'cycle') { const g = cycleMap(last, f); if (g !== null) return evalChannel(ch, g); }
+    return last.v;
+  }
+  let lo = 0, hi = k.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (k[m].f <= f) lo = m; else hi = m; }
+  const a = k[lo], b = k[hi];
+  const it = a.i || 'smooth';
+  if (it === 'cycle') { const g = cycleMap(a, f); return g === null ? a.v : evalChannel(ch, g); }
+  // timing controls: hold, interval (on twos...), stagger
+  const hold = Math.min(Math.max(a.hold || 0, 0), b.f - a.f);
+  if (f - a.f < hold) return a.v;
+  const start = a.f + hold;
+  let fa = f;
+  const iv = Math.floor(a.iv || 0);
+  if (iv >= 2) fa = start + Math.floor((fa - start) / iv) * iv;
+  if (a.stg === true) {
+    const q = iv >= 2 ? iv : 2, idx = Math.floor((fa - start) / q);
+    fa = ((idx % 2) + 2) % 2 === 1 ? start + (idx - 0.5) * q : start + idx * q;
+  }
+  const t = b.f - start > 0 ? clamp((fa - start) / (b.f - start), 0, 1) : 1;
+  const numeric = typeof a.v === 'number' || Array.isArray(a.v);
+  if (!numeric && !isColor(a.v)) return a.v; // discrete -> hold
+  if (it === 'step') return a.v;
+  if (it === 'smooth' && numeric) {
+    const p = k[lo - 1], n = k[hi + 1], span = b.f - a.f;
+    const comp = (av, bv, pv, nv) => {
+      const ma = p ? ((bv - pv) / (b.f - p.f)) * span : 0;
+      const mb = n ? ((nv - av) / (n.f - a.f)) * span : 0;
+      return hermite(av, bv, ma, mb, t);
+    };
+    if (typeof a.v === 'number') return comp(a.v, b.v, p ? p.v : 0, n ? n.v : 0);
+    return a.v.map((av, i) => comp(av, b.v[i], p ? p.v[i] : 0, n ? n.v[i] : 0));
+  }
+  if (it === 'bezier') return mixVal(a.v, b.v, bezierEase(a.bz || [0.33, 0, 0.67, 1], t));
+  if (it === 'noisy' && numeric) {
+    const amp = a.na ?? 10, per = Math.max(0.5, a.nf ?? 3), env = Math.sin(Math.PI * t);
+    const nz = (i) => vnoise((fa - a.f) / per, a.f * 0.137 + 7 + i * 13) * amp * env, m = mixVal(a.v, b.v, t);
+    return typeof m === 'number' ? m + nz(0) : m.map((x, i) => x + nz(i));
+  }
+  if (it === 'noisy') return mixVal(a.v, b.v, t);
+  const e = EASE[it] || EASE.ease;
+  return mixVal(a.v, b.v, it === 'smooth' ? EASE.ease(t) : e(t));
+}
+
+// ---------- application state (not saved in document) ----------
+const S = {
+  doc: null,
+  boneLabels: (() => { try { return localStorage.getItem('popai.boneLabels') !== '0'; } catch { return true; } })(),
+  media: {}, // id -> {name, type, url, el(img|audioBuffer)}
+  frame: 0,
+  playing: false,
+  loop: true,
+  autoKey: true,
+  defInterp: 'smooth',
+  tool: 'select',
+  selLayers: [], // ids, last = primary
+  selPts: new Set(),
+  selShape: null,
+  selBone: null,
+  selBones: new Set(), // multi-selection for Select Bone / Reparent
+  selKeys: new Set(), // `${ownerId}|${path}|${frame}`
+  activeChannel: null, // {owner, path}
+  onion: false, onionN: 2,
+  showPaths: true,
+  newStyle: { fill: '#f2b880', stroke: '#2b2b2b', width: 4, fillOn: true, strokeOn: true },
+  polySides: 5, polyStar: false, freehandSmooth: 3, ikMode: true,
+  view: { zoom: 0.6, panX: 0, panY: 0 },
+  dirtyDoc: false,
+  outputOnly: false,
+  fastPlay: true,
+  mode: 'animate', // 'setup' edits the rest pose / rig; 'animate' records keys
+  animFrame: 0,
+  swPreview: {}, // switchId -> childId shown temporarily (never keyed)
+  alignOverlay: false,
+};
+
+// ---------- document model ----------
+const LAYER_TYPES = {
+  vector: { icon: '✎', name: 'Vector' },
+  group: { icon: '▣', name: 'Group' },
+  bone: { icon: '🦴', name: 'Bone Group' },
+  switch: { icon: '⇄', name: 'Switch Group' },
+  image: { icon: '🖼', name: 'Image' },
+  text: { icon: 'T', name: 'Text' },
+  audio: { icon: '♪', name: 'Audio' },
+  particle: { icon: '✦', name: 'Particles' },
+};
+const isContainer = (L) => L && (L.type === 'group' || L.type === 'bone' || L.type === 'switch');
+
+function newDoc(o = {}) {
+  return {
+    v: 1, name: o.name || 'Untitled', w: o.w || 1280, h: o.h || 720, fps: o.fps || 24, end: o.end || 72, bg: o.bg || '#ffffff',
+    camera: { id: 'CAM', type: 'camera', name: 'Camera', p: { x: 0, y: 0, zoom: 1, roll: 0, shake: 0, shakeFreq: 10 }, ch: {} },
+    layers: [], styles: [], markers: [],
+    palette: ['#ffffff', '#2b2b2b', '#f2b880', '#c97b4a', '#e94f37', '#f6ae2d', '#86bb4a', '#3f88c5', '#7b4fa0', '#ff8fb1', '#8a8a8a', '#3a2a1a'],
+    media: {},
+    ai: { log: [] },
+  };
+}
+let _layerCount = {};
+function mkLayer(type, name) {
+  _layerCount[type] = (_layerCount[type] || 0) + 1;
+  const L = {
+    id: uid('L'), type, name: name || `${LAYER_TYPES[type].name} ${_layerCount[type]}`,
+    vis: true, lock: false, render: true, open: true, label: '',
+    p: { x: 0, y: 0, z: 0, rot: 0, sx: 1, sy: 1, opacity: 1, ox: 0, oy: 0 }, ch: {}, fx: [], blend: 'source-over', bindBone: null,
+  };
+  if (type === 'vector') { L.pts = {}; L.paths = []; L.shapes = []; }
+  if (isContainer(L)) L.children = [];
+  if (type === 'bone') L.bones = [];
+  if (type === 'group') L.mask = 'none';
+  if (type === 'switch') { L.p.sw = null; L.swMode = 'discrete'; L.swFade = 4; }
+  if (type === 'image') { L.media = null; L.iw = 0; L.ih = 0; }
+  if (type === 'text') { L.text = 'Text'; L.font = 'Inter, system-ui, sans-serif'; L.size = 72; L.bold = true; L.p.color = '#222222'; }
+  if (type === 'audio') { L.media = null; L.offset = 0; L.p.gain = 1; L.mute = false; }
+  if (type === 'particle') {
+    L.mode = 'continuous'; L.startF = 0; L.endF = 9999; L.seed = 7; L.burst = 40; L.shape = 'soft'; L.emit = 'circle';
+    Object.assign(L.p, { rate: 30, life: 1.4, speed: 220, speedVar: 0.5, spread: 50, angle: -90, gravity: 250, wind: 0, drag: 0.6,
+      size0: 14, size1: 34, alpha0: 0.8, alpha1: 0, color0: '#a3876a', color1: '#e1d6c8', emitR: 24, spin: 90 });
+  }
+  return L;
+}
+
+// ---------- tree helpers ----------
+function walk(list, fn, parent = null, depth = 0) {
+  for (const L of list) {
+    if (fn(L, parent, depth) === false) return false;
+    if (L.children && walk(L.children, fn, L, depth + 1) === false) return false;
+  }
+}
+function findLayer(id, list = S.doc.layers) {
+  let r = null;
+  walk(list, (L) => { if (L.id === id) { r = L; return false; } });
+  return r;
+}
+function parentOf(id) {
+  let r = null;
+  walk(S.doc.layers, (L, P) => { if (L.id === id) { r = P; return false; } });
+  return r;
+}
+function siblingsOf(id) { const P = parentOf(id); return P ? P.children : S.doc.layers; }
+function ancestors(id) { const a = []; let P = parentOf(id); while (P) { a.push(P); P = parentOf(P.id); } return a; }
+function boneLayerFor(L) { // nearest ancestor bone layer
+  return ancestors(L.id).find((A) => A.type === 'bone') || null;
+}
+function getOwner(id) { return id === 'CAM' ? S.doc.camera : findLayer(id); }
+function selLayer() { const id = S.selLayers[S.selLayers.length - 1]; return id ? findLayer(id) : null; }
+function allLayers() { const a = []; walk(S.doc.layers, (L) => { a.push(L); }); return a; }
+
+// ---------- property access (base values + channels) ----------
+function baseGet(o, path) {
+  if (path.indexOf(':') < 0) return o.p[path];
+  const [kind, id, prop] = path.split(':');
+  if (kind === 'pt') { const p = o.pts && o.pts[id]; return p ? [p.x, p.y] : undefined; }
+  if (kind === 'pv') { const p=o.pts?.[id]; return p ? (p[prop] ?? ({c:1,width:1,alpha:1,color:'#000000',strength:0}[prop] ?? [0,0])) : undefined; }
+  if (kind === 'curve') { const p=o.paths?.find(p=>p.id===id); return p ? (p[prop] ?? ({start:0,end:1,repeats:1,offset:0}[prop] ?? false)) : undefined; }
+  if (kind === 'bone') {
+    const b = o.bones && o.bones.find((b) => b.id === id); if (!b) return undefined;
+    return prop === 'p' ? [b.x, b.y] : prop === 'a' ? b.a : prop === 's' ? (b.s ?? 1) : b[prop];
+  }
+  if (kind === 'fx') { const e = o.fx.find((e) => e.id === id); return e ? e.p[prop] : undefined; }
+  if (kind === 'sh') { const s = o.shapes && o.shapes.find((s) => s.id === id); return s ? s[prop] : undefined; }
+}
+function baseSet(o, path, v) {
+  if (path.indexOf(':') < 0) { o.p[path] = v; return; }
+  const [kind, id, prop] = path.split(':');
+  if (kind === 'pt') { const p = o.pts[id]; if (p) { p.x = v[0]; p.y = v[1]; } return; }
+  if (kind === 'pv') { if(o.pts?.[id])o.pts[id][prop]=v; return; }
+  if (kind === 'curve') { const p=o.paths?.find(p=>p.id===id); if(p)p[prop]=v; return; }
+  if (kind === 'bone') {
+    const b = o.bones.find((b) => b.id === id); if (!b) return;
+    if (prop === 'p') { b.x = v[0]; b.y = v[1]; } else if (prop === 'a') b.a = v; else if (prop === 's') b.s = v; else b[prop] = v;
+    return;
+  }
+  if (kind === 'fx') { const e = o.fx.find((e) => e.id === id); if (e) e.p[prop] = v; return; }
+  if (kind === 'sh') { const s = o.shapes.find((s) => s.id === id); if (s) s[prop] = v; }
+}
+function val(o, path, f) {
+  const ch = o.ch[path];
+  if (ch && ch.keys.length) return evalChannel(ch, f);
+  return baseGet(o, path);
+}
+function isKeyed(o, path) { const ch = o.ch[path]; return !!(ch && ch.keys.length); }
+function keyAt(o, path, f) { const ch = o.ch[path]; return ch ? ch.keys.find((k) => k.f === f) : null; }
+function setKey(ch, f, v, interp) {
+  const k = ch.keys.find((k) => k.f === f);
+  if (k) { k.v = clone(v); if (interp) k.i = interp; }
+  else {
+    let i = interp || S.defInterp;
+    if (i === 'copy') { const prev = ch.keys.filter((q) => q.f < f).pop(); i = prev && prev.i && prev.i !== 'cycle' ? prev.i : 'smooth'; }
+    ch.keys.push({ f, v: clone(v), i }); ch.keys.sort((a, b) => a.f - b.f);
+  }
+}
+const DISCRETE = (path) => path === 'sw' || path === 'vis' || path === 'vit' || path === 'visible' || path === 'order';
+let REV = 0; // bumped on every document change (invalidates simulation caches)
+// Moho-style: frame 0 is the setup pose; edits at other frames create keys (auto-key)
+function setVal(o, path, v, f = S.frame, force = false) {
+  assertWritable(o);
+  if (!Number.isFinite(f) || f < 0 || f > 100000) throw new Error("Invalid keyframe time");
+  REV++;
+  const ch = o.ch[path];
+  const interp = DISCRETE(path) ? 'step' : undefined;
+  if (ch && ch.keys.length) { setKey(ch, f, v, interp); if (f === 0) baseSet(o, path, v); return; }
+  if (!force && (f === 0 || !S.autoKey)) { baseSet(o, path, v); return; }
+  const old = baseGet(o, path);
+  const nc = (o.ch[path] = { keys: [] });
+  setKey(nc, 0, old, interp);
+  setKey(nc, f, v, interp);
+}
+function deleteChannelsMatching(o, pred) { for (const k of Object.keys(o.ch)) if (pred(k)) delete o.ch[k]; }
+
+// ---------- history (undo/redo) ----------
+const H = { undo: [], redo: [], pending: null, max: 120 };
+function snapshot() {
+  const media = S.doc.media; S.doc.media = undefined;
+  const s = JSON.stringify(S.doc);
+  S.doc.media = media;
+  return s;
+}
+function restore(s) {
+  invalidateScene();
+  const media = S.doc.media;
+  S.doc = JSON.parse(s);
+  S.doc.media = media;
+  // drop stale selections
+  S.selLayers = S.selLayers.filter((id) => findLayer(id));
+  S.selPts = new Set(); S.selKeys = new Set();
+}
+function edit(label, fn) {
+  const before = snapshot();
+  let r;
+  try { r = fn(); } catch (e) { console.error(e); restore(before); toast('Error: ' + e.message, 'err'); refreshAll(); return false; }
+  const after = snapshot();
+  if (after !== before) {
+    H.undo.push({ label, s: before }); if (H.undo.length > H.max) H.undo.shift();
+    H.redo = []; S.dirtyDoc = true; invalidateScene();
+  }
+  refreshAll();
+  return r === undefined ? true : r;
+}
+// for continuous interactions (drags): begin -> many updates -> commit
+function beginEdit(label) { H.pending = { label, s: snapshot() }; }
+function commitEdit() {
+  if (!H.pending) return;
+  const after = snapshot();
+  if (after !== H.pending.s) { H.undo.push(H.pending); if (H.undo.length > H.max) H.undo.shift(); H.redo = []; S.dirtyDoc = true; }
+  H.pending = null; refreshAll();
+}
+function cancelEdit() { if (H.pending) { restore(H.pending.s); H.pending = null; refreshAll(); } }
+function undo() {
+  if (H.pending) commitEdit();
+  const e = H.undo.pop(); if (!e) return toast('Nothing to undo');
+  H.redo.push({ label: e.label, s: snapshot() }); restore(e.s); S.dirtyDoc = true; toast('Undo: ' + e.label); refreshAll();
+}
+function redo() {
+  const e = H.redo.pop(); if (!e) return toast('Nothing to redo');
+  H.undo.push({ label: e.label, s: snapshot() }); restore(e.s); S.dirtyDoc = true; toast('Redo: ' + e.label); refreshAll();
+}
+
+// ---------- refresh scheduling (UI modules register) ----------
+const UI = { stage: null, timeline: null, panels: [] };
+let _raf = 0, _panelsDirty = false;
+function requestDraw() { if (!_raf) _raf = requestAnimationFrame(() => { _raf = 0; drawNow(); }); }
+function drawNow() {
+  UI.stage && UI.stage();
+  UI.timeline && UI.timeline();
+  if (_panelsDirty) { _panelsDirty = false; UI.panels.forEach((p) => p()); }
+}
+function refreshAll() { REV++; if (S.doc) buildRows(); _panelsDirty = true; requestDraw(); }
+
+function toast(msg, kind = '') {
+  const t = document.createElement('div');
+  t.className = 'toast ' + kind; t.textContent = msg;
+  const host = $('#toasts'); if (!host) return;
+  host.appendChild(t); setTimeout(() => t.classList.add('out'), 2200); setTimeout(() => t.remove(), 2700);
+}
+
+/* ===================== Popai Animator — scene evaluation & renderer (shared by preview and export) ===================== */
+
+const CAM_D = 1500; // camera distance used for 2.5D depth (z) parallax
+
+// pivot (ox, oy) is in the layer's content coordinates: rotation and scale happen around it
+function layerLocalM(L, f) {
+  const ox = L.p.ox || 0, oy = L.p.oy || 0;
+  return M.chain(M.t(val(L, 'x', f) + ox, val(L, 'y', f) + oy), M.r(val(L, 'rot', f) * DEG), M.s(val(L, 'sx', f) * (L.flipH ? -1 : 1), val(L, 'sy', f) * (L.flipV ? -1 : 1)), M.t(-ox, -oy));
+}
+// which alternative a switch shows at frame f (+ the previous one, for crossfades)
+function switchState(L, f) {
+  const ch = L.ch.sw, first = L.children[0] && L.children[0].id;
+  let cur = val(L, 'sw', f) || first, prev = null, t = 1;
+  if (L.swMode === 'crossfade' && ch && ch.keys.length > 1) {
+    let i = -1; for (let k = 0; k < ch.keys.length; k++) if (ch.keys[k].f <= f) i = k;
+    if (i > 0) { const fade = Math.max(1, L.swFade || 4); t = (f - ch.keys[i].f + 1) / (fade + 1); if (t < 1 && ch.keys[i - 1].v !== cur) prev = ch.keys[i - 1].v; }
+  }
+  return { cur, prev, t: clamp(t, 0, 1) };
+}
+
+// ---------- bones ----------
+function sortBones(B) { // parents before children
+  const out = [], seen = new Set();
+  const visit = (b) => {
+    if (seen.has(b.id)) return; seen.add(b.id);
+    const p = b.parent && B.bones.find((x) => x.id === b.parent);
+    if (p) visit(p); else b.parent = null;
+    out.push(b);
+  };
+  B.bones.forEach(visit); B.bones = out;
+}
+// Vitruvian bones: alternate bone constructions; only the active group (plus ungrouped bones) is live
+function vitActive(B, f) { return B.vgroups && B.vgroups.length && f !== null ? val(B, 'vit', f) || B.vgroups[0] : null; }
+// f === null -> rest (setup) pose, used for binding. Posed frames add the exploded-rig offset and physics.
+// over: {boneId: angleDeg} (IK preview). noDyn: skip the physics simulation.
+function boneFrames(B, f, over, noDyn) {
+  const out = {}, vg = vitActive(B, f);
+  const dyn = !actActive() && !noDyn && f !== null && B.bones.some((b) => b.dyn && b.dyn.on) ? simulateBones(B)[clamp(Math.round(f), 0, S.doc.end)] || {} : null;
+  for (const b of B.bones) {
+    let a = over && over[b.id] !== undefined ? over[b.id] : f === null ? b.a : val(B, 'bone:' + b.id + ':a', f);
+    if (dyn && dyn[b.id] && !(over && over[b.id] !== undefined)) a += dyn[b.id];
+    let pos = f === null ? [b.x, b.y] : val(B, 'bone:' + b.id + ':p', f);
+    if (f !== null && (b.ox || b.oy)) pos = [pos[0] + (b.ox || 0), pos[1] + (b.oy || 0)];
+    const s = f === null ? 1 : val(B, 'bone:' + b.id + ':s', f) ?? 1;
+    const par = b.parent && out[b.parent];
+    const PF = par ? par.F : M.I(), ps = par ? par.s : 1;
+    const F = M.mul(PF, M.mul(M.t(pos[0] * ps, pos[1]), M.r(a * DEG)));
+    out[b.id] = { F, s, len: b.len * s, b, off: !!(vg && b.vg && b.vg !== vg) };
+  }
+  return out;
+}
+function boneDeforms(B, f, over) {
+  const rest = boneFrames(B, null), cur = boneFrames(B, f, over), D = {};
+  for (const id in cur) D[id] = M.mul(M.mul(cur[id].F, M.s(cur[id].s, 1)), M.inv(rest[id].F));
+  return { D, cur, rest };
+}
+// ---------- bone physics: deterministic spring dynamics with inertia, gravity and wind ----------
+const _simCache = new Map();
+function simulateBones(B) {
+  const c = _simCache.get(B.id);
+  if (c && c.doc === S.doc && c.rev === REV && c.end === S.doc.end) return c.res;
+  const fps = S.doc.fps, N = S.doc.end + 1, dynB = B.bones.filter((b) => b.dyn && b.dyn.on), res = [], st = {};
+  const fo = B.force || {}, g = fo.gravS || 0, ga = (fo.gravA ?? 90) * DEG, w = fo.windS || 0, wa = (fo.windA || 0) * DEG, turb = fo.turb || 0;
+  for (let f = 0; f < N; f++) {
+    const off = {};
+    if (f > 0) {
+      const fr = boneFrames(B, f, null, true), LW = evalLC(B, f).world;
+      for (const b of dynB) {
+        const F = M.mul(LW, fr[b.id].F), base = M.ap(F, 0, 0), tgt = Math.atan2(F[1], F[0]), L = Math.max(5, fr[b.id].len * M.scaleOf(LW));
+        let s = st[b.id]; if (!s) s = st[b.id] = { ang: tgt, vel: 0, p1: base, p2: base };
+        const acc = [(base[0] - 2 * s.p1[0] + s.p2[0]) * fps * fps, (base[1] - 2 * s.p1[1] + s.p2[1]) * fps * fps];
+        const d = b.dyn, k = d.spring ?? 60, damp = d.damp ?? 11, inert = d.inertia ?? 0.6, n = 4, dt = 1 / fps / n, lever = L * 0.5;
+        for (let i = 0; i < n; i++) {
+          const t = (f + i / n) / fps, sn = Math.sin(s.ang), cs = Math.cos(s.ang), tang = (vx, vy) => -vx * sn + vy * cs;
+          const ws = w * (1 + turb * vnoise(t * 1.7, b.id.length * 7 + 3));
+          let aa = (-inert * tang(acc[0], acc[1]) + tang(Math.cos(ga) * g, Math.sin(ga) * g) + tang(Math.cos(wa) * ws, Math.sin(wa) * ws)) / lever;
+          let diff = s.ang - tgt; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+          if (d.lockTip) diff *= 2;
+          aa += -k * diff - damp * s.vel;
+          s.vel += aa * dt; s.ang += s.vel * dt;
+        }
+        s.p2 = s.p1; s.p1 = base;
+        let diff = s.ang - tgt; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        off[b.id] = clamp(diff / DEG, -120, 120);
+      }
+    }
+    res.push(off);
+  }
+  _simCache.set(B.id, { doc: S.doc, rev: REV, end: S.doc.end, res });
+  return res;
+}
+
+// ---------- vector geometry ----------
+// flexible binding: unbound points follow every bone whose strength region (set with Bone Strength) covers them
+function flexSegs(B) {
+  if (!B || !B.rest || B.layer.autoBind === false) return [];
+  return B.layer.bones.filter((b) => b.str > 0 && B.rest[b.id]).map((b) => ({ id: b.id, s: b.str, a: M.ap(B.rest[b.id].F, 0, 0), b: M.ap(B.rest[b.id].F, b.len, 0) }));
+}
+function flexWeights(segs, p) {
+  const out = [];
+  for (const g of segs) {
+    const dx = g.b[0] - g.a[0], dy = g.b[1] - g.a[1], l2 = dx * dx + dy * dy || 1e-9, t = clamp(((p[0] - g.a[0]) * dx + (p[1] - g.a[1]) * dy) / l2, 0, 1);
+    const d = Math.hypot(p[0] - (g.a[0] + t * dx), p[1] - (g.a[1] + t * dy));
+    if (d < g.s) { const w = (1 - d / g.s) ** 2; if (w > 1e-4) out.push([g.id, w]); }
+  }
+  return out;
+}
+// Which bones move a point (Moho model): a whole-layer bone attachment overrides everything; an explicit
+// point binding (pt.b, normally one bone) wins next; pt.b = [] means the point was released (no bone moves it);
+// otherwise the point is flexi-bound to every eligible bone, unless the layer's flexi-binding is off (L.flexi === false)
+// or restricted to chosen bones (L.flexiBones).
+function layerFlexSegs(L, B) { if (!B || L.flexi === false) return []; const s = flexSegs(B); return Array.isArray(L.flexiBones) ? s.filter((g) => L.flexiBones.includes(g.id)) : s; }
+function pointBoneWeights(L, pt, B, relPts, segs) {
+  if (!B || L.bindBone) return null;
+  if (Array.isArray(pt.b)) return pt.b.length ? pt.b : null;
+  return segs.length ? flexWeights(segs, M.ap(relPts, pt.x, pt.y)) : null;
+}
+function deformedPts(L, f, lc) {
+  const out = {};
+  const B = lc && lc.B;
+  const relInv = B ? M.inv(lc.relPts) : null;
+  const segs = B && !lc.bound ? layerFlexSegs(L, B) : [];
+  for (const id in L.pts) {
+    let v = val(L, 'pt:' + id, f);
+    const pt = L.pts[id];
+    const ws_ = B ? pointBoneWeights(L, pt, B, lc.relPts, segs) : null;
+    if (ws_ && ws_.length) {
+      const p = M.ap(lc.relPts, v[0], v[1]);
+      let x = 0, y = 0, ws = 0;
+      for (const [bid, w] of ws_) {
+        const D = B.D[bid]; if (!D) continue;
+        const q = M.ap(D, p[0], p[1]); x += q[0] * w; y += q[1] * w; ws += w;
+      }
+      if (ws > 0) v = M.ap(relInv, x / ws, y / ws);
+    }
+    out[id] = v;
+  }
+  return out;
+}
+function tracePath(ctx, L, path, P) {
+  const ids = path.pts.filter((id) => P[id]); const n = ids.length;
+  if (n < 2) return;
+  const closed = path.closed && n > 2;
+  const get = (i) => P[ids[closed ? (i + n) % n : clamp(i, 0, n - 1)]];
+  const cv = (i) => { const p = L.pts[ids[closed ? (i + n) % n : clamp(i, 0, n - 1)]]; return p && p.c !== undefined ? p.c : 1; };
+  const p0 = get(0); ctx.moveTo(p0[0], p0[1]);
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = get(i - 1), b = get(i), c = get(i + 1), d = get(i + 2);
+    const k1 = cv(i) / 6, k2 = cv(i + 1) / 6;
+    if (k1 === 0 && k2 === 0) { ctx.lineTo(c[0], c[1]); continue; }
+    ctx.bezierCurveTo(b[0] + (c[0] - a[0]) * k1, b[1] + (c[1] - a[1]) * k1, c[0] - (d[0] - b[0]) * k2, c[1] - (d[1] - b[1]) * k2, c[0], c[1]);
+  }
+  if (closed) ctx.closePath();
+}
+// Moho style model: a shape may apply two named styles (Style 1, Style 2 — Style 2 wins where both define a property).
+// A style supplies only the properties it defines (older styles without a 'defines' list supply everything), and a
+// shape's local override keeps its own value for that property.
+const STYLE_PROPS = ['fill', 'stroke', 'width', 'fillOn', 'strokeOn'];
+function styleDefines(st, p) { return !!st && (!st.defines || !!st.defines[p]); }
+function shapeStyle(L, sh, f) {
+  const own = { fill: val(L, 'sh:' + sh.id + ':fill', f), stroke: val(L, 'sh:' + sh.id + ':stroke', f), width: val(L, 'sh:' + sh.id + ':width', f), fillOn: sh.fillOn, strokeOn: sh.strokeOn };
+  const s1 = sh.styleId && S.doc.styles.find((s) => s.id === sh.styleId), s2 = sh.style2Id && S.doc.styles.find((s) => s.id === sh.style2Id);
+  if (!s1 && !s2) return own;
+  const out = {};
+  for (const p of STYLE_PROPS) out[p] = sh.over && sh.over[p] ? own[p] : styleDefines(s2, p) ? s2[p] : styleDefines(s1, p) ? s1[p] : own[p];
+  out.from = [s1, s2].filter(Boolean).map((s) => s.name).join(' + ');
+  return out;
+}
+
+// ---------- camera ----------
+function camFn(f) {
+  const c = S.doc.camera;
+  const x = val(c, 'x', f), y = val(c, 'y', f), zoom = val(c, 'zoom', f), roll = val(c, 'roll', f);
+  const sh = val(c, 'shake', f), fr = val(c, 'shakeFreq', f);
+  const t = (f / S.doc.fps) * fr;
+  const sx = sh ? sh * vnoise(t, 1) : 0, sy = sh ? sh * vnoise(t, 2) : 0, sr = sh ? sh * 0.05 * vnoise(t, 3) : 0;
+  const cache = {};
+  return (z = 0) => {
+    if (cache[z]) return cache[z];
+    const s = (zoom * CAM_D) / Math.max(60, CAM_D - z);
+    return (cache[z] = M.chain(M.r(-(roll + sr) * DEG), M.s(s), M.t(-(x + sx), -(y + sy))));
+  };
+}
+
+// ---------- offscreen pool ----------
+const Pool = {
+  list: [],
+  get(w, h) {
+    const c = this.list.pop() || document.createElement('canvas');
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const x = c.getContext('2d');
+    x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; x.filter = 'none';
+    x.imageSmoothingEnabled = true; x.clearRect(0, 0, w, h);
+    return c;
+  },
+  put(...cs) { for (const c of cs) if (c && this.list.length < 24) this.list.push(c); },
+};
+function tmpCopy(src) { const c = Pool.get(src.width, src.height); c.getContext('2d').drawImage(src, 0, 0); return c; }
+function colorized(src, color) {
+  const c = tmpCopy(src), x = c.getContext('2d');
+  x.globalCompositeOperation = 'source-in'; x.fillStyle = color; x.fillRect(0, 0, c.width, c.height);
+  return c;
+}
+function blurred(src, r) {
+  const c = Pool.get(src.width, src.height), x = c.getContext('2d');
+  x.filter = r > 0.2 ? `blur(${r}px)` : 'none'; x.drawImage(src, 0, 0); x.filter = 'none';
+  return c;
+}
+
+// ---------- effects catalogue (Core set + a few Expansion) ----------
+// params: name: [default, min, max, step] or ['#color'] or [bool]
+const FX = {
+  blur: { label: 'Gaussian blur', params: { radius: [8, 0, 200, 0.5] },
+    apply(c, p, sc) { if (p.radius <= 0) return; const b = blurred(c, p.radius * sc), x = c.getContext('2d'); x.clearRect(0, 0, c.width, c.height); x.drawImage(b, 0, 0); Pool.put(b); } },
+  glow: { label: 'Glow / bloom', params: { radius: [18, 0, 300, 0.5], intensity: [1.5, 0, 6, 0.05], color: ['#ffd27a'] },
+    apply(c, p, sc) {
+      const g = colorized(c, p.color), b = blurred(g, p.radius * sc), x = c.getContext('2d');
+      x.globalCompositeOperation = 'destination-over'; let k = p.intensity; // glow sits behind the artwork so colors stay true
+      while (k > 0.001) { x.globalAlpha = Math.min(1, k); x.drawImage(b, 0, 0); k -= 1; }
+      x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; Pool.put(g, b);
+    } },
+  shadow: { label: 'Drop shadow', params: { dx: [10, -500, 500, 0.5], dy: [12, -500, 500, 0.5], softness: [12, 0, 200, 0.5], color: ['#000000'], opacity: [0.45, 0, 1, 0.01] },
+    apply(c, p, sc) {
+      const g = colorized(c, p.color), b = blurred(g, p.softness * sc), x = c.getContext('2d');
+      x.globalCompositeOperation = 'destination-over'; x.globalAlpha = p.opacity; x.drawImage(b, p.dx * sc, p.dy * sc);
+      x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; Pool.put(g, b);
+    } },
+  outline: { label: 'Outline', params: { width: [4, 0, 100, 0.5], color: ['#111111'] },
+    apply(c, p, sc) {
+      const w = p.width * sc; if (w <= 0) return;
+      const g = colorized(c, p.color), x = c.getContext('2d'); x.globalCompositeOperation = 'destination-over';
+      const n = Math.min(32, Math.max(12, Math.round(w * 2)));
+      for (let i = 0; i < n; i++) { const a = (i / n) * Math.PI * 2; x.drawImage(g, Math.cos(a) * w, Math.sin(a) * w); }
+      x.globalCompositeOperation = 'source-over'; Pool.put(g);
+    } },
+  color: { label: 'Color correction', params: { brightness: [1, 0, 3, 0.01], contrast: [1, 0, 3, 0.01], saturation: [1, 0, 3, 0.01], hue: [0, -180, 180, 1] },
+    apply(c, p) {
+      const t = tmpCopy(c), x = c.getContext('2d'); x.clearRect(0, 0, c.width, c.height);
+      x.filter = `brightness(${p.brightness}) contrast(${p.contrast}) saturate(${p.saturation}) hue-rotate(${p.hue}deg)`;
+      x.drawImage(t, 0, 0); x.filter = 'none'; Pool.put(t);
+    } },
+  tint: { label: 'Colorize', params: { color: ['#3a86ff'], amount: [0.5, 0, 1, 0.01] },
+    apply(c, p) { const x = c.getContext('2d'); x.globalCompositeOperation = 'source-atop'; x.globalAlpha = p.amount; x.fillStyle = p.color; x.fillRect(0, 0, c.width, c.height); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; } },
+  noise: { label: 'Noise / grain', params: { amount: [0.25, 0, 1, 0.01], size: [2, 1, 40, 0.5], animated: [true], seed: [1, 0, 9999, 1] },
+    apply(c, p, sc, R, L) {
+      const cell = Math.max(1, p.size * sc * 0.5), w = Math.ceil(c.width / cell), h = Math.ceil(c.height / cell);
+      if (w * h > 600000) throw new Error("Noise exceeds preview/render budget; increase grain size");
+      const n = Pool.get(w, h), nx = n.getContext('2d'), img = nx.createImageData(w, h);
+      const rnd = mulberry32((p.seed | 0) * 7919 + (p.animated ? actProceduralFrame(L, R.f) * 104729 : 0));
+      for (let i = 0; i < img.data.length; i += 4) { const v = rnd() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+      nx.putImageData(img, 0, 0);
+      const a = tmpCopy(c), x = c.getContext('2d');
+      x.imageSmoothingEnabled = false; x.globalCompositeOperation = 'overlay'; x.globalAlpha = p.amount; x.drawImage(n, 0, 0, w * cell, h * cell);
+      x.globalAlpha = 1; x.globalCompositeOperation = 'destination-in'; x.drawImage(a, 0, 0);
+      x.globalCompositeOperation = 'source-over'; x.imageSmoothingEnabled = true; Pool.put(a, n);
+    } },
+  pixelate: { label: 'Pixelate / mosaic', params: { size: [12, 1, 200, 1] },
+    apply(c, p, sc) {
+      const s = Math.max(1, p.size * sc); if (s <= 1.01) return;
+      const w = Math.max(1, Math.round(c.width / s)), h = Math.max(1, Math.round(c.height / s));
+      const t = Pool.get(w, h); t.getContext('2d').drawImage(c, 0, 0, w, h);
+      const x = c.getContext('2d'); x.clearRect(0, 0, c.width, c.height); x.imageSmoothingEnabled = false; x.drawImage(t, 0, 0, c.width, c.height); x.imageSmoothingEnabled = true; Pool.put(t);
+    } },
+  streak: { label: 'Directional blur', params: { angle: [0, -180, 180, 1], length: [30, 0, 500, 1], samples: [10, 2, 40, 1] },
+    apply(c, p, sc) {
+      const t = tmpCopy(c), x = c.getContext('2d'); x.clearRect(0, 0, c.width, c.height);
+      const n = Math.round(p.samples), L = p.length * sc, a = p.angle * DEG;
+      for (let i = 0; i < n; i++) { const k = i / (n - 1) - 0.5; x.globalAlpha = 1 / n * 1.6; x.drawImage(t, Math.cos(a) * L * k, Math.sin(a) * L * k); }
+      x.globalAlpha = 1; Pool.put(t);
+    } },
+  trail: { label: 'Motion trail / echo', params: { samples: [6, 1, 30, 1], spacing: [2, 1, 20, 1], decay: [0.65, 0.05, 1, 0.01] },
+    apply(c, p, sc, R, L) {
+      if (R.noTrail || (actActive() && !actHasAnimation(L))) return;
+      const x = c.getContext('2d'), t = Pool.get(c.width, c.height);
+      for (let i = Math.round(p.samples); i >= 1; i--) {
+        const ff = R.f - i * Math.round(p.spacing); if (ff < 0) continue;
+        const tx = t.getContext('2d'); tx.setTransform(1, 0, 0, 1, 0, 0); tx.clearRect(0, 0, t.width, t.height);
+        renderScene(tx, ff, R.view, { only: L.id, noTrail: true, export: R.export });
+        x.globalCompositeOperation = 'destination-over'; x.globalAlpha = Math.pow(p.decay, i); x.drawImage(t, 0, 0);
+      }
+      x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; Pool.put(t);
+    } },
+  chroma: { label: 'Chromatic aberration', params: { offset: [4, 0, 80, 0.5], angle: [0, -180, 180, 1] },
+    apply(c, p, sc) {
+      const o = p.offset * sc, a = p.angle * DEG, dx = Math.cos(a) * o, dy = Math.sin(a) * o;
+      const ch = (col) => { const t = tmpCopy(c), x = t.getContext('2d'); x.globalCompositeOperation = 'multiply'; x.fillStyle = col; x.fillRect(0, 0, t.width, t.height); x.globalCompositeOperation = 'destination-in'; x.drawImage(c, 0, 0); return t; };
+      const r = ch('#ff0000'), g = ch('#00ff00'), b = ch('#0000ff'), x = c.getContext('2d');
+      x.clearRect(0, 0, c.width, c.height); x.globalCompositeOperation = 'lighter';
+      x.drawImage(r, -dx, -dy); x.drawImage(g, 0, 0); x.drawImage(b, dx, dy); x.globalCompositeOperation = 'source-over'; Pool.put(r, g, b);
+    } },
+};
+function fxDefaults(type) { const p = {}; for (const [k, d] of Object.entries(FX[type].params)) p[k] = d[0]; return p; }
+function fxParamsAt(L, e, f) { const p = {}; for (const k in e.p) p[k] = val(L, 'fx:' + e.id + ':' + k, f); return p; }
+
+// ---------- scene rendering ----------
+function renderScene(ctx, f, view, opts = {}) {
+  const R = {
+    f, actionFrame:f, view, cam: opts.workspace ? stageCamFn(f) : camFn(f), cameraState: opts.workspace ? cameraWorkspaceState(f) : cameraStateAt(f), rec: opts.rec || null, export: !!opts.export, W: ctx.canvas.width, H: ctx.canvas.height,
+    only: opts.only || null, onlyAnc: opts.only ? new Set(ancestors(opts.only).map((a) => a.id)) : null, noTrail: !!opts.noTrail, swo: opts.swOverride || null,
+  };
+  drawList(ctx, S.doc.layers, R, { base: M.I(), rel: M.I(), z: 0, B: null, inOnly: false });
+  return R;
+}
+function drawList(ctx, list, R, pc) { for (let i = list.length - 1; i >= 0; i--) drawLayer(ctx, list[i], R, pc); }
+
+function layerCtx(L, f, pc) {
+  const local = layerLocalM(L, f);
+  const relPts = M.mul(pc.rel, local);
+  let rel = relPts;
+  if (L.bindBone && pc.B && pc.B.D[L.bindBone]) rel = M.mul(pc.B.D[L.bindBone], relPts);
+  return { L, base: pc.base, relParent: pc.rel, relPts, rel, world: M.mul(pc.base, rel), z: pc.z + (val(L, 'z', f) || 0), B: pc.B, bound: !!(pc.B && (pc.bound || L.bindBone)) };
+}
+
+function drawLayer(ctx, L, R, pc) {
+  if (S.doc.activeAction) R = { ...R, f:actPreviewFrame(L, R.actionFrame ?? R.f) };
+  if (!L.vis || val(L, 'visible', R.f) === false || (R.export && !L.render)) return;
+  const inOnly = pc.inOnly || R.only === L.id;
+  const isAnc = R.only && !inOnly;
+  if (isAnc && !R.onlyAnc.has(L.id)) return;
+  if (L.bindBone && pc.B && pc.B.cur && pc.B.cur[L.bindBone] && pc.B.cur[L.bindBone].off) return; // attached to an inactive Vitruvian bone
+  const lc = layerCtx(L, R.f, pc);
+  lc.inOnly = inOnly;
+  lc.full = cameraFullMatrix(R, L, lc);
+  if (R.rec && !isAnc) R.rec.push(lc);
+  const op = isAnc ? 1 : val(L, 'opacity', R.f);
+  if (op <= 0.001) return;
+  const fxOn = !isAnc && L.fx.some((e) => e.on);
+  const dofRadius = isAnc ? 0 : cameraDofRadius(R, L, lc);
+  const needOff = !isAnc && (dofRadius > 0.1 || fxOn || L.blend !== 'source-over' || (isContainer(L) && op < 0.999) || (L.type === 'group' && (L.mask === 'bottom' || L.mask === 'invert')));
+  if (!needOff) { const ga = ctx.globalAlpha; ctx.globalAlpha = ga * op; drawContent(ctx, L, R, lc); ctx.globalAlpha = ga; return; }
+  const off = Pool.get(R.W, R.H), octx = off.getContext('2d');
+  drawContent(octx, L, R, lc);
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.globalAlpha = 1; octx.globalCompositeOperation = 'source-over';
+  const sc = M.scaleOf(M.mul(R.view, R.cam(lc.z)));
+  for (const e of L.fx) if (e.on && FX[e.type]) { try { FX[e.type].apply(off, fxParamsAt(L, e, R.f), sc, R, L, lc); } catch (err) { if (R.export) throw new Error('Effect ' + e.type + ' on ' + L.name + ': ' + err.message); console.warn('fx', err); } octx.setTransform(1, 0, 0, 1, 0, 0); octx.globalAlpha = 1; octx.globalCompositeOperation = 'source-over'; octx.filter = 'none'; }
+  if (dofRadius > 0.1) { const b = blurred(off, dofRadius); octx.clearRect(0, 0, off.width, off.height); octx.drawImage(b, 0, 0); Pool.put(b); }
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha *= op; ctx.globalCompositeOperation = L.blend || 'source-over';
+  ctx.drawImage(off, 0, 0); ctx.restore();
+  Pool.put(off);
+}
+
+function drawContent(ctx, L, R, lc) {
+  const full = lc.full;
+  switch (L.type) {
+    case 'vector': {
+      const P = (lc.P = deformedPts(L, R.f, lc));
+      M.set(ctx, full);
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      for (const sh of L.shapes) {
+        const st = shapeStyle(L, sh, R.f);
+        ctx.beginPath();
+        for (const pid of sh.paths) { const path = L.paths.find((p) => p.id === pid); if (path) tracePath(ctx, L, path, P); }
+        if (st.fillOn) { ctx.fillStyle = st.fill; ctx.fill('evenodd'); }
+        if (st.strokeOn && st.width > 0) { ctx.lineWidth = st.width; ctx.strokeStyle = st.stroke; ctx.stroke(); }
+      }
+      break;
+    }
+    case 'image': {
+      const m = S.media[L.media];
+      if (m && m.el && m.el.complete !== false) { M.set(ctx, full); ctx.drawImage(m.el, -L.iw / 2, -L.ih / 2, L.iw, L.ih); }
+      break;
+    }
+    case 'text': {
+      M.set(ctx, full);
+      ctx.fillStyle = val(L, 'color', R.f); ctx.font = `${L.bold ? '700 ' : ''}${L.size}px ${L.font}`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const lines = String(L.text).split('\n'), lh = L.size * 1.15;
+      lines.forEach((ln, i) => ctx.fillText(ln, 0, (i - (lines.length - 1) / 2) * lh));
+      break;
+    }
+    case 'particle': drawParticles(ctx, L, R, lc); break;
+    case 'group': case 'switch': case 'bone': {
+      // A Bone layer with “Allow nested layer control” off only deforms its direct children.
+      let cpc = { base: lc.base, rel: lc.rel, z: lc.z, B: L.type === 'group' && lc.B && lc.B.layer.nested === false ? null : lc.B, inOnly: lc.inOnly, bound: lc.bound };
+      if (L.type === 'bone') {
+        const bd = boneDeforms(L, R.f);
+        lc.bones = bd;
+        cpc = { base: lc.world, rel: M.I(), z: lc.z, B: { layer: L, D: bd.D, cur: bd.cur, rest: bd.rest }, inOnly: lc.inOnly, bound: false };
+      }
+      if (L.type === 'switch') {
+        const st = switchState(L, R.f), over = !R.export && R.swo && R.swo[L.id];
+        const c = L.children.find((c) => c.id === (over || st.cur)) || L.children[0];
+        lc.activeChild = c && c.id;
+        const pc0 = !over && st.prev && L.children.find((x) => x.id === st.prev);
+        if (pc0) { const ga = ctx.globalAlpha; ctx.globalAlpha = ga * (1 - st.t); drawLayer(ctx, pc0, R, cpc); ctx.globalAlpha = ga * st.t; if (c) drawLayer(ctx, c, R, cpc); ctx.globalAlpha = ga; }
+        else if (c) drawLayer(ctx, c, R, cpc);
+      } else if (L.type === 'group' && (L.mask === 'bottom' || L.mask === 'invert') && L.children.length > 1 && !R.only) {
+        const kids = L.children, mL = kids[kids.length - 1];
+        const mc = Pool.get(R.W, R.H), cc = Pool.get(R.W, R.H);
+        drawLayer(mc.getContext('2d'), mL, R, cpc);
+        const cx = cc.getContext('2d');
+        for (let i = kids.length - 2; i >= 0; i--) drawLayer(cx, kids[i], R, cpc);
+        cx.setTransform(1, 0, 0, 1, 0, 0); cx.globalCompositeOperation = L.mask === 'invert' ? 'destination-out' : 'destination-in';
+        cx.drawImage(mc, 0, 0); cx.globalCompositeOperation = 'source-over';
+        ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(cc, 0, 0); ctx.restore();
+        Pool.put(mc, cc);
+      } else drawList(ctx, L.children, R, cpc);
+      break;
+    }
+  }
+}
+
+// ---------- particles (analytic & deterministic: same frame + seed => same result) ----------
+function particleList(L, f, lc) {
+  f = actProceduralFrame(L, f);
+  const fps = S.doc.fps, p = (k) => val(L, k, f);
+  const life = Math.max(0.05, p('life')), out = [];
+  const births = [];
+  if (L.mode === 'burst') { for (let i = 0; i < L.burst; i++) births.push([i, L.startF + hash1(i, L.seed + 5) * 1.5]); }
+  else {
+    const step = fps / Math.max(0.01, p('rate'));
+    const from = Math.max(L.startF, f - life * 1.3 * fps), to = Math.min(f, L.endF);
+    const i0 = Math.max(0, Math.ceil((from - L.startF) / step)), i1 = Math.floor((to - L.startF) / step);
+    for (let i = i0; i <= i1 && births.length < 3000; i++) births.push([i, L.startF + i * step]);
+  }
+  const relCache = new Map();
+  const relAt = (bf) => {
+    const k = Math.round(bf);
+    if (relCache.has(k)) return relCache.get(k);
+    let m = layerLocalM(L, k);
+    if (L.bindBone && lc.B) { const D = boneDeforms(lc.B.layer, k).D[L.bindBone]; if (D) m = M.mul(D, m); }
+    relCache.set(k, m); return m;
+  };
+  const g = p('gravity'), wind = p('wind'), drag = p('drag');
+  for (const [i, bf] of births) {
+    const r = (k) => hash1(i * 13 + k, L.seed);
+    const age = (f - bf) / fps, pl = life * (0.7 + 0.6 * r(1));
+    if (age < 0 || age > pl) continue;
+    const t = age / pl;
+    const ang = (p('angle') + (r(2) - 0.5) * p('spread')) * DEG, sp = p('speed') * (1 - p('speedVar') * r(3));
+    let ox = 0, oy = 0;
+    const er = p('emitR');
+    if (L.emit === 'circle') { const a = r(4) * Math.PI * 2, rr = Math.sqrt(r(5)) * er; ox = Math.cos(a) * rr; oy = Math.sin(a) * rr; }
+    else if (L.emit === 'line') ox = (r(4) - 0.5) * 2 * er;
+    const em = M.ap(relAt(bf), ox, oy);
+    const k = drag > 0 ? (1 - Math.exp(-drag * age)) / drag : age;
+    const vx = Math.cos(ang) * sp, vy = Math.sin(ang) * sp;
+    out.push({
+      x: em[0] + vx * k + 0.5 * wind * age * age, y: em[1] + vy * k + 0.5 * g * age * age,
+      vx: vx * Math.exp(-drag * age) + wind * age, vy: vy * Math.exp(-drag * age) + g * age,
+      size: lerp(p('size0'), p('size1'), t) * (0.7 + 0.6 * r(6)), a: lerp(p('alpha0'), p('alpha1'), t),
+      col: mixColor(p('color0'), p('color1'), t), rot: r(7) * 360 + p('spin') * age * (r(8) - 0.5) * 2,
+    });
+  }
+  return out;
+}
+function drawParticles(ctx, L, R, lc) {
+  const list = particleList(L, R.f, lc);
+  const m = M.chain(R.view, R.cam(lc.z), lc.base, lc.relParent);
+  const ga = ctx.globalAlpha;
+  for (const q of list) {
+    if (q.a <= 0.003 || q.size <= 0) continue;
+    ctx.globalAlpha = ga * clamp(q.a, 0, 1);
+    M.set(ctx, M.mul(m, M.t(q.x, q.y)));
+    const s = q.size / 2;
+    if (L.shape === 'soft') {
+      const gr = ctx.createRadialGradient(0, 0, 0, 0, 0, s);
+      gr.addColorStop(0, q.col); gr.addColorStop(1, rgba(q.col, 0));
+      ctx.fillStyle = gr; ctx.fillRect(-s, -s, s * 2, s * 2);
+    } else if (L.shape === 'streak') {
+      const sp = Math.hypot(q.vx, q.vy) || 1;
+      ctx.strokeStyle = q.col; ctx.lineWidth = Math.max(1, q.size / 6); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo((-q.vx / sp) * q.size * 2, (-q.vy / sp) * q.size * 2); ctx.stroke();
+    } else if (L.shape === 'square') {
+      ctx.rotate(q.rot * DEG); ctx.fillStyle = q.col; ctx.fillRect(-s, -s, s * 2, s * 2);
+    } else if (L.shape === 'star') {
+      ctx.rotate(q.rot * DEG); ctx.fillStyle = q.col; ctx.beginPath();
+      for (let i = 0; i < 10; i++) { const rr = i % 2 ? s * 0.42 : s, a = (i / 10) * Math.PI * 2 - Math.PI / 2; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+      ctx.fill();
+    } else { ctx.fillStyle = q.col; ctx.beginPath(); ctx.arc(0, 0, s, 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.globalAlpha = ga;
+}
+const PARTICLE_PRESETS = {
+  Dust: { mode: 'burst', burst: 70, shape: 'soft', emit: 'line', p: { life: 1.3, speed: 260, speedVar: 0.6, spread: 160, angle: -90, gravity: 120, wind: 0, drag: 2.2, size0: 26, size1: 90, alpha0: 0.85, alpha1: 0, color0: '#a08566', color1: '#e8ddcf', emitR: 70, spin: 60 } },
+  Fire: { mode: 'continuous', shape: 'soft', emit: 'circle', p: { rate: 60, life: 0.9, speed: 160, speedVar: 0.5, spread: 30, angle: -90, gravity: -120, wind: 0, drag: 0.8, size0: 40, size1: 6, alpha0: 0.95, alpha1: 0, color0: '#ffdd55', color1: '#e2361b', emitR: 18, spin: 0 } },
+  Smoke: { mode: 'continuous', shape: 'soft', emit: 'circle', p: { rate: 18, life: 3, speed: 70, speedVar: 0.5, spread: 40, angle: -90, gravity: -20, wind: 30, drag: 0.4, size0: 30, size1: 140, alpha0: 0.45, alpha1: 0, color0: '#777777', color1: '#cccccc', emitR: 16, spin: 30 } },
+  Sparks: { mode: 'burst', burst: 60, shape: 'streak', emit: 'circle', p: { life: 0.8, speed: 600, speedVar: 0.7, spread: 360, angle: 0, gravity: 900, wind: 0, drag: 1.2, size0: 16, size1: 4, alpha0: 1, alpha1: 0, color0: '#fff4b0', color1: '#ff7a1a', emitR: 4, spin: 0 } },
+  Snow: { mode: 'continuous', shape: 'circle', emit: 'line', p: { rate: 40, life: 6, speed: 60, speedVar: 0.6, spread: 30, angle: 90, gravity: 10, wind: 25, drag: 0.2, size0: 7, size1: 7, alpha0: 0.95, alpha1: 0.7, color0: '#ffffff', color1: '#e6f0ff', emitR: 800, spin: 0 } },
+  Rain: { mode: 'continuous', shape: 'streak', emit: 'line', p: { rate: 160, life: 1.2, speed: 900, speedVar: 0.2, spread: 4, angle: 100, gravity: 400, wind: 0, drag: 0, size0: 14, size1: 14, alpha0: 0.6, alpha1: 0.5, color0: '#a9c7ff', color1: '#a9c7ff', emitR: 900, spin: 0 } },
+  Magic: { mode: 'continuous', shape: 'star', emit: 'circle', p: { rate: 40, life: 1.4, speed: 90, speedVar: 0.6, spread: 360, angle: 0, gravity: -40, wind: 0, drag: 0.8, size0: 18, size1: 2, alpha0: 1, alpha1: 0, color0: '#fff3a8', color1: '#b26bff', emitR: 30, spin: 220 } },
+};
+function applyParticlePreset(L, name) {
+  const pr = PARTICLE_PRESETS[name]; if (!pr) return;
+  L.mode = pr.mode; L.shape = pr.shape; L.emit = pr.emit; if (pr.burst) L.burst = pr.burst;
+  for (const [k, v] of Object.entries(pr.p)) { L.p[k] = v; delete L.ch[k]; }
+  L.preset = name;
+}
+
+// ---------- hit testing on recorded render ----------
+const _hitCtx = document.createElement('canvas').getContext('2d');
+function hitLayerEntry(e, sx, sy, tol = 6) {
+  const L = e.L, x = _hitCtx;
+  if (L.type === 'vector' && e.P) {
+    M.set(x, e.full);
+    for (let i = L.shapes.length - 1; i >= 0; i--) {
+      const sh = L.shapes[i], st = shapeStyle(L, sh, S.frame);
+      const p = new Path2D();
+      for (const pid of sh.paths) { const path = L.paths.find((q) => q.id === pid); if (path) tracePath(p, L, path, e.P, S.frame, e); }
+      if (st.fillOn && x.isPointInPath(p, sx, sy, 'evenodd')) return { shape: sh };
+      x.lineWidth = Math.max(st.strokeOn ? st.width : 0, tol / M.scaleOf(e.full));
+      if (x.isPointInStroke(p, sx, sy)) return { shape: sh };
+    }
+    return null;
+  }
+  const inv = M.inv(e.full), q = M.ap(inv, sx, sy);
+  if (L.type === 'image') return Math.abs(q[0]) <= L.iw / 2 && Math.abs(q[1]) <= L.ih / 2 ? {} : null;
+  if (L.type === 'text') {
+    const lines = String(L.text).split('\n'); x.setTransform(1, 0, 0, 1, 0, 0); x.font = `${L.bold ? '700 ' : ''}${L.size}px ${L.font}`;
+    const w = Math.max(...lines.map((l) => x.measureText(l).width)), h = lines.length * L.size * 1.15;
+    return Math.abs(q[0]) <= w / 2 && Math.abs(q[1]) <= h / 2 ? {} : null;
+  }
+  if (L.type === 'particle') return Math.hypot(q[0], q[1]) <= Math.max(30, val(L, 'emitR', S.frame)) ? {} : null;
+  return null;
+}
+
+/* ===================== Popai Animator — stage view, overlays and tools ===================== */
+
+const Stage = { cv: null, ctx: null, dpr: 1, rec: [], drag: null, mouse: [0, 0], hover: null, pen: null, preview: null, space: false };
+
+function viewM() {
+  const c = Stage.cv, z = S.view.zoom * Stage.dpr;
+  return M.chain(M.t(c.width / 2 + S.view.panX * Stage.dpr, c.height / 2 + S.view.panY * Stage.dpr), M.r(S.view.rot || 0), M.s(z));
+}
+// evaluate a layer's transform context at frame f without rendering
+function evalLC(L, f) {
+  const chain = ancestors(L.id).reverse().concat([L]);
+  let pc = { base: M.I(), rel: M.I(), z: 0, B: null }, lc = null;
+  for (const A of chain) {
+    lc = layerCtx(A, f, pc);
+    if (A === L) break;
+    if (A.type === 'bone') { const bd = boneDeforms(A, f); pc = { base: lc.world, rel: M.I(), z: lc.z, B: { layer: A, D: bd.D, cur: bd.cur, rest: bd.rest }, bound: false }; }
+    else pc = { base: lc.base, rel: lc.rel, z: lc.z, B: A.type === 'group' && lc.B && lc.B.layer.nested === false ? null : lc.B, bound: lc.bound };
+  }
+  return lc;
+}
+function lcOf(L) {
+  const e = Stage.rec.find((r) => r.L === L);
+  if (e) return e;
+  const lc = evalLC(L, S.frame);
+  lc.full = cameraFullMatrix({view:viewM(),cam:stageCamFn(S.frame),cameraState:cameraWorkspaceState(S.frame)}, L, lc);
+  if (L.type === 'vector') lc.P = deformedPts(L, S.frame, lc);
+  if (L.type === 'bone') lc.bones = boneDeforms(L, S.frame);
+  return lc;
+}
+function parentFull(L) { const lc = lcOf(L); return M.chain(cameraLayerProjection({view:viewM(),cam:stageCamFn(S.frame),cameraState:cameraWorkspaceState(S.frame)},L,lc),lc.base,lc.relParent); }
+function toLocal(L, sx, sy) { return M.ap(M.inv(lcOf(L).full), sx, sy); }
+
+// switches show the alternative being edited/previewed on stage (never in export, never keyed)
+function switchOverrides() {
+  const o = { ...S.swPreview }, L = selLayer();
+  if (L) { let child = L; for (const A of ancestors(L.id)) { if (A.type === 'switch' && !(A.id in S.swPreview)) o[A.id] = child.id; child = A; } }
+  return o;
+}
+function editingInactiveAlt() {
+  const L = selLayer(); if (!L) return null;
+  let child = L;
+  for (const A of ancestors(L.id)) { if (A.type === 'switch') { const st = switchState(A, S.frame); if (st.cur !== child.id) return { sw: A, child }; } child = A; }
+  return null;
+}
+// ---------- stage rendering ----------
+function renderStage() {
+  const cv = Stage.cv, ctx = Stage.ctx, r = cv.getBoundingClientRect();
+  const dpr = (Stage.dpr = Math.min(2, window.devicePixelRatio || 1) * (S.playing && S.fastPlay && (window.devicePixelRatio || 1) > 1 ? 0.5 : 1));
+  const W = Math.max(10, Math.round(r.width * dpr)), Hh = Math.max(10, Math.round(r.height * dpr));
+  if (cv.width !== W || cv.height !== Hh) { cv.width = W; cv.height = Hh; }
+  const d = S.doc, V = viewM();
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#2b2e35'; ctx.fillRect(0, 0, W, Hh);
+  // frame background + shadow
+  M.set(ctx, V); ctx.shadowColor = 'rgba(0,0,0,.45)'; ctx.shadowBlur = 24 * dpr;
+  ctx.fillStyle = d.bg; ctx.fillRect(-d.w / 2, -d.h / 2, d.w, d.h); ctx.shadowBlur = 0;
+  // onion skins
+  const sel = selLayer();
+  if (S.onion && sel && !S.playing) {
+    for (let k = S.onionN; k >= 1; k--) for (const dir of [-1, 1]) {
+      const f = S.frame + dir * k; if (f < 0 || f > d.end) continue;
+      const off = Pool.get(W, Hh), ox = off.getContext('2d');
+      renderScene(ox, f, V, { only: sel.id, swOverride: switchOverrides(), workspace:true });
+      ox.setTransform(1, 0, 0, 1, 0, 0); ox.globalCompositeOperation = 'source-atop';
+      ox.fillStyle = dir < 0 ? '#ff4d6d' : '#38d39f'; ox.globalAlpha = 0.55; ox.fillRect(0, 0, W, Hh);
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 0.32 / k; ctx.drawImage(off, 0, 0); ctx.globalAlpha = 1; Pool.put(off);
+    }
+  }
+  Stage.rec = [];
+  renderScene(ctx, S.frame, V, { rec: Stage.rec, export: S.outputOnly, swOverride: switchOverrides(), workspace:!S.outputOnly });
+  // switch alignment overlay: every alternative ghosted over its registration point
+  const SWa = S.alignOverlay && !S.outputOnly && typeof switchTarget === 'function' && switchTarget();
+  if (SWa) {
+    for (const c of SWa.children) {
+      const off = Pool.get(W, Hh);
+      renderScene(off.getContext('2d'), S.frame, V, { only: c.id, swOverride: { [SWa.id]: c.id }, workspace:true });
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 0.25; ctx.drawImage(off, 0, 0); ctx.globalAlpha = 1; Pool.put(off);
+    }
+    const o = M.ap(lcOf(SWa).full, SWa.p.ox || 0, SWa.p.oy || 0);
+    ctx.strokeStyle = '#ff3bd4'; ctx.lineWidth = dpr; ctx.beginPath(); ctx.moveTo(o[0] - 30 * dpr, o[1]); ctx.lineTo(o[0] + 30 * dpr, o[1]); ctx.moveTo(o[0], o[1] - 30 * dpr); ctx.lineTo(o[0], o[1] + 30 * dpr); ctx.stroke();
+  }
+  // dim outside the camera frame
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const c0 = M.ap(V, -d.w / 2, -d.h / 2), c1 = M.ap(V, d.w / 2, d.h / 2);
+  if (CAMERA_VIEW.mode === 'camera' || S.outputOnly) {
+  ctx.fillStyle = 'rgba(28,30,36,.62)';
+  ctx.beginPath(); ctx.rect(0, 0, W, Hh); ctx.rect(c0[0], c0[1], c1[0] - c0[0], c1[1] - c0[1]); ctx.fill('evenodd');
+  ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 1; ctx.strokeRect(c0[0] + 0.5, c0[1] + 0.5, c1[0] - c0[0], c1[1] - c0[1]);
+  }
+  if (!S.outputOnly) drawOverlays(ctx);
+  if (S.mode === 'setup' && CAMERA_VIEW.mode === 'camera') {
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#ff8a3d'; ctx.lineWidth = 3 * dpr;
+    ctx.strokeRect(c0[0] - 2 * dpr, c0[1] - 2 * dpr, c1[0] - c0[0] + 4 * dpr, c1[1] - c0[1] + 4 * dpr);
+    ctx.fillStyle = '#ff8a3d'; ctx.font = `600 ${11 * dpr}px Inter, system-ui, sans-serif`; ctx.fillText('SETUP · rest pose — bones, binding and pivots. Tab returns to Animate', c0[0] + 2 * dpr, c1[1] + 16 * dpr);
+  }
+  renderCrumbs();
+  $('#hudInfo').textContent = `${Math.round(S.view.zoom * 100)}%  ·  frame ${S.frame}`;
+}
+
+// ---------- overlays (editor-only, never rendered on export) ----------
+function screenBBox(L) {
+  const es = [];
+  const collect = (A) => { const e = Stage.rec.find((r) => r.L === A); if (e && !isContainer(A)) es.push(e); if (A.children) A.children.forEach(collect); };
+  collect(L);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (m, x, y) => { const p = M.ap(m, x, y); x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); };
+  for (const e of es) {
+    const A = e.L;
+    if (A.type === 'vector' && e.P) for (const id in e.P) add(e.full, e.P[id][0], e.P[id][1]);
+    else if (A.type === 'image') { for (const [x, y] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) add(e.full, (x * A.iw) / 2, (y * A.ih) / 2); }
+    else if (A.type === 'text') { _hitCtx.font = `${A.bold ? '700 ' : ''}${A.size}px ${A.font}`; const lines = String(A.text).split('\n'); const w = Math.max(...lines.map((l) => _hitCtx.measureText(l).width)) / 2, h = (lines.length * A.size * 1.15) / 2; for (const [x, y] of [[-w, -h], [w, -h], [w, h], [-w, h]]) add(e.full, x, y); }
+    else if (A.type === 'particle') { const r = val(A, 'emitR', S.frame) || 20; for (const [x, y] of [[-r, -r], [r, -r], [r, r], [-r, r]]) add(e.full, x, y); }
+  }
+  if (x0 === Infinity) { const e = lcOf(L); const p = M.ap(e.full, 0, 0); return [p[0] - 20, p[1] - 20, p[0] + 20, p[1] + 20]; }
+  return [x0, y0, x1, y1];
+}
+function handlesFor(bb) {
+  const [x0, y0, x1, y1] = bb, mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+  return [
+    { k: 'nw', x: x0, y: y0 }, { k: 'ne', x: x1, y: y0 }, { k: 'se', x: x1, y: y1 }, { k: 'sw', x: x0, y: y1 },
+    { k: 'n', x: mx, y: y0 }, { k: 's', x: mx, y: y1 }, { k: 'e', x: x1, y: my }, { k: 'w', x: x0, y: my },
+    { k: 'rot', x: mx, y: y0 - 26 * Stage.dpr },
+  ];
+}
+function hitHandle(bb, sx, sy) { const r = 7 * Stage.dpr; return handlesFor(bb).find((h) => Math.abs(h.x - sx) <= r && Math.abs(h.y - sy) <= r) || null; }
+function ptsBBox(L, ids) {
+  const e = lcOf(L); let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const id of ids) { const v = e.P && e.P[id]; if (!v) continue; const p = M.ap(e.full, v[0], v[1]); x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+  const pad = 6 * Stage.dpr; return x0 === Infinity ? null : [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
+}
+function drawHandles(ctx, bb, color = '#ff8a3d') {
+  const dpr = Stage.dpr; ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.strokeStyle = color; ctx.lineWidth = dpr; ctx.setLineDash([4 * dpr, 3 * dpr]);
+  ctx.strokeRect(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1]); ctx.setLineDash([]);
+  const hs = handlesFor(bb);
+  ctx.beginPath(); ctx.moveTo(hs[4].x, hs[4].y); ctx.lineTo(hs[8].x, hs[8].y); ctx.stroke();
+  for (const h of hs) {
+    ctx.fillStyle = h.k === 'rot' ? color : '#fff'; ctx.strokeStyle = color;
+    ctx.beginPath();
+    if (h.k === 'rot') ctx.arc(h.x, h.y, 5 * dpr, 0, Math.PI * 2); else ctx.rect(h.x - 4 * dpr, h.y - 4 * dpr, 8 * dpr, 8 * dpr);
+    ctx.fill(); ctx.stroke();
+  }
+}
+const POINT_TOOLS = new Set(['points', 'pen', 'curvature', 'freehand', 'fill', 'rect', 'ellipse', 'polygon']);
+const BONE_TOOLS = new Set(['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset', 'physics', 'force']);
+function drawOverlays(ctx) {
+  const dpr = Stage.dpr, sel = selLayer();
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.lineJoin = 'round';
+  // motion path of selected layer
+  if (sel && S.showPaths && (S.tool === 'select' || S.tool === 'bonemanip') && Object.keys(sel.ch).some((k) => k === 'x' || k === 'y')) {
+    const cam = stageCamFn(S.frame), V = viewM(), pts = [];
+    const f0 = 0, f1 = S.doc.end, step = Math.max(1, Math.ceil((f1 - f0) / 400));
+    for (let f = f0; f <= f1; f += step) { const lc = evalLC(sel, f); pts.push([M.ap(M.chain(V, cam(lc.z), lc.world), 0, 0), f]); }
+    ctx.strokeStyle = 'rgba(255,138,61,.55)'; ctx.lineWidth = 1.5 * dpr; ctx.beginPath();
+    pts.forEach(([p], i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke();
+    for (const [p, f] of pts) {
+      const k = Object.values(sel.ch).some((c) => c.keys.some((kk) => kk.f === f));
+      ctx.fillStyle = f === S.frame ? '#fff' : k ? '#ffd166' : 'rgba(255,138,61,.8)';
+      ctx.beginPath(); ctx.arc(p[0], p[1], (k ? 3.5 : 2) * dpr, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  // vector outlines + points
+  for (const id of S.selLayers) {
+    const L = findLayer(id); if (!L) continue;
+    if (L.type === 'vector') {
+      const e = lcOf(L); if (!e.P) continue;
+      const showPts = POINT_TOOLS.has(S.tool) || S.tool === 'bind' || S.tool === 'bindpts' || S.tool === 'strength';
+      const showW = showPts && S.selBone && boneLayerFor(L) && boneLayerFor(L).bones.some((b) => b.id === S.selBone);
+      const flexW = showW && !L.bindBone ? (() => { const lc = lcOf(L); const sg = layerFlexSegs(L, lc.B); return (pid) => { if (Array.isArray(L.pts[pid].b)) return null; const w = flexWeights(sg, M.ap(lc.relPts, L.pts[pid].x, L.pts[pid].y)), t = w.reduce((a, q) => a + q[1], 0), m = w.find((q) => q[0] === S.selBone); return m ? m[1] / t : t ? 0 : null; }; })() : null;
+      M.set(ctx, e.full);
+      ctx.beginPath(); for (const path of L.paths) tracePath(ctx, L, path, e.P, S.frame, e);
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = showPts ? 'rgba(80,160,255,.95)' : 'rgba(80,160,255,.45)'; ctx.lineWidth = 1 * dpr; ctx.stroke();
+      if (S.selShape) {
+        const sh = L.shapes.find((s) => s.id === S.selShape);
+        if (sh) { M.set(ctx, e.full); ctx.beginPath(); for (const pid of sh.paths) { const pa = L.paths.find((p) => p.id === pid); if (pa) tracePath(ctx, L, pa, e.P, S.frame, e); } ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#ff8a3d'; ctx.lineWidth = 2 * dpr; ctx.setLineDash([5 * dpr, 4 * dpr]); ctx.stroke(); ctx.setLineDash([]); }
+      }
+      if (showPts) {
+        for (const pid in e.P) {
+          const p = M.ap(e.full, e.P[pid][0], e.P[pid][1]), s = S.selPts.has(pid), r = (s ? 4 : 3) * dpr;
+          const ends = L.paths.some((pa) => !pa.closed && (pa.pts[0] === pid || pa.pts[pa.pts.length - 1] === pid));
+          let col = s ? '#ff3b3b' : ends ? '#9be15d' : '#3d8bff';
+          if (showW && !s) { const pb = L.pts[pid].b; if (pb && pb.length) col = mixColor('#26315c', '#ffd23f', (pb.find((q) => q[0] === S.selBone) || [0, 0])[1]); else { const fw = flexW && flexW(pid); col = fw === null || fw === undefined ? '#6b6b6b' : mixColor('#1f4d52', '#3bc9db', fw); } }
+          ctx.fillStyle = col; ctx.strokeStyle = '#000';
+          ctx.lineWidth = dpr; ctx.beginPath(); ctx.rect(p[0] - r, p[1] - r, r * 2, r * 2); ctx.fill(); ctx.stroke();
+          if (isKeyed(L, 'pt:' + pid) && keyAt(L, 'pt:' + pid, S.frame)) { ctx.strokeStyle = '#ffd166'; ctx.strokeRect(p[0] - r - 2 * dpr, p[1] - r - 2 * dpr, (r + 2 * dpr) * 2, (r + 2 * dpr) * 2); }
+        }
+        if (S.tool === 'points' && S.selPts.size > 1) { const bb = ptsBBox(L, S.selPts); if (bb) drawHandles(ctx, bb, '#ff3b3b'); }
+        if (showW) { const bn = boneLayerFor(L).bones.find((b) => b.id === S.selBone); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#ffd23f'; ctx.font = `${11 * dpr}px Inter, system-ui`; ctx.fillText(`Weights for “${bn.name}”: yellow = bound 100% · dark = 0% · cyan = flexible (strength region) · grey = not influenced`, 12 * dpr, 52 * dpr); }
+      }
+    }
+    if (L.type === 'particle') {
+      const e = lcOf(L), p = M.ap(e.full, 0, 0), r = (val(L, 'emitR', S.frame) || 0) * M.scaleOf(e.full);
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = '#d68cff'; ctx.setLineDash([4 * dpr, 4 * dpr]); ctx.lineWidth = dpr;
+      ctx.beginPath(); if (L.emit === 'line') { const a = M.ap(e.full, -val(L, 'emitR', S.frame), 0), b = M.ap(e.full, val(L, 'emitR', S.frame), 0); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); } else ctx.arc(p[0], p[1], Math.max(r, 4 * dpr), 0, Math.PI * 2);
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#d68cff'; ctx.font = `${10 * dpr}px sans-serif`; ctx.fillText('✦ ' + L.name, p[0] + 8 * dpr, p[1] - 8 * dpr);
+    }
+  }
+  // selection box with transform handles
+  if (sel && S.tool === 'select' && !sel.lock) {
+    const bb = screenBBox(sel); drawHandles(ctx, bb);
+    const o = M.ap(lcOf(sel).full, sel.p.ox || 0, sel.p.oy || 0);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5 * dpr; ctx.beginPath();
+    ctx.moveTo(o[0] - 9 * dpr, o[1]); ctx.lineTo(o[0] + 9 * dpr, o[1]); ctx.moveTo(o[0], o[1] - 9 * dpr); ctx.lineTo(o[0], o[1] + 9 * dpr); ctx.stroke();
+    ctx.beginPath(); ctx.arc(o[0], o[1], 5 * dpr, 0, Math.PI * 2); ctx.stroke();
+  }
+  // bones
+  const B = activeBoneLayer();
+  if (B && (BONE_TOOLS.has(S.tool) || S.selLayers.includes(B.id))) drawBones(ctx, B);
+  // pen preview
+  if (S.tool === 'pen' && Stage.pen) {
+    const L = findLayer(Stage.pen.layer), path = L && L.paths.find((p) => p.id === Stage.pen.path);
+    if (path && path.pts.length) {
+      const e = lcOf(L), last = e.P[path.pts[path.pts.length - 1]];
+      if (last) { const a = M.ap(e.full, last[0], last[1]); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.setLineDash([3 * dpr, 3 * dpr]); ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(Stage.mouse[0], Stage.mouse[1]); ctx.stroke(); ctx.setLineDash([]); }
+    }
+  }
+  // freehand preview / marquee
+  if (Stage.preview) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (Stage.preview.type === 'poly') { ctx.strokeStyle = S.newStyle.stroke; ctx.lineWidth = Math.max(1, S.newStyle.width * S.view.zoom * dpr); ctx.lineCap = 'round'; ctx.beginPath(); Stage.preview.pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke(); }
+    if (Stage.preview.type === 'marquee') { const [x0, y0, x1, y1] = Stage.preview.r; ctx.strokeStyle = '#fff'; ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.lineWidth = dpr; ctx.fillStyle = 'rgba(80,160,255,.12)'; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0); ctx.setLineDash([]); }
+  }
+  // camera tool indicator
+  if (CAMERA_TOOLS.has(S.tool) && CAMERA_VIEW.mode === 'camera') {
+    const d = S.doc, V = viewM(), c0 = M.ap(V, -d.w / 2, -d.h / 2), c1 = M.ap(V, d.w / 2, d.h / 2);
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.strokeStyle = 'rgba(255,209,102,.9)'; ctx.lineWidth = 2 * dpr; ctx.strokeRect(c0[0], c0[1], c1[0] - c0[0], c1[1] - c0[1]);
+    // thirds + safe area
+    ctx.lineWidth = dpr; ctx.strokeStyle = 'rgba(255,209,102,.35)'; ctx.beginPath();
+    for (const t of [1 / 3, 2 / 3]) { const x = lerp(c0[0], c1[0], t), y = lerp(c0[1], c1[1], t); ctx.moveTo(x, c0[1]); ctx.lineTo(x, c1[1]); ctx.moveTo(c0[0], y); ctx.lineTo(c1[0], y); }
+    ctx.stroke(); const ix = (c1[0] - c0[0]) * 0.05, iy = (c1[1] - c0[1]) * 0.05; ctx.strokeRect(c0[0] + ix, c0[1] + iy, c1[0] - c0[0] - 2 * ix, c1[1] - c0[1] - 2 * iy);
+  }
+}
+function activeBoneLayer() {
+  const L = selLayer(); if (!L) return null;
+  if (L.type === 'bone') return L;
+  return boneLayerFor(L);
+}
+function boneScreen(B, all) { // -> [{id, b, base:[x,y], tip:[x,y]}]; inactive Vitruvian bones only when all
+  const e = lcOf(B); const bd = e.bones || boneDeforms(B, S.frame);
+  return B.bones.filter((b) => all || !bd.cur[b.id].off).map((b) => { const fr = bd.cur[b.id], m = M.mul(e.full, fr.F); return { id: b.id, b, base: M.ap(m, 0, 0), tip: M.ap(m, fr.len, 0), m, fr, off: fr.off, full: e.full }; });
+}
+function drawBones(ctx, B) {
+  const dpr = Stage.dpr, sel = selLayer(), T = S.tool;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const boundIds = new Set();
+  if (sel && sel.bindBone) boundIds.add(sel.bindBone);
+  if (sel && sel.type === 'vector') for (const id of S.selPts) { const p = sel.pts[id]; if (p && p.b) p.b.forEach(([bid]) => boundIds.add(bid)); }
+  const list = boneScreen(B, T === 'vitruvian'), selIds = new Set(selectedBoneIds());
+  const k = M.scaleOf(lcOf(B).full);
+  if (T === 'strength' || (S.mode === 'setup' && T === 'bonesel')) {
+    for (const bs of list) {
+      const r = (bs.b.str || 0) * k; if (r <= 0) continue;
+      ctx.strokeStyle = selIds.has(bs.id) ? 'rgba(255,138,61,.28)' : 'rgba(110,140,255,.16)'; ctx.lineWidth = r * 2; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(bs.base[0], bs.base[1]); ctx.lineTo(bs.tip[0], bs.tip[1]); ctx.stroke();
+    }
+    ctx.lineCap = 'butt';
+  }
+  if (T === 'offset' || S.mode === 'setup') {
+    const rest = boneFrames(B, null), full = lcOf(B).full;
+    for (const bs of list) {
+      if (!(bs.b.ox || bs.b.oy) && !ancestorOffset(B, bs.b)) continue;
+      const m = M.mul(full, rest[bs.id].F), a = M.ap(m, 0, 0), t = M.ap(m, bs.b.len, 0);
+      ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.lineWidth = dpr;
+      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(t[0], t[1]); ctx.moveTo(a[0], a[1]); ctx.lineTo(bs.base[0], bs.base[1]); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+  for (const bs of list) {
+    const dx = bs.tip[0] - bs.base[0], dy = bs.tip[1] - bs.base[1], len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len, w = Math.min(len * 0.14, 9 * dpr), mx = bs.base[0] + dx * 0.18, my = bs.base[1] + dy * 0.18;
+    const isSel = selIds.has(bs.id), prim = S.selBone === bs.id;
+    ctx.globalAlpha = bs.off ? 0.3 : 1;
+    ctx.beginPath(); ctx.moveTo(bs.base[0], bs.base[1]); ctx.lineTo(mx + nx * w, my + ny * w); ctx.lineTo(bs.tip[0], bs.tip[1]); ctx.lineTo(mx - nx * w, my - ny * w); ctx.closePath();
+    ctx.fillStyle = isSel ? '#ff3333' : boundIds.has(bs.id) ? 'rgba(92,207,138,.75)' : bs.b.color || (bs.b.dyn && bs.b.dyn.on ? 'rgba(59,201,219,.7)' : 'rgba(110,140,255,.6)');
+    ctx.strokeStyle = isSel ? '#fff' : 'rgba(0,0,0,.7)'; ctx.lineWidth = dpr; ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(bs.base[0], bs.base[1], 3.5 * dpr, 0, Math.PI * 2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.stroke();
+    if (bs.b.dyn && bs.b.dyn.on) { ctx.strokeStyle = '#3bc9db'; ctx.beginPath(); for (let i = 0; i <= 6; i++) { const t = 0.35 + i * 0.08, o = (i % 2 ? 4 : -4) * dpr; const px = bs.base[0] + dx * t + nx * o, py = bs.base[1] + dy * t + ny * o; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke(); }
+    if (S.boneLabels || isSel || ['vitruvian', 'strength'].includes(T)) {
+      const txt = bs.b.name + (T === 'vitruvian' && bs.b.vg ? ` [${bs.b.vg}]` : '') + (T === 'strength' ? ` · ${bs.b.str || 0}` : '');
+      let ang = Math.atan2(dy, dx); if (ang > Math.PI / 2) ang -= Math.PI; else if (ang < -Math.PI / 2) ang += Math.PI; // keep text upright
+      const fs = 11 * dpr, room = len - 10 * dpr;
+      ctx.save(); ctx.font = `600 ${fs}px Inter, system-ui, sans-serif`;
+      const tw = ctx.measureText(txt).width;
+      if (tw <= room) { ctx.translate(bs.base[0] + dx * 0.55, bs.base[1] + dy * 0.55); ctx.rotate(ang); } // along the bone
+      else { ctx.translate(bs.tip[0] + 6 * dpr, bs.tip[1] - 6 * dpr); } // short bone: next to its tip
+      ctx.textAlign = tw <= room ? 'center' : 'left'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+      ctx.lineWidth = 3 * dpr; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(txt, 0, 0);
+      ctx.fillStyle = isSel ? '#fff' : 'rgba(255,255,255,.92)'; ctx.fillText(txt, 0, 0); ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+  if (T === 'reparent') {
+    const byId = Object.fromEntries(list.map((x) => [x.id, x]));
+    ctx.save();
+    ctx.setLineDash([]);
+    for (const bs of list) {
+      const parent = bs.b.parent && byId[bs.b.parent];
+      if (!parent) continue;
+      // Midpoints keep the direction visible even when child and parent share a joint.
+      const x0 = (bs.base[0] + bs.tip[0]) / 2, y0 = (bs.base[1] + bs.tip[1]) / 2;
+      const x1 = (parent.base[0] + parent.tip[0]) / 2, y1 = (parent.base[1] + parent.tip[1]) / 2;
+      const dx = x1 - x0, dy = y1 - y0, length = Math.hypot(dx, dy);
+      if (length < dpr) continue;
+      const ux = dx / length, uy = dy / length, head = Math.min(9 * dpr, length * 0.35);
+      const color = selIds.has(bs.id) ? '#ff3333' : '#ffd166';
+      ctx.strokeStyle = 'rgba(0,0,0,.8)'; ctx.lineWidth = 5 * dpr;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      ctx.strokeStyle = color; ctx.lineWidth = 2 * dpr; ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 - ux * head - uy * head * 0.5, y1 - uy * head + ux * head * 0.5);
+      ctx.lineTo(x1 - ux * head + uy * head * 0.5, y1 - uy * head - ux * head * 0.5);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+  if (T === 'force' || (T === 'bonesel' && (Stage.forceArrow || ((B.force || {}).windS && B.bones.some((b) => b.dyn && b.dyn.on))))) {
+    const f = B.force || {}, c = Stage.forceArrow || null;
+    let x0, y0, x1, y1;
+    if (c) [x0, y0, x1, y1] = c; else { x0 = Stage.cv.width / 2; y0 = 60 * dpr; const L = Math.min(200 * dpr, ((f.windS || 0) / 1.5) * k); x1 = x0 + Math.cos((f.windA || 0) * DEG) * L; y1 = y0 + Math.sin((f.windA || 0) * DEG) * L; }
+    if (Math.hypot(x1 - x0, y1 - y0) > 2) {
+      const ang = Math.atan2(y1 - y0, x1 - x0); ctx.strokeStyle = '#3bc9db'; ctx.fillStyle = '#3bc9db'; ctx.lineWidth = 2.5 * dpr;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - Math.cos(ang - 0.4) * 12 * dpr, y1 - Math.sin(ang - 0.4) * 12 * dpr); ctx.lineTo(x1 - Math.cos(ang + 0.4) * 12 * dpr, y1 - Math.sin(ang + 0.4) * 12 * dpr); ctx.fill();
+      ctx.font = `${11 * dpr}px Inter, system-ui`; ctx.fillText(`wind ${f.windS || 0}`, x1 + 8 * dpr, y1);
+    }
+  }
+}
+function ancestorOffset(B, b) { let p = b.parent && boneOf(B, b.parent); while (p) { if (p.ox || p.oy) return true; p = p.parent && boneOf(B, p.parent); } return false; }
+function hitBone(B, sx, sy, tol = 10, all = false) {
+  let best = null, bd = tol * Stage.dpr;
+  for (const bs of boneScreen(B, all || S.tool === 'vitruvian')) {
+    const d = distToSeg(sx, sy, bs.base, bs.tip);
+    if (d < bd) { bd = d; best = bs; }
+  }
+  return best;
+}
+function distToSeg(px, py, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy || 1e-9;
+  const t = clamp(((px - a[0]) * dx + (py - a[1]) * dy) / l2, 0, 1);
+  return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
+}
+function hitPoint(L, sx, sy, r = 8) {
+  const e = lcOf(L); if (!e.P) return null;
+  let best = null, bd = r * Stage.dpr;
+  for (const id in e.P) { const p = M.ap(e.full, e.P[id][0], e.P[id][1]); const d = Math.hypot(p[0] - sx, p[1] - sy); if (d < bd) { bd = d; best = id; } }
+  return best;
+}
+function hitTestLayers(sx, sy) {
+  for (let i = Stage.rec.length - 1; i >= 0; i--) {
+    const e = Stage.rec[i]; if (e.L.lock || e.L.ignoreSelector || isContainer(e.L) || e.L.type === 'audio') continue;
+    if (ancestors(e.L.id).some((a) => a.lock)) continue;
+    const h = hitLayerEntry(e, sx, sy); if (h) return { L: e.L, ...h };
+  }
+  return null;
+}
+
+// ---------- vector editing helpers ----------
+function ensureVectorLayer() {
+  let L = selLayer();
+  if (L && L.type === 'vector') return L;
+  const nl = mkLayer('vector');
+  const target = L && isContainer(L) ? L.children : L ? siblingsOf(L.id) : S.doc.layers;
+  const idx = L && !isContainer(L) ? target.indexOf(L) : 0;
+  target.splice(Math.max(0, idx), 0, nl);
+  S.selLayers = [nl.id];
+  return nl;
+}
+function addPoint(L, x, y, c = 1) { const id = uid('p'); L.pts[id] = { x, y, c }; return id; }
+function addShape(L, pathIds, style = S.newStyle, over = {}) {
+  const sh = { id: uid('s'), paths: pathIds, fill: style.fill, stroke: style.stroke, width: style.width, fillOn: style.fillOn, strokeOn: style.strokeOn, ...over };
+  L.shapes.push(sh); return sh;
+}
+function deletePoints(L, ids) {
+  for (const id of ids) { delete L.pts[id]; delete L.ch['pt:' + id]; }
+  for (const pa of L.paths) pa.pts = pa.pts.filter((p) => L.pts[p]);
+  const dead = new Set(L.paths.filter((pa) => pa.pts.length < 2).map((p) => p.id));
+  L.paths = L.paths.filter((pa) => !dead.has(pa.id));
+  for (const sh of L.shapes) sh.paths = sh.paths.filter((p) => !dead.has(p));
+  const deadSh = L.shapes.filter((s) => !s.paths.length).map((s) => s.id);
+  L.shapes = L.shapes.filter((s) => s.paths.length);
+  deadSh.forEach((sid) => deleteChannelsMatching(L, (k) => k.startsWith('sh:' + sid + ':')));
+  for (const id of Object.keys(L.pts)) if (!L.paths.some((pa) => pa.pts.includes(id))) delete L.pts[id];
+}
+function rdp(pts, eps) {
+  if (pts.length < 3) return pts;
+  let dmax = 0, idx = 0; const a = pts[0], b = pts[pts.length - 1];
+  for (let i = 1; i < pts.length - 1; i++) { const d = distToSeg(pts[i][0], pts[i][1], a, b); if (d > dmax) { dmax = d; idx = i; } }
+  if (dmax > eps) return rdp(pts.slice(0, idx + 1), eps).slice(0, -1).concat(rdp(pts.slice(idx), eps));
+  return [a, b];
+}
+// find segment near screen point -> {path, index(insert after)}
+function hitSegment(L, sx, sy) {
+  const e = lcOf(L); if (!e.P) return null;
+  for (const pa of L.paths) {
+    const n = pa.pts.length, segs = pa.closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const p = new Path2D(); const sub = { pts: [pa.pts[i], pa.pts[(i + 1) % n]], closed: false };
+      // sample along the actual curve by tracing the whole path is costly; approximate with neighbours
+      const ids = pa.closed ? [pa.pts[(i - 1 + n) % n], pa.pts[i], pa.pts[(i + 1) % n], pa.pts[(i + 2) % n]] : [pa.pts[Math.max(0, i - 1)], pa.pts[i], pa.pts[i + 1], pa.pts[Math.min(n - 1, i + 2)]];
+      void sub;
+      const q = ids.map((id) => e.P[id]);
+      const k1 = (L.pts[ids[1]].c ?? 1) / 6, k2 = (L.pts[ids[2]].c ?? 1) / 6;
+      const c1 = [q[1][0] + (q[2][0] - q[0][0]) * k1, q[1][1] + (q[2][1] - q[0][1]) * k1], c2 = [q[2][0] - (q[3][0] - q[1][0]) * k2, q[2][1] - (q[3][1] - q[1][1]) * k2];
+      p.moveTo(q[1][0], q[1][1]); p.bezierCurveTo(c1[0], c1[1], c2[0], c2[1], q[2][0], q[2][1]);
+      M.set(_hitCtx, e.full); _hitCtx.lineWidth = (8 * Stage.dpr) / M.scaleOf(e.full);
+      if (_hitCtx.isPointInStroke(p, sx, sy)) return { path: pa, index: i };
+    }
+  }
+  return null;
+}
+
+// ---------- tools ----------
+const TOOLS = {};
+const TOOL_GROUPS = [
+  ['Select', ['select', 'points']],
+  ['Draw', ['pen', 'freehand', 'rect', 'ellipse', 'polygon', 'text']],
+  ['Edit', ['curvature', 'fill']],
+  ['Bone', ['bonesel', 'boneadd', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'sketch', 'bind', 'bindpts', 'offset', 'physics', 'force']],
+  ['FX', ['emitter']],
+  ['Camera', ['camera']],
+  ['View', ['pan', 'zoom']],
+];
+function defTool(id, t) { TOOLS[id] = { id, ...t }; }
+// Which tools apply depends on: selected layer type + editing mode + current selection.
+// Tools never move; unavailable ones are dimmed and explain why.
+const TOOLS_ALWAYS = new Set(['select', 'text', 'emitter', 'camera', 'pan', 'zoom']);
+const TOOLS_DRAW = new Set(['pen', 'freehand', 'rect', 'ellipse', 'polygon']);
+function toolAvail(id) {
+  if (TOOLS_ALWAYS.has(id)) return null;
+  const L = selLayer(), T = L ? LAYER_TYPES[L.type].name : '';
+  if (TOOLS_DRAW.has(id)) {
+    if (!L) return S.mode === 'setup' ? null : 'Create geometry in Setup mode';
+    if (L.type === 'vector') return writeReason(L) || (S.mode !== 'setup' ? 'Create geometry in Setup mode; animate existing points in Animate mode' : null);
+    if (isContainer(L)) return `You can't draw directly into a ${T}. Use “＋ Vector layer inside” in the bar above, then draw.`;
+    return `Drawing tools edit vector layers — “${L.name}” is a ${T} layer. Select a vector layer, or press Esc to draw on a new one.`;
+  }
+  if (id === 'points' || id === 'curvature' || id === 'fill') {
+    if (!L) return 'Select a vector layer first';
+    if (L.type === 'vector') return writeReason(L);
+    if (L.type === 'switch') return 'Select one of this Switch Group’s drawings in the Layers panel to edit its points';
+    if (L.type === 'text') return 'Text layers keep editable letters, so they have no points';
+    return `${T} layers have no vector points`;
+  }
+  if (BONE_TOOLS.has(id)) {
+    const B = activeBoneLayer();
+    if (B && id !== 'bonesel' && (writeReason(B) || (L && writeReason(L)))) return writeReason(B) || writeReason(L);
+    if (!B) return 'Bone tools work on a Bone Group — select one (or artwork inside it). Rig ▸ New bone group creates one.';
+    const setupOnly = { boneadd: 'Bones are created', reparent: 'Reparenting changes the skeleton, so it is done', strength: 'Bone strength is set', sketch: 'Sketching bones creates bones, so it is done', bind: 'Binding is done', bindpts: 'Binding points is done', offset: 'Offsets assemble an exploded rig', physics: 'Bone physics is set up' };
+    if (setupOnly[id] && S.mode !== 'setup') return `${setupOnly[id]} in Setup mode — press Tab or click Setup`;
+    const needBones = ['bonesel', 'bonetf', 'bonemanip', 'reparent', 'strength', 'vitruvian', 'bind', 'bindpts', 'offset', 'physics', 'force'];
+    if (needBones.includes(id) && !B.bones.length) return 'This Bone Group has no bones yet — use Add bone or Sketch bones in Setup mode';
+    if (id === 'bind' && (!L || L === B)) return 'Select an artwork layer inside the Bone Group first, then click the bone it should follow';
+    if (id === 'bindpts' && (!L || L.type !== 'vector' || L === B)) return 'Select a vector layer inside the Bone Group first';
+    if (id === 'bindpts' && L.bindBone) return `“${L.name}” is bound as a whole layer — clear that attachment (Bind layer, click empty space) to bind individual points`;
+    if (id === 'bindpts' && !Object.keys(L.pts || {}).length) return `“${L.name}” has no points to bind`;
+    if (id === 'reparent' && B.bones.length < 2) return 'Reparenting needs at least two bones';
+    if (id === 'force' && !B.bones.some((b) => b.dyn && b.dyn.on)) return 'Forces act on bones with physics — enable Bone physics on a bone first';
+    return null;
+  }
+  return null;
+}
+function updateToolbar() {
+  const bl = $('#toolbar .tg[data-group="Bone"]'); if (bl) { const B = activeBoneLayer(); bl.classList.toggle('ctx', !!B); bl.textContent = B ? `Bone · ${S.mode === 'setup' ? 'Setup' : 'Animate'}` : 'Bone'; }
+  $$('#toolbar button').forEach((b) => {
+    const t = TOOLS[b.dataset.tool], why = toolAvail(t.id);
+    b.classList.toggle('na', !!why);
+    b.title = `${t.name}${t.key ? ` (${t.key})` : ''}\n${why ? '⚠ ' + why : t.hint}`;
+  });
+}
+function setMode(m) {
+  if (m === S.mode) return;
+  if (m === 'setup') {
+    if (S.playing) stopPlay();
+    S.animFrame = S.frame; S.mode = 'setup'; S.frame = 0; S.swPreview = {};
+    if (toolAvail(S.tool)) S.tool = activeBoneLayer() ? 'bonetf' : 'select';
+    toast('Setup mode — edit the rest pose, bones, binding and pivots');
+  } else {
+    S.mode = 'animate'; S.frame = S.animFrame || 0;
+    if (toolAvail(S.tool)) S.tool = activeBoneLayer() ? 'bonemanip' : 'select';
+    toast('Animate mode — changes record keys at the playhead');
+  }
+  setTool(S.tool); updateModeUI(); renderTLBar(); refreshAll();
+}
+function updateModeUI() {
+  $$('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.m === S.mode));
+  document.body.classList.toggle('setup', S.mode === 'setup');
+}
+function setTool(id) {
+  const why = toolAvail(id);
+  if (why && id !== S.tool) { toast(why, 'err'); return; }
+  if (S.tool === 'pen') finishPen();
+  S.tool = id; Stage.preview = null;
+  $$('#toolbar button').forEach((b) => b.classList.toggle('on', b.dataset.tool === id));
+  updateToolbar(); renderToolOpts(); setCursor(); requestDraw();
+}
+function setCursor() { const t = TOOLS[S.tool]; Stage.cv.style.cursor = Stage.space ? 'grab' : (t && t.cursor) || 'default'; }
+
+function startDrag(e, data) { Stage.drag = { sx: Stage.mouse[0], sy: Stage.mouse[1], moved: false, shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey, ...data }; }
+
+// --- Select / transform layer
+defTool('select', {
+  icon: '➤', name: 'Transform layer', key: 'V', hint: 'Drag anywhere to move the current layer · handles scale/rotate · drag the ⊕ to move its pivot',
+  down(e, sx, sy) {
+    const sel = selLayer();
+    if (sel && !writeReason(sel)) {
+      const lc0 = lcOf(sel), o = M.ap(lc0.full, sel.p.ox || 0, sel.p.oy || 0);
+      if (Math.hypot(sx - o[0], sy - o[1]) < 8 * Stage.dpr) { beginEdit('Move pivot'); startDrag(e, { mode: 'pivot', L: sel, inv: M.inv(lc0.full) }); return; }
+      const h = hitHandle(screenBBox(sel), sx, sy);
+      if (h) { this.beginTf(e, sel, h.k === 'rot' ? 'rot' : 'scale', h.k); return; }
+    }
+    if (!sel) { toast('Select a layer in the Layers panel'); return; }
+    const why = writeReason(sel); if (why) { toast(why, 'err'); return; }
+    this.beginTf(e, sel, 'move');
+  },
+  beginTf(e, L, mode, handle) {
+    const why = writeReason(L); if (why) return toast(why, 'err');
+    const targets = [L];
+    beginEdit(mode === 'move' ? 'Move layer' : mode === 'rot' ? 'Rotate layer' : 'Scale layer');
+    const o = M.ap(lcOf(L).full, L.p.ox || 0, L.p.oy || 0);
+    startDrag(e, { mode, handle, L, o, targets: targets.map((T) => ({ T, x: val(T, 'x', S.frame), y: val(T, 'y', S.frame), rot: val(T, 'rot', S.frame), sx: val(T, 'sx', S.frame), sy: val(T, 'sy', S.frame), inv: M.inv(parentFull(T)) })) });
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    const dx = sx - d.sx, dy = sy - d.sy;
+    if (d.mode === 'pivot') { const q = M.ap(d.inv, sx, sy); d.L.p.ox = round(q[0]); d.L.p.oy = round(q[1]); requestDraw(); return; }
+    if (d.mode === 'move') {
+      for (const t of d.targets) { let v = cameraDragDelta(t.inv, sx, sy, d.sx, d.sy); if (e.shiftKey) { if (Math.abs(v[0]) > Math.abs(v[1])) v[1] = 0; else v[0] = 0; } setVal(t.T, 'x', round(t.x + v[0])); setVal(t.T, 'y', round(t.y + v[1])); }
+    } else if (d.mode === 'rot') {
+      const a0 = Math.atan2(d.sy - d.o[1], d.sx - d.o[0]), a1 = Math.atan2(sy - d.o[1], sx - d.o[0]);
+      let r = d.targets[0].rot + (a1 - a0) / DEG; if (e.shiftKey) r = Math.round(r / 15) * 15;
+      setVal(d.L, 'rot', round(r));
+    } else {
+      const t = d.targets[0], h = d.handle;
+      const d0 = Math.hypot(d.sx - d.o[0], d.sy - d.o[1]) || 1, d1 = Math.hypot(sx - d.o[0], sy - d.o[1]);
+      let k = d1 / d0;
+      if (h === 'n' || h === 's') setVal(d.L, 'sy', round(t.sy * k, 3));
+      else if (h === 'e' || h === 'w') setVal(d.L, 'sx', round(t.sx * k, 3));
+      else { setVal(d.L, 'sx', round(t.sx * k, 3)); setVal(d.L, 'sy', round(t.sy * k, 3)); }
+    }
+    requestDraw();
+  },
+  up() { commitEdit(); },
+});
+
+// --- Points
+defTool('points', {
+  icon: '⬚', name: 'Select / Transform points', key: 'A', cursor: 'crosshair', hint: 'Click/drag points · marquee to select · Shift adds · handles scale/rotate · Del deletes · Ctrl+A selects all',
+  down(e, sx, sy) {
+    const L = selLayer();
+    if (!L || L.type !== 'vector') { const hit = hitTestLayers(sx, sy); if (hit && hit.L.type === 'vector') { S.selLayers = [hit.L.id]; S.selPts.clear(); refreshAll(); } else toast('Select a vector layer to edit its points'); return; }
+    if (L.lock) return toast('Layer is locked');
+    if (S.selPts.size > 1) { const bb = ptsBBox(L, S.selPts); const h = bb && hitHandle(bb, sx, sy); if (h) return this.beginPts(e, L, h.k === 'rot' ? 'rot' : 'scale', bb); }
+    const pid = hitPoint(L, sx, sy);
+    if (pid) {
+      if (e.shiftKey) { S.selPts.has(pid) ? S.selPts.delete(pid) : S.selPts.add(pid); }
+      else if (!S.selPts.has(pid)) { S.selPts = new Set([pid]); }
+      refreshAll(); this.beginPts(e, L, 'move'); return;
+    }
+    const sh = hitLayerEntry(lcOf(L), sx, sy);
+    if (sh && sh.shape && !e.shiftKey) {
+      S.selShape = sh.shape.id; const ids = new Set(); sh.shape.paths.forEach((pid) => { const pa = L.paths.find((p) => p.id === pid); pa && pa.pts.forEach((i) => ids.add(i)); });
+      S.selPts = ids; refreshAll(); this.beginPts(e, L, 'move'); return;
+    }
+    if (!e.shiftKey) S.selPts = new Set();
+    startDrag(e, { mode: 'marquee', L, base: new Set(S.selPts) }); refreshAll();
+  },
+  beginPts(e, L, mode, bb) {
+    beginEdit(mode === 'move' ? 'Move points' : mode === 'rot' ? 'Rotate points' : 'Scale points');
+    const start = {}; for (const id of S.selPts) start[id] = val(L, 'pt:' + id, S.frame);
+    let c = [0, 0]; const ids = [...S.selPts]; ids.forEach((id) => { c[0] += start[id][0] / ids.length; c[1] += start[id][1] / ids.length; });
+    startDrag(e, { mode, L, start, c, inv: M.inv(lcOf(L).full), cs: M.ap(lcOf(L).full, c[0], c[1]) });
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    if (d.mode === 'marquee') {
+      const r = [Math.min(d.sx, sx), Math.min(d.sy, sy), Math.max(d.sx, sx), Math.max(d.sy, sy)];
+      Stage.preview = { type: 'marquee', r };
+      const lc = lcOf(d.L); const s = new Set(d.base);
+      for (const id in lc.P) { const p = M.ap(lc.full, lc.P[id][0], lc.P[id][1]); if (p[0] >= r[0] && p[0] <= r[2] && p[1] >= r[1] && p[1] <= r[3]) s.add(id); }
+      S.selPts = s; requestDraw(); return;
+    }
+    const L = d.L;
+    if (d.mode === 'move') {
+      let v = cameraDragDelta(d.inv, sx, sy, d.sx, d.sy);
+      if (e.shiftKey) { if (Math.abs(v[0]) > Math.abs(v[1])) v[1] = 0; else v[0] = 0; }
+      for (const id in d.start) setVal(L, 'pt:' + id, [round(d.start[id][0] + v[0]), round(d.start[id][1] + v[1])]);
+    } else if (d.mode === 'rot') {
+      const a = Math.atan2(sy - d.cs[1], sx - d.cs[0]) - Math.atan2(d.sy - d.cs[1], d.sx - d.cs[0]);
+      const m = M.chain(M.t(d.c[0], d.c[1]), M.r(a), M.t(-d.c[0], -d.c[1]));
+      for (const id in d.start) { const p = M.ap(m, d.start[id][0], d.start[id][1]); setVal(L, 'pt:' + id, [round(p[0]), round(p[1])]); }
+    } else {
+      const k = Math.hypot(sx - d.cs[0], sy - d.cs[1]) / (Math.hypot(d.sx - d.cs[0], d.sy - d.cs[1]) || 1);
+      for (const id in d.start) setVal(L, 'pt:' + id, [round(d.c[0] + (d.start[id][0] - d.c[0]) * k), round(d.c[1] + (d.start[id][1] - d.c[1]) * k)]);
+    }
+    requestDraw();
+  },
+  up() { const d = Stage.drag; Stage.preview = null; if (d && d.mode !== 'marquee') commitEdit(); refreshAll(); },
+});
+
+// --- Pen (add points / paths)
+function finishPen(closeIt) {
+  const P = Stage.pen; Stage.pen = null; if (!P) return;
+  const L = findLayer(P.layer); if (!L) return;
+  const path = L.paths.find((p) => p.id === P.path); if (!path) return;
+  edit(closeIt ? 'Close path' : 'Finish path', () => {
+    if (path.pts.length < 2) { L.paths = L.paths.filter((p) => p !== path); for (const id of path.pts) if (!L.paths.some((pa) => pa.pts.includes(id))) delete L.pts[id]; return; }
+    if (closeIt) path.closed = true;
+    if (!L.shapes.some((s) => s.paths.includes(path.id)) && (closeIt || S.newStyle.strokeOn)) {
+      const sh = addShape(L, [path.id], S.newStyle, closeIt ? {} : { fillOn: false });
+      S.selShape = sh.id;
+    }
+  });
+}
+defTool('pen', {
+  icon: '✒', name: 'Pen — add points', key: 'P', cursor: 'crosshair', hint: 'Click to add points (drag to place) · click first point to close · click a segment to insert · Enter/Esc finishes',
+  down(e, sx, sy) {
+    const L = ensureVectorLayer(); if (L.lock) return toast('Layer is locked');
+    beginEdit('Add point');
+    const loc = toLocal(L, sx, sy);
+    const hp = hitPoint(L, sx, sy);
+    let P = Stage.pen && Stage.pen.layer === L.id ? Stage.pen : null;
+    let path = P && L.paths.find((p) => p.id === P.path);
+    if (path && hp && hp === path.pts[0] && path.pts.length > 2) { commitEdit(); finishPen(true); return; }
+    if (!path) {
+      if (hp) { // continue from an open endpoint, or branch from an existing point
+        const pa = L.paths.find((p) => !p.closed && (p.pts[0] === hp || p.pts[p.pts.length - 1] === hp));
+        if (pa) { if (pa.pts[0] === hp) pa.pts.reverse(); Stage.pen = { layer: L.id, path: pa.id }; commitEdit(); requestDraw(); return; }
+        path = { id: uid('a'), pts: [hp], closed: false }; L.paths.push(path); Stage.pen = { layer: L.id, path: path.id };
+        commitEdit(); requestDraw(); return;
+      }
+      const seg = hitSegment(L, sx, sy);
+      if (seg) {
+        const id = addPoint(L, round(loc[0]), round(loc[1]), 1);
+        seg.path.pts.splice(seg.index + 1, 0, id); S.selPts = new Set([id]);
+        startDrag(e, { mode: 'pt', L, id, inv: M.inv(lcOf(L).full), start: [loc[0], loc[1]] }); return;
+      }
+      path = { id: uid('a'), pts: [], closed: false }; L.paths.push(path); Stage.pen = { layer: L.id, path: path.id };
+    }
+    let id = hp;
+    if (!id) id = addPoint(L, round(loc[0]), round(loc[1]), this.opts.smooth ? 1 : 0);
+    path.pts.push(id); S.selPts = new Set([id]);
+    if (hp && hp !== path.pts[0]) { commitEdit(); finishPen(false); return; } // welded to another point
+    startDrag(e, { mode: 'pt', L, id, inv: M.inv(lcOf(L).full), start: [loc[0], loc[1]] });
+    requestDraw();
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d || d.mode !== 'pt') return requestDraw();
+    const v = cameraDragDelta(d.inv, sx, sy, d.sx, d.sy); const p = d.L.pts[d.id];
+    if (p) { p.x = round(d.start[0] + v[0]); p.y = round(d.start[1] + v[1]); }
+    requestDraw();
+  },
+  up() { commitEdit(); },
+  opts: { smooth: true },
+});
+
+// --- Freehand
+defTool('freehand', {
+  icon: '✍', name: 'Freehand', key: 'F', cursor: 'crosshair', hint: 'Drag to draw a stroke · end near the start to make a filled closed shape',
+  down(e, sx, sy) { const L = ensureVectorLayer(); if (L.lock) return toast('Layer is locked'); startDrag(e, { L }); Stage.preview = { type: 'poly', pts: [[sx, sy]] }; refreshAll(); },
+  move(e, sx, sy) { if (!Stage.drag || !Stage.preview) return; const pts = Stage.preview.pts, l = pts[pts.length - 1]; if (Math.hypot(sx - l[0], sy - l[1]) > 2) pts.push([sx, sy]); requestDraw(); },
+  up() {
+    const d = Stage.drag, pv = Stage.preview; Stage.preview = null; if (!d || !pv || pv.pts.length < 3) return requestDraw();
+    const L = d.L, inv = M.inv(lcOf(L).full);
+    const eps = (S.freehandSmooth + 0.5) * Stage.dpr;
+    let pts = rdp(pv.pts, eps);
+    const first = pv.pts[0], last = pv.pts[pv.pts.length - 1];
+    const closed = pts.length > 3 && Math.hypot(first[0] - last[0], first[1] - last[1]) < 18 * Stage.dpr;
+    if (closed) pts = pts.slice(0, -1);
+    edit('Freehand stroke', () => {
+      const ids = pts.map((p) => { const q = M.ap(inv, p[0], p[1]); return addPoint(L, round(q[0]), round(q[1]), 1); });
+      const path = { id: uid('a'), pts: ids, closed }; L.paths.push(path);
+      const sh = addShape(L, [path.id], S.newStyle, closed ? {} : { fillOn: false, strokeOn: true });
+      S.selShape = sh.id;
+    });
+  },
+});
+
+// --- Primitive shapes
+function primTool(id, icon, name, key, gen) {
+  defTool(id, {
+    icon, name, key, cursor: 'crosshair', hint: 'Drag to draw · Shift = equal proportions · Alt = from center',
+    down(e, sx, sy) { const L = ensureVectorLayer(); if (L.lock) return toast('Layer is locked'); beginEdit(name); startDrag(e, { L, a: toLocal(L, sx, sy), inv: M.inv(lcOf(L).full) }); },
+    move(e, sx, sy) {
+      const d = Stage.drag; if (!d) return;
+      const b = M.ap(d.inv, sx, sy); let a = d.a.slice(), w = b[0] - a[0], h = b[1] - a[1];
+      if (e.shiftKey) { const m = Math.max(Math.abs(w), Math.abs(h)); w = Math.sign(w || 1) * m; h = Math.sign(h || 1) * m; }
+      if (e.altKey) a = [a[0] - w, a[1] - h], (w *= 2), (h *= 2);
+      if (Math.abs(w) < 2 && Math.abs(h) < 2) return;
+      const L = d.L, geo = gen(a[0], a[1], w, h);
+      if (!d.path) {
+        const ids = geo.map((g) => addPoint(L, 0, 0, g[2]));
+        d.path = { id: uid('a'), pts: ids, closed: true }; L.paths.push(d.path);
+        S.selShape = addShape(L, [d.path.id]).id;
+      }
+      d.path.pts.forEach((pid, i) => { L.pts[pid].x = round(geo[i][0]); L.pts[pid].y = round(geo[i][1]); });
+      requestDraw();
+    },
+    up() { commitEdit(); },
+  });
+}
+primTool('rect', '▭', 'Rectangle', 'R', (x, y, w, h) => [[x, y, 0], [x + w, y, 0], [x + w, y + h, 0], [x, y + h, 0]]);
+primTool('ellipse', '◯', 'Ellipse', 'E', (x, y, w, h) => {
+  const cx = x + w / 2, cy = y + h / 2, out = [];
+  for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; out.push([cx + (Math.cos(a) * w) / 2, cy + (Math.sin(a) * h) / 2, 1.105]); }
+  return out;
+});
+primTool('polygon', '⬠', 'Polygon / star', 'Y', (x, y, w, h) => {
+  const n = clamp(S.polySides | 0, 3, 24), cx = x + w / 2, cy = y + h / 2, out = [], star = S.polyStar, m = star ? n * 2 : n;
+  for (let i = 0; i < m; i++) { const a = (i / m) * Math.PI * 2 - Math.PI / 2, r = star && i % 2 ? 0.45 : 1; out.push([cx + (Math.cos(a) * w * r) / 2, cy + (Math.sin(a) * h * r) / 2, 0]); }
+  return out;
+});
+
+// --- Text
+defTool('text', {
+  icon: 'T', name: 'Text', key: 'T', cursor: 'text', hint: 'Click to place a text layer, then edit its text in Properties',
+  down(e, sx, sy) {
+    edit('Add text', () => {
+      const L = mkLayer('text'); const V = viewM(); const w = M.ap(M.inv(M.mul(V, camFn(S.frame)(0))), sx, sy);
+      L.p.x = round(w[0]); L.p.y = round(w[1]); S.doc.layers.unshift(L); S.selLayers = [L.id];
+    });
+    setTool('select'); setTab('props'); setTimeout(() => { const t = $('#tabBody textarea'); if (t) { t.focus(); t.select(); } }, 50);
+  },
+});
+
+// --- Curvature
+defTool('curvature', {
+  icon: '⌒', name: 'Curvature', key: 'C', cursor: 'ns-resize', hint: 'Drag a point up/down to change its curvature · double-click toggles corner/smooth',
+  down(e, sx, sy) {
+    const L = selLayer(); if (!L || L.type !== 'vector') return toast('Select a vector layer');
+    const pid = hitPoint(L, sx, sy); if (!pid) return;
+    if (!S.selPts.has(pid)) S.selPts = new Set([pid]);
+    beginEdit('Curvature'); const start = {}; for (const id of S.selPts) start[id] = L.pts[id].c ?? 1;
+    startDrag(e, { L, start, t: performance.now() });
+  },
+  move(e, sx, sy) { const d = Stage.drag; if (!d) return; const dv = -(sy - d.sy) / (100 * Stage.dpr); for (const id in d.start) d.L.pts[id].c = round(clamp(d.start[id] + dv, 0, 2.5), 3); requestDraw(); },
+  up() { commitEdit(); },
+  dbl(e, sx, sy) { const L = selLayer(); if (!L || L.type !== 'vector') return; const pid = hitPoint(L, sx, sy); if (!pid) return; edit('Toggle corner', () => { L.pts[pid].c = (L.pts[pid].c ?? 1) > 0.05 ? 0 : 1; }); },
+});
+
+// --- Paint bucket
+defTool('fill', {
+  icon: '🪣', name: 'Paint bucket', key: 'B', cursor: 'cell', hint: 'Click inside a closed path to fill it with the current style · Shift = stroke color only · Alt = pick style (eyedropper)',
+  down(e, sx, sy) {
+    const hit = hitTestLayers(sx, sy);
+    if (e.altKey) {
+      if (hit && hit.shape) { const st = shapeStyle(hit.L, hit.shape, S.frame); Object.assign(S.newStyle, { fill: st.fill, stroke: st.stroke, width: st.width }); toast('Picked style'); refreshAll(); }
+      return;
+    }
+    let L = selLayer(); if (!L || L.type !== 'vector') { if (hit && hit.L.type === 'vector') L = hit.L; else return toast('Select a vector layer'); }
+    const e2 = lcOf(L); M.set(_hitCtx, e2.full);
+    const cands = L.paths.filter((pa) => pa.closed).map((pa) => { const p = new Path2D(); tracePath(p, L, pa, e2.P, S.frame, e2); return { pa, p }; }).filter((c) => _hitCtx.isPointInPath(c.p, sx, sy));
+    if (!cands.length) {
+      if (hit && hit.L === L && hit.shape) return edit('Recolor shape', () => this.paint(L, hit.shape, e.shiftKey));
+      return toast('No closed path here — close the path first (Pen: click its first point)', 'err');
+    }
+    const area = (pa) => { let a = 0; const ids = pa.pts; for (let i = 0; i < ids.length; i++) { const p = e2.P[ids[i]], q = e2.P[ids[(i + 1) % ids.length]]; a += p[0] * q[1] - q[0] * p[1]; } return Math.abs(a); };
+    cands.sort((a, b) => area(a.pa) - area(b.pa));
+    const pa = cands[0].pa;
+    edit('Fill', () => {
+      const sh = L.shapes.find((s) => s.paths.includes(pa.id));
+      if (sh) this.paint(L, sh, e.shiftKey);
+      else S.selShape = addShape(L, [pa.id], S.newStyle, { fillOn: true }).id;
+    });
+  },
+  paint(L, sh, strokeOnly) {
+    if (sh.styleId) sh.styleId = null;
+    if (strokeOnly) { setVal(L, 'sh:' + sh.id + ':stroke', S.newStyle.stroke); sh.strokeOn = true; }
+    else { setVal(L, 'sh:' + sh.id + ':fill', S.newStyle.fill); sh.fillOn = true; }
+    S.selShape = sh.id;
+  },
+});
+
+// ===================== Bone tools (Moho order) =====================
+const BONE_SVG = '<path d="M4.5 19.5 L8 12.8 L19.5 4.5 L11.2 16 Z" fill="currentColor" fill-opacity=".38"/><circle cx="4.5" cy="19.5" r="1.7"/>';
+const svgI = (inner) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+const BIC = {
+  bonesel: svgI(BONE_SVG + '<path d="M2.5 2.5 L2.5 10 L4.6 8.1 L6.2 11.3 L7.7 10.6 L6.1 7.5 L9 7.3 Z" fill="currentColor" stroke="none"/>'),
+  boneadd: svgI(BONE_SVG + '<path d="M6 1.8v7.4M2.3 5.5h7.4" stroke-width="2"/>'),
+  bonetf: svgI(BONE_SVG + '<path d="M6 1.5v8M2 5.5h8M4.7 2.8L6 1.5l1.3 1.3M8.7 4.2L10 5.5 8.7 6.8M4.7 8.2L6 9.5l1.3-1.3M3.3 4.2L2 5.5l1.3 1.3"/>'),
+  bonemanip: svgI('<path d="M3 21 L5.5 15.5 L11 12.5 L7 17.5 Z" fill="currentColor" fill-opacity=".38"/><path d="M11 12.5 L15.5 7 L21 4 L17 9.5 Z" fill="currentColor" fill-opacity=".38"/><circle cx="11" cy="12.5" r="1.4"/><path d="M14 18.5c3 0 5.5-2.2 6-5" /><path d="M18.5 12.6l1.5.9.9-1.6"/>'),
+  reparent: svgI('<path d="M3 21 L5 16 L10 13 L6.5 17.5 Z" fill="currentColor" fill-opacity=".38"/><path d="M14 10 L16.5 5 L21.5 2.5 L18 7 Z" fill="currentColor" fill-opacity=".38"/><path d="M8 11c0-4 2-6 5-6" stroke-dasharray="2 2"/><path d="M11 3.4l2 1.6-1.8 1.9"/>'),
+  strength: svgI(BONE_SVG + '<ellipse cx="12" cy="12" rx="11" ry="5.2" transform="rotate(-42 12 12)" stroke-dasharray="2.2 2"/>'),
+  vitruvian: svgI('<circle cx="12" cy="12" r="9.6"/><rect x="4.5" y="4.5" width="15" height="15" stroke-opacity=".5"/><circle cx="12" cy="6.6" r="1.7"/><path d="M12 8.4v6.6M5.5 10.6h13M12 15l-3.6 5M12 15l3.6 5"/>'),
+  sketch: svgI('<path d="M3 20c2.5-5 5-.5 7.5-5s5-2.5 6.5-6.5"/><circle cx="3" cy="20" r="1.2"/><circle cx="10.5" cy="15" r="1.2"/><circle cx="17" cy="8.5" r="1.2"/><path d="M17.2 6.8l3-3 1.9 1.9-3 3z" fill="currentColor" fill-opacity=".4"/>'),
+  bind: svgI(BONE_SVG + '<rect x="2" y="2" width="9" height="8" rx="1.2" fill="currentColor" fill-opacity=".18"/>'),
+  bindpts: svgI(BONE_SVG + '<rect x="2" y="2.3" width="3" height="3" fill="currentColor"/><rect x="7.5" y="2.3" width="3" height="3" fill="currentColor"/><rect x="2" y="7.5" width="3" height="3" fill="currentColor"/>'),
+  offset: svgI('<path d="M2.5 13.5 L5 8.5 L12 3 L7.5 10 Z" stroke-dasharray="1.8 1.6"/>' + '<path d="M9 21 L11.5 15.8 L21 9.5 L14.2 18 Z" fill="currentColor" fill-opacity=".38"/><path d="M7 11.5 L10.5 15.5M10.5 15.5v-3M10.5 15.5h-3"/>'),
+  physics: svgI(BONE_SVG + '<path d="M13.5 2.5l2 1.4-3 1.6 3 1.6-3 1.6 3 1.6-2 1.4"/>'),
+  force: svgI('<path d="M2.5 7.5h11a3 3 0 1 0-3-3M2.5 12.5h16a3 3 0 1 1-3 3M2.5 17.5h8"/>'),
+};
+function requireSetup(what) { if (S.mode !== 'setup') { toast(`${what} is done in Setup mode — press Tab or click Setup`, 'err'); return false; } return true; }
+function ensureBoneLayer() { return activeBoneLayer(); }
+const boneOf = (B, id) => B && B.bones.find((b) => b.id === id);
+function selectBone(id, add) {
+  if (!id) { S.selBone = null; S.selBones = new Set(); }
+  else if (add) { if (S.selBones.has(id)) { S.selBones.delete(id); S.selBone = [...S.selBones].pop() || null; } else { S.selBones.add(id); S.selBone = id; } }
+  else { S.selBone = id; S.selBones = new Set([id]); }
+  refreshAll();
+}
+function selectedBoneIds() { const s = new Set(S.selBones); if (S.selBone) s.add(S.selBone); return [...s]; }
+function posedFrames(B, f = S.frame) { return boneFrames(B, f); }
+function reparentBone(B, b, pid) { // keeps the bone's world rest pose
+  const rest = boneFrames(B, null), W = rest[b.id].F;
+  b.parent = pid || null; sortBones(B);
+  const PF = b.parent ? boneFrames(B, null)[b.parent].F : M.I(), lm = M.mul(M.inv(PF), W);
+  b.x = round(lm[4]); b.y = round(lm[5]); b.a = round(Math.atan2(lm[1], lm[0]) / DEG);
+  delete B.ch['bone:' + b.id + ':a']; delete B.ch['bone:' + b.id + ':p'];
+}
+function newBone(B, name, parent, x, y, a, len) {
+  a = ((((a + 180) % 360) + 360) % 360) - 180;
+  const b = { id: uid('b'), name, parent, x: round(x), y: round(y), a: round(a), len: round(Math.max(1, len)), s: 1, str: round(Math.max(1, len) * 0.45) };
+  B.bones.push(b); return b;
+}
+
+// 1. Select Bone
+defTool('bonesel', {
+  icon: BIC.bonesel, name: 'Select bone', key: 'S', cursor: 'pointer', hint: 'Click a bone to select it · Shift-click adds more · rename it, recolour it and turn on physics in the bar above · drag on empty space to set the wind for bones with physics',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy); selectBone(hb && hb.id, e.shiftKey); if (hb && currentTab !== 'props') setTab('props');
+    if (!hb && B && B.bones.some((b) => b.dyn && b.dyn.on)) startDrag(e, { B, k: M.scaleOf(lcOf(B).full), wind: true });
+  },
+  move(e, sx, sy) { const d = Stage.drag; if (!d || !d.wind) return; if (!d.began) { beginEdit('Wind force'); d.began = true; } TOOLS.force.move(e, sx, sy); },
+  up() { const d = Stage.drag; Stage.forceArrow = null; if (d && d.began) commitEdit(); },
+});
+// 2. Add Bone
+defTool('boneadd', {
+  icon: BIC.boneadd, name: 'Add bone', key: 'N', cursor: 'crosshair', hint: 'Drag from base to tip · the selected bone becomes the parent · Shift snaps angles',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(); if (!requireSetup('Creating bones')) return;
+    beginEdit('Add bone');
+    const inv = M.inv(lcOf(B).full), p = M.ap(inv, sx, sy);
+    const parent = S.selBone && boneOf(B, S.selBone) ? S.selBone : null;
+    const PF = parent ? posedFrames(B, 0)[parent].F : M.I(), lp = M.ap(M.inv(PF), p[0], p[1]);
+    const b = newBone(B, 'Bone ' + (B.bones.length + 1), parent, lp[0], lp[1], 0, 1);
+    S.selBone = b.id; S.selBones = new Set([b.id]);
+    startDrag(e, { B, b, inv, p, PF }); requestDraw();
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    const q = M.ap(d.inv, sx, sy), dx = q[0] - d.p[0], dy = q[1] - d.p[1];
+    let a = (Math.atan2(dy, dx) - Math.atan2(d.PF[1], d.PF[0])) / DEG; if (e.shiftKey) a = Math.round(a / 15) * 15;
+    d.b.a = round(a); d.b.len = round(Math.max(1, Math.hypot(dx, dy))); d.b.str = round(d.b.len * 0.45); requestDraw();
+  },
+  up() { const d = Stage.drag; if (d && d.b.len < 4) { d.b.len = 40; d.b.str = 18; } commitEdit(); },
+});
+// 3. Transform Bone
+defTool('bonetf', {
+  icon: BIC.bonetf, name: 'Transform bone', key: 'J', cursor: 'move', hint: 'Drag the base to move, near the tip to rotate · Setup edits the skeleton (art stays put) · on animation frames it keys the bone · Shift-drag tip = scale',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy);
+    if (!hb) { selectBone(null); return; }
+    selectBone(hb.id);
+    const setup = S.mode === 'setup', f = setup ? 0 : S.frame;
+    if (!setup && S.frame === 0) return toast('Frame 0 is the setup pose — use Setup mode, or go to frame 1+ to animate', 'err');
+    const fr = posedFrames(B, f), b = hb.b, PF = b.parent ? fr[b.parent].F : M.I(), ps = b.parent ? fr[b.parent].s : 1;
+    const nearTip = Math.hypot(sx - hb.tip[0], sy - hb.tip[1]) < Math.hypot(sx - hb.base[0], sy - hb.base[1]);
+    beginEdit(setup ? 'Transform rest bone' : 'Transform bone');
+    const inv = M.inv(lcOf(B).full);
+    startDrag(e, { B, b, setup, f, mode: nearTip ? (e.shiftKey && !setup ? 'scale' : 'tip') : 'base', inv, PF, ps, base: M.ap(fr[b.id].F, 0, 0), q0: M.ap(inv, sx, sy), p0: val(B, 'bone:' + b.id + ':p', f), len: b.len });
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    const q = M.ap(d.inv, sx, sy), b = d.b, B = d.B;
+    if (d.mode === 'base') {
+      if (d.setup) { const lp = M.ap(M.inv(d.PF), q[0], q[1]); setVal(B, 'bone:' + b.id + ':p', [round(lp[0] / d.ps - (b.ox || 0)), round(lp[1] - (b.oy || 0))], 0); }
+      else { const dv = M.apv(M.inv(d.PF), q[0] - d.q0[0], q[1] - d.q0[1]); setVal(B, 'bone:' + b.id + ':p', [round(d.p0[0] + dv[0] / d.ps), round(d.p0[1] + dv[1])], d.f); }
+    } else if (d.mode === 'scale') setVal(B, 'bone:' + b.id + ':s', round(Math.max(0.05, Math.hypot(q[0] - d.base[0], q[1] - d.base[1]) / d.len), 3), d.f);
+    else {
+      const ang = round((Math.atan2(q[1] - d.base[1], q[0] - d.base[0]) - Math.atan2(d.PF[1], d.PF[0])) / DEG);
+      setVal(B, 'bone:' + b.id + ':a', ang, d.f);
+      if (d.setup) { b.len = round(Math.max(2, Math.hypot(q[0] - d.base[0], q[1] - d.base[1]))); }
+    }
+    requestDraw();
+  },
+  up() { commitEdit(); },
+});
+// 4. Manipulate Bones
+function solveIK(B, endId, target, f, chainLen = 3) {
+  const chain = []; let id = endId;
+  while (id && chain.length < chainLen) { const b = B.bones.find((x) => x.id === id); if (!b) break; chain.push(b); if (b.ikStop) break; id = b.parent; }
+  const over = {}; for (const b of chain) over[b.id] = val(B, 'bone:' + b.id + ':a', f);
+  for (let it = 0; it < 14; it++) {
+    for (const b of chain) {
+      const fr = boneFrames(B, f, over, true), endF = fr[endId], tip = M.ap(endF.F, endF.len, 0), base = M.ap(fr[b.id].F, 0, 0);
+      const a1 = Math.atan2(tip[1] - base[1], tip[0] - base[0]), a2 = Math.atan2(target[1] - base[1], target[0] - base[0]);
+      let na = over[b.id] + (a2 - a1) / DEG;
+      while (na - over[b.id] > 180) na -= 360; while (na - over[b.id] < -180) na += 360;
+      if (b.min !== undefined && b.max !== undefined && b.min < b.max) na = clamp(na, b.min, b.max);
+      over[b.id] = na;
+    }
+  }
+  return over;
+}
+function testSet(B, path, v) { B.ch[path] = { keys: [{ f: 0, v, i: 'smooth' }] }; } // temporary frame-0 pose used for rig tests (reverted on release)
+defTool('bonemanip', {
+  icon: BIC.bonemanip, name: 'Manipulate bones', key: 'M', cursor: 'grab', hint: 'Drag near the end of a chain — IK bends the parents · Alt rotates one bone · Shift moves it · in Setup it only tests the rig (snaps back on release)',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy);
+    if (!hb) { selectBone(null); return; }
+    S.selBone = hb.id; S.selBones = new Set([hb.id]);
+    const test = S.mode === 'setup';
+    if (!test && S.frame === 0) { refreshAll(); return toast('Frame 0 is the starting (setup) pose — move to frame 1 or later to record a pose', 'err'); }
+    beginEdit(test ? 'Test rig' : 'Pose bone');
+    startDrag(e, { B, b: hb.b, test, inv: M.inv(lcOf(B).full), p0: val(B, 'bone:' + hb.id + ':p', S.frame), alt: e.altKey });
+    refreshAll();
+  },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    const B = d.B, b = d.b, q = M.ap(d.inv, sx, sy), f = d.test ? 0 : S.frame;
+    const put = (path, v) => (d.test ? testSet(B, path, v) : setVal(B, path, v));
+    if (e.shiftKey || d.shift) {
+      const fr = boneFrames(B, f, null, true), PF = b.parent ? fr[b.parent].F : M.I(), ps = b.parent ? fr[b.parent].s : 1;
+      const s0 = M.ap(d.inv, d.sx, d.sy), dv = M.apv(M.inv(PF), q[0] - s0[0], q[1] - s0[1]);
+      put('bone:' + b.id + ':p', [round(d.p0[0] + dv[0] / ps), round(d.p0[1] + dv[1])]);
+    } else if (S.ikMode && b.parent && !b.ikStop && !(e.altKey || d.alt)) {
+      const over = solveIK(B, b.id, q, f, 3);
+      for (const id in over) put('bone:' + id + ':a', round(over[id], 2));
+    } else {
+      const fr = boneFrames(B, f, null, true), base = M.ap(fr[b.id].F, 0, 0), PF = b.parent ? fr[b.parent].F : M.I();
+      let a = (Math.atan2(q[1] - base[1], q[0] - base[0]) - Math.atan2(PF[1], PF[0])) / DEG;
+      if (b.min !== undefined && b.max !== undefined && b.min < b.max) a = clamp(a, b.min, b.max);
+      put('bone:' + b.id + ':a', round(a, 2));
+    }
+    requestDraw();
+  },
+  up() { const d = Stage.drag; if (d && d.test) { cancelEdit(); } else commitEdit(); },
+});
+// 5. Reparent Bone
+defTool('reparent', {
+  icon: BIC.reparent, name: 'Reparent bone', key: 'I', cursor: 'alias', hint: 'Select the bone(s) to move in the hierarchy (Select bone), then click the new parent · click empty space to make them root bones · bound artwork is unchanged',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy);
+    const ids = selectedBoneIds().filter((id) => !hb || id !== hb.id);
+    if (!ids.length) { if (hb) selectBone(hb.id); return toast('Now click the bone that should become its parent', 'ok'); }
+    let skipped = 0;
+    edit('Reparent bone', () => {
+      for (const id of ids) { const b = boneOf(B, id); if (!b) continue; if (hb && (hb.id === id || boneDescends(B, hb.id, id))) { skipped++; continue; } reparentBone(B, b, hb ? hb.id : null); }
+    });
+    toast(hb ? `Parent is now “${hb.b.name}”${skipped ? ` (${skipped} skipped — would create a loop)` : ''}` : 'Made root bone(s)', skipped ? 'err' : 'ok');
+  },
+});
+// 6. Bone Strength
+defTool('strength', {
+  icon: BIC.strength, name: 'Bone strength', key: 'U', cursor: 'ew-resize', hint: 'Drag sideways on a bone to grow or shrink its influence region · unbound points inside a region bend with that bone (flexible binding)',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy, 24); if (!hb) { selectBone(null); return; }
+    selectBone(hb.id); beginEdit('Bone strength');
+    startDrag(e, { b: hb.b, s0: hb.b.str || 0, k: M.scaleOf(lcOf(B).full) });
+  },
+  move(e, sx) { const d = Stage.drag; if (!d) return; d.b.str = round(Math.max(0, d.s0 + (sx - d.sx) / d.k)); requestDraw(); },
+  up() { commitEdit(); },
+});
+// 7. Vitruvian Bones
+defTool('vitruvian', {
+  icon: BIC.vitruvian, name: 'Vitruvian bones', key: '', cursor: 'pointer', hint: 'Alternate bone constructions: Setup — pick a group in the bar and click bones to put them (and their children) in it · Animate — choose which group is active at the playhead',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy, 10, true); if (!hb) return;
+    if (S.mode !== 'setup') { selectBone(hb.id); return toast('Switch the active construction from the bar above (it keys at the playhead)'); }
+    const g = this.opts.target; if (!g || !(B.vgroups || []).includes(g)) return toast('Add a construction group first (＋ Group in the bar)', 'err');
+    const set = hb.b.vg === g ? '' : g;
+    edit('Vitruvian group', () => { const mark = (id) => { const b = boneOf(B, id); b.vg = set; B.bones.filter((c) => c.parent === id).forEach((c) => mark(c.id)); }; mark(hb.id); });
+    toast(set ? `“${hb.b.name}” and its children → ${g}` : `“${hb.b.name}” is shared by every construction`);
+  },
+  opts: { target: '' },
+});
+// 8. Sketch Bones
+defTool('sketch', {
+  icon: BIC.sketch, name: 'Sketch bones', key: 'W', cursor: 'crosshair', hint: 'Draw a stroke to create a whole chain of bones along it (tails, ropes, tentacles) · continues from the selected bone',
+  down(e, sx, sy) { if (!requireSetup('Sketching bones')) return; startDrag(e, { B: activeBoneLayer() }); Stage.preview = { type: 'poly', pts: [[sx, sy]] }; },
+  move(e, sx, sy) { if (!Stage.drag || !Stage.preview) return; const pts = Stage.preview.pts, l = pts[pts.length - 1]; if (Math.hypot(sx - l[0], sy - l[1]) > 3) pts.push([sx, sy]); requestDraw(); },
+  up() {
+    const d = Stage.drag, pv = Stage.preview; Stage.preview = null; if (!d || !pv || pv.pts.length < 3) return requestDraw();
+    const B = d.B, inv = M.inv(lcOf(B).full), pts = pv.pts.map((p) => M.ap(inv, p[0], p[1]));
+    const cum = [0]; for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+    const total = cum[cum.length - 1]; if (total < 10) return;
+    const n = this.opts.count > 0 ? this.opts.count : clamp(Math.round(total / this.opts.seg), 2, 40);
+    const at = (dist) => { let i = 1; while (i < cum.length - 1 && cum[i] < dist) i++; const t = (dist - cum[i - 1]) / ((cum[i] - cum[i - 1]) || 1); return [lerp(pts[i - 1][0], pts[i][0], t), lerp(pts[i - 1][1], pts[i][1], t)]; };
+    const nodes = []; for (let k = 0; k <= n; k++) nodes.push(at((total * k) / n));
+    edit('Sketch bones', () => {
+      let parent = S.selBone && boneOf(B, S.selBone) ? S.selBone : null, prevAng = null, prevLen = 0;
+      const base = parent ? posedFrames(B, 0)[parent].F : M.I();
+      for (let k = 0; k < n; k++) {
+        const p0 = nodes[k], p1 = nodes[k + 1], ang = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]) / DEG, len = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]);
+        let b;
+        if (k === 0) { const lp = M.ap(M.inv(base), p0[0], p0[1]); b = newBone(B, 'Chain 1', parent, lp[0], lp[1], ang - Math.atan2(base[1], base[0]) / DEG, len); }
+        else b = newBone(B, 'Chain ' + (k + 1), parent, prevLen, 0, ang - prevAng, len);
+        parent = b.id; prevAng = ang; prevLen = b.len;
+      }
+      S.selBone = parent; S.selBones = new Set([parent]);
+    });
+    toast(`Created a chain of ${n} bones — refine them with Transform bone`, 'ok');
+  },
+  opts: { count: 0, seg: 60 },
+});
+// 9. Bind Layer
+defTool('bind', {
+  icon: BIC.bind, name: 'Bind layer', key: 'L', cursor: 'alias', hint: 'Select an artwork layer (vector, image, switch, group…) inside the Bone Group, then click a bone — the whole layer follows it as one unit · click empty space to clear the attachment',
+  down(e, sx, sy) {
+    const L = selLayer(); const B = activeBoneLayer();
+    if (!L || !B || L === B) return toast('Select a layer inside a Bone Group first');
+    if (!requireSetup('Binding')) return;
+    const hb = hitBone(B, sx, sy);
+    if (!hb && !L.bindBone) return;
+    edit(hb ? 'Bind layer' : 'Unbind layer', () => { L.bindBone = hb ? hb.id : null; });
+    if (hb) selectBone(hb.id);
+    toast(hb ? `“${L.name}” now follows ${hb.b.name} as one unit` : `“${L.name}” is no longer attached to a single bone — its point and flexi-binding settings apply again`, 'ok');
+  },
+});
+// 10. Bind Points
+defTool('bindpts', {
+  icon: BIC.bindpts, name: 'Bind points', key: 'D', cursor: 'crosshair', hint: 'Select points (click / drag a box), then click a bone to bind them to it · click a bone with nothing selected to see its points',
+  down(e, sx, sy) {
+    const L = selLayer(), B = activeBoneLayer();
+    if (!requireSetup('Binding points')) return;
+    const pid = hitPoint(L, sx, sy, 7);
+    if (pid) { if (e.shiftKey) S.selPts.has(pid) ? S.selPts.delete(pid) : S.selPts.add(pid); else S.selPts = new Set([pid]); refreshAll(); return; }
+    const hb = hitBone(B, sx, sy);
+    if (hb) {
+      if (!S.selPts.size) { S.selPts = new Set(Object.keys(L.pts).filter((id) => (L.pts[id].b || []).some((q) => q[0] === hb.id))); selectBone(hb.id); return toast(`${S.selPts.size} point(s) are bound to ${hb.b.name}`); }
+      const n = S.selPts.size;
+      edit('Bind points', () => { for (const id of S.selPts) L.pts[id].b = [[hb.id, 1]]; L.bindBone = null; });
+      selectBone(hb.id); return toast(`Bound ${n} point(s) to ${hb.b.name}`, 'ok');
+    }
+    if (!e.shiftKey) S.selPts = new Set();
+    startDrag(e, { mode: 'marquee', L, base: new Set(S.selPts) }); refreshAll();
+  },
+  move(e, sx, sy) { const d = Stage.drag; if (d && d.mode === 'marquee') TOOLS.points.move.call(TOOLS.points, e, sx, sy); },
+  up() { Stage.preview = null; refreshAll(); },
+});
+// 11. Offset Bone
+defTool('offset', {
+  icon: BIC.offset, name: 'Offset bone', key: 'G', cursor: 'move', hint: 'Exploded rig: draw parts apart, bind them, then drag their bones into place — the art moves with them · Alt-click resets a bone\'s offset',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy); if (!hb) { selectBone(null); return; }
+    if (!requireSetup('Offsetting bones')) return;
+    selectBone(hb.id);
+    if (e.altKey) return edit('Reset bone offset', () => { hb.b.ox = 0; hb.b.oy = 0; });
+    const fr = posedFrames(B, 0), b = hb.b, PF = b.parent ? fr[b.parent].F : M.I(), ps = b.parent ? fr[b.parent].s : 1;
+    beginEdit('Offset bone'); const inv = M.inv(lcOf(B).full);
+    startDrag(e, { b, PF, ps, inv, q0: M.ap(inv, sx, sy), ox: b.ox || 0, oy: b.oy || 0 });
+  },
+  move(e, sx, sy) { const d = Stage.drag; if (!d) return; const q = M.ap(d.inv, sx, sy), dv = M.apv(M.inv(d.PF), q[0] - d.q0[0], q[1] - d.q0[1]); d.b.ox = round(d.ox + dv[0] / d.ps); d.b.oy = round(d.oy + dv[1]); requestDraw(); },
+  up() { commitEdit(); },
+});
+// 12. Bone Physics
+defTool('physics', {
+  icon: BIC.physics, name: 'Bone physics', key: '', cursor: 'pointer', hint: 'Click a bone to give it springy follow-through (hair, tails, ears, antennae) · tune spring and damping in the bar · forces come from the Force tool',
+  down(e, sx, sy) {
+    const B = activeBoneLayer(), hb = hitBone(B, sx, sy); if (!hb) { selectBone(null); return; }
+    if (!requireSetup('Bone physics')) return;
+    selectBone(hb.id);
+    const on = !(hb.b.dyn && hb.b.dyn.on);
+    edit(on ? 'Enable bone physics' : 'Disable bone physics', () => { hb.b.dyn = { spring: 60, damp: 11, inertia: 0.6, lockTip: false, ...(hb.b.dyn || {}), on }; });
+    toast(on ? `Physics on for ${hb.b.name} — it now swings after its parent moves` : `Physics off for ${hb.b.name}`, 'ok');
+  },
+});
+// 13. Force
+defTool('force', {
+  icon: BIC.force, name: 'Force (wind & gravity)', key: '', cursor: 'crosshair', hint: 'Drag on the stage to set wind direction and strength for bones with physics · gravity and turbulence are in the bar',
+  down(e, sx, sy) { const B = activeBoneLayer(); beginEdit('Wind force'); startDrag(e, { B, k: M.scaleOf(lcOf(B).full) }); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return; const B = d.B; B.force = B.force || {};
+    const dx = sx - d.sx, dy = sy - d.sy; B.force.windA = round(Math.atan2(dy, dx) / DEG); B.force.windS = round((Math.hypot(dx, dy) / d.k) * 1.5);
+    Stage.forceArrow = [d.sx, d.sy, sx, sy]; requestDraw();
+  },
+  up() { Stage.forceArrow = null; commitEdit(); },
+});
+
+function autoBindPoints(L, B, ids, allowed) { // weighted binding by distance to bone segments (rest pose); allowed = bone ids that may participate
+  const lc = evalLC(L, 0), rest = boneFrames(B, null);
+  const segs = B.bones.filter((b) => !allowed || allowed.includes(b.id)).map((b) => ({ id: b.id, a: M.ap(rest[b.id].F, 0, 0), b: M.ap(rest[b.id].F, b.len, 0) }));
+  if (!segs.length) return 0;
+  let n = 0;
+  for (const id of ids) {
+    const pt = L.pts[id]; if (!pt) continue;
+    const p = M.ap(lc.relPts, pt.x, pt.y);
+    const ds = segs.map((s) => ({ id: s.id, d: distToSeg(p[0], p[1], s.a, s.b) })).sort((a, b) => a.d - b.d);
+    const near = ds.slice(0, 2), d0 = near[0].d + 1;
+    const ws = near.map((x) => [x.id, 1 / Math.pow(x.d + 1, 3)]).filter((w, i) => i === 0 || near[i].d < d0 * 2.2 + 25);
+    const sum = ws.reduce((s, w) => s + w[1], 0);
+    pt.b = ws.map(([bid, w]) => [bid, round(w / sum, 3)]); n++;
+  }
+  L.bindBone = null;
+  return n;
+}
+
+// --- Emitter
+defTool('emitter', {
+  icon: '✦', name: 'Particle emitter', key: 'Q', cursor: 'crosshair', hint: 'Click to place a particle emitter using the preset below',
+  down(e, sx, sy) {
+    edit('Add emitter', () => {
+      const L = mkLayer('particle', this.opts.preset + ' emitter');
+      applyParticlePreset(L, this.opts.preset);
+      const w = M.ap(M.inv(M.mul(viewM(), camFn(S.frame)(0))), sx, sy);
+      L.p.x = round(w[0]); L.p.y = round(w[1]); L.startF = S.frame;
+      S.doc.layers.unshift(L); S.selLayers = [L.id];
+    });
+  },
+  opts: { preset: 'Dust' },
+});
+
+// --- Camera
+defTool('camera', {
+  icon: '🎥', name: 'Camera', key: 'K', cursor: 'move', hint: 'Drag = track · Shift-drag = zoom · Alt-drag = roll · keys the camera at the current frame',
+  down(e, sx, sy) { const c = S.doc.camera; beginEdit('Camera'); startDrag(e, { x: val(c, 'x', S.frame), y: val(c, 'y', S.frame), zoom: val(c, 'zoom', S.frame), roll: val(c, 'roll', S.frame), inv: M.inv(M.mul(viewM(), camFn(S.frame)(0))) }); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return; const c = S.doc.camera;
+    if (e.shiftKey) setVal(c, 'zoom', round(clamp(d.zoom * Math.exp(-(sy - d.sy) / (200 * Stage.dpr)), 0.05, 50), 3));
+    else if (e.altKey) setVal(c, 'roll', round(d.roll + (sx - d.sx) / (3 * Stage.dpr), 2));
+    else { const v = M.apv(d.inv, sx - d.sx, sy - d.sy); setVal(c, 'x', round(d.x - v[0])); setVal(c, 'y', round(d.y - v[1])); }
+    requestDraw();
+  },
+  up() { commitEdit(); },
+});
+
+// --- Workspace
+defTool('pan', { icon: '✥', name: 'Pan workspace', key: 'H', cursor: 'grab', hint: 'Drag to pan the view (or hold Space / middle mouse in any tool)',
+  down(e) { startDrag(e, { px: S.view.panX, py: S.view.panY }); },
+  move(e, sx, sy) { const d = Stage.drag; if (!d) return; S.view.panX = d.px + (sx - d.sx) / Stage.dpr; S.view.panY = d.py + (sy - d.sy) / Stage.dpr; requestDraw(); },
+  up() {} });
+defTool('zoom', { icon: '🔍', name: 'Zoom workspace', key: 'Z', cursor: 'zoom-in', hint: 'Click to zoom in · Alt-click to zoom out · wheel zooms anywhere',
+  down(e, sx, sy) { zoomAt(sx, sy, e.altKey ? 1 / 1.4 : 1.4); }, move() {}, up() {} });
+
+function zoomAt(sx, sy, k) {
+  const before = M.ap(M.inv(viewM()), sx, sy);
+  S.view.zoom = clamp(S.view.zoom * k, 0.03, 40);
+  const after = M.ap(viewM(), before[0], before[1]);
+  S.view.panX -= (after[0] - sx) / Stage.dpr; S.view.panY -= (after[1] - sy) / Stage.dpr;
+  requestDraw();
+}
+function fitView() {
+  const r = Stage.cv.getBoundingClientRect();
+  S.view.zoom = Math.min((r.width - 60) / S.doc.w, (r.height - 60) / S.doc.h); S.view.panX = 0; S.view.panY = 0; S.view.rot = 0; requestDraw();
+}
+
+// ---------- stage input ----------
+function initStage() {
+  Stage.cv = $('#stage'); Stage.ctx = Stage.cv.getContext('2d');
+  UI.stage = renderStage;
+  const pos = (e) => { const r = Stage.cv.getBoundingClientRect(); return [(e.clientX - r.left) * Stage.dpr, (e.clientY - r.top) * Stage.dpr]; };
+  let panDrag = null;
+  Stage.cv.addEventListener('pointerdown', (e) => {
+    Stage.cv.setPointerCapture(e.pointerId);
+    const [sx, sy] = (Stage.mouse = pos(e));
+    Stage.mods = { alt: e.altKey, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey };
+    // Workspace navigation never edits the scene: right-drag pans, Shift+right-drag zooms, Ctrl/Cmd+right-drag rotates the view.
+    if (e.button === 2) { const c = M.ap(M.t(Stage.cv.width / 2 + S.view.panX * Stage.dpr, Stage.cv.height / 2 + S.view.panY * Stage.dpr), 0, 0); panDrag = { mode: e.shiftKey ? 'zoom' : (e.ctrlKey || e.metaKey) ? 'rotate' : 'pan', sx, sy, px: S.view.panX, py: S.view.panY, zoom: S.view.zoom, rot: S.view.rot || 0, c }; Stage.cv.style.cursor = panDrag.mode === 'pan' ? 'grabbing' : panDrag.mode === 'zoom' ? 'zoom-in' : 'alias'; return; }
+    if (e.button === 1 || Stage.space || (e.button === 0 && S.tool === 'pan')) { panDrag = { mode: 'pan', sx, sy, px: S.view.panX, py: S.view.panY }; Stage.cv.style.cursor = 'grabbing'; return; }
+    if (e.button !== 0) return;
+    if (S.playing) stopPlay();
+    const why = toolAvail(S.tool); if (why) return toast(why, 'err');
+    const t = TOOLS[S.tool];
+    if (t && t.down) t.down(e, sx, sy);
+  });
+  Stage.cv.addEventListener('pointermove', (e) => {
+    const [sx, sy] = (Stage.mouse = pos(e));
+    Stage.mods = { alt: e.altKey, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey };
+    if (panDrag) {
+      if (panDrag.mode === 'zoom') { const k = clamp(panDrag.zoom * Math.exp(-(sy - panDrag.sy) / (150 * Stage.dpr)), 0.03, 40) / S.view.zoom; zoomAt(panDrag.sx, panDrag.sy, k); return; }
+      if (panDrag.mode === 'rotate') { const a = Math.atan2(sy - panDrag.c[1], sx - panDrag.c[0]) - Math.atan2(panDrag.sy - panDrag.c[1], panDrag.sx - panDrag.c[0]); S.view.rot = panDrag.rot + a; requestDraw(); return; }
+      S.view.panX = panDrag.px + (sx - panDrag.sx) / Stage.dpr; S.view.panY = panDrag.py + (sy - panDrag.sy) / Stage.dpr; requestDraw(); return; }
+    const d = Stage.drag;
+    if (d) { if (!d.moved && Math.hypot(sx - d.sx, sy - d.sy) > 2) d.moved = true; if (d.moved) TOOLS[S.tool].move(e, sx, sy); }
+    else if (S.tool === 'pen' || (S.tool === 'linewidth' && typeof VEC !== 'undefined' && VEC.lwMagnet)) requestDraw();
+  });
+  const end = (e) => {
+    if (panDrag) { panDrag = null; setCursor(); return; }
+    const d = Stage.drag; if (!d) return;
+    if(e.type==='pointercancel'){cancelEdit();Stage.drag=null;Stage.preview=null;Stage.vectorLasso=null;requestDraw();return;}
+    const t = TOOLS[S.tool]; if (t && t.up) t.up(e);
+    Stage.drag = null; Stage.preview = null; requestDraw();
+  };
+  Stage.cv.addEventListener('contextmenu', (e) => e.preventDefault());
+  Stage.cv.addEventListener('pointerup', end);
+  Stage.cv.addEventListener('pointercancel', end);
+  Stage.cv.addEventListener('dblclick', (e) => {
+    const [sx, sy] = pos(e); const t = TOOLS[S.tool];
+    if (t && t.dbl) t.dbl(e, sx, sy);
+    else if (S.tool === 'pen' && Stage.pen) finishPen(false);
+    // Transform Layer keeps its target; use the Points tool to edit artwork.
+  });
+  Stage.cv.addEventListener('wheel', (e) => {
+    e.preventDefault(); const [sx, sy] = pos(e);
+    if (e.ctrlKey || e.metaKey || !e.shiftKey) zoomAt(sx, sy, Math.exp(-e.deltaY * 0.0015));
+    else { S.view.panX -= e.deltaY * 0.5; requestDraw(); }
+  }, { passive: false });
+  new ResizeObserver(() => requestDraw()).observe(Stage.cv);
+  // toolbar
+  const tb = $('#toolbar');
+  for (const [g, ids] of TOOL_GROUPS) {
+    const lab = document.createElement('div'); lab.className = 'tg'; lab.dataset.group = g; lab.textContent = g; tb.appendChild(lab);
+    for (const id of ids) {
+      const t = TOOLS[id], b = document.createElement('button');
+      b.dataset.tool = id; b.innerHTML = t.icon; b.title = `${t.name}${t.key ? ' ('+t.key+')' : ''}\n${t.hint}`;
+      b.onclick = () => setTool(id); tb.appendChild(b);
+    }
+  }
+  $$('#stagehud [data-view]').forEach((b) => (b.onclick = () => {
+    const v = b.dataset.view;
+    if (v === 'fit') fitView(); else if (v === '100') { S.view.zoom = 1; requestDraw(); }
+    else { S.outputOnly = !S.outputOnly; b.classList.toggle('on', S.outputOnly); requestDraw(); }
+  }));
+}
+
+// ---------- breadcrumb ----------
+function renderCrumbs() {
+  const el = $('#crumbs'); if (!el) return;
+  const L = selLayer(); let h = '<span class="cr root" data-crumb="">Scene</span>';
+  if (S.camSel) h += '<span class="sepc">›</span><span class="cr on">🎥 Camera</span>';
+  else if (L) {
+    for (const A of ancestors(L.id).reverse().concat([L])) h += `<span class="sepc">›</span><span class="cr ${A === L ? 'on' : ''}" data-crumb="${A.id}">${LAYER_TYPES[A.type].icon} ${esc(A.name)} <i>${LAYER_TYPES[A.type].name}</i></span>`;
+    const B = activeBoneLayer(), b = B && S.selBone && B.bones.find((x) => x.id === S.selBone);
+    if (b && (BONE_TOOLS.has(S.tool) || L === B)) h += `<span class="sepc">›</span><span class="cr bone">🦴 ${esc(b.name)}</span>`;
+    const ia = editingInactiveAlt();
+    if (ia) h += `<span class="crwarn" title="You are editing a drawing that is not the active one at this frame. Nothing is keyed.">editing an inactive alternative of ${esc(ia.sw.name)} · not keyed</span>`;
+  }
+  if (S.mode === 'setup') h += '<span class="crmode">SETUP</span>';
+  if (el._h === h) return; el._h = h; el.innerHTML = h;
+  el.querySelectorAll('[data-crumb]').forEach((c) => (c.onclick = () => { S.camSel = false; S.selLayers = c.dataset.crumb ? [c.dataset.crumb] : []; S.selPts = new Set(); S.selShape = null; refreshAll(); }));
+}
+
+// ---------- switch helpers (preview vs. edit vs. set active) ----------
+function swShown(SW) { return S.swPreview[SW.id] || switchOverrides()[SW.id] || switchState(SW, S.frame).cur; }
+function swPreviewStep(SW, d) {
+  const n = SW.children.length; if (!n) return;
+  const i = SW.children.findIndex((c) => c.id === swShown(SW));
+  S.swPreview[SW.id] = SW.children[(i + d + n) % n].id; refreshAll();
+}
+function swSetActive(SW, id) {
+  id = id || swShown(SW); const c = SW.children.find((x) => x.id === id); if (!c) return;
+  edit('Set active: ' + c.name, () => setVal(SW, 'sw', id, S.frame, true));
+  delete S.swPreview[SW.id]; toast(`“${c.name}” is active from frame ${S.frame}`, 'ok');
+}
+function contentBox(L, f = S.frame) { // bounds of a layer's artwork in its parent's space
+  const pts = [];
+  const gather = (A, m) => {
+    if (A.type === 'vector') { const P = deformedPts(A, f, null); for (const k in P) pts.push(M.ap(m, P[k][0], P[k][1])); }
+    if (A.type === 'image') for (const [x, y] of [[-1, -1], [1, 1]]) pts.push(M.ap(m, (x * A.iw) / 2, (y * A.ih) / 2));
+    if (A.children) A.children.forEach((c) => gather(c, M.mul(m, layerLocalM(c, f))));
+  };
+  gather(L, layerLocalM(L, f));
+  if (!pts.length) return null;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+function alignAlternatives(SW) {
+  edit('Align alternatives', () => {
+    for (const c of SW.children) {
+      const b = contentBox(c); if (!b) continue;
+      const cx = round((b[0] + b[2]) / 2), cy = round((b[1] + b[3]) / 2);
+      c.p.x -= cx; c.p.y -= cy;
+      if (c.ch.x) c.ch.x.keys.forEach((k) => (k.v -= cx)); if (c.ch.y) c.ch.y.keys.forEach((k) => (k.v -= cy));
+    }
+  });
+  toast('Every alternative is now centred on the switch’s registration point', 'ok');
+}
+function bindingInfo(L) {
+  const B = boneLayerFor(L); if (!B) return null;
+  if (L.bindBone) { const b = B.bones.find((x) => x.id === L.bindBone); return { B, mode: 'Attached', text: `Attached to: ${b ? b.name : '?'}` }; }
+  const flexNote = L.flexi === false ? 'flexi-binding off' : Array.isArray(L.flexiBones) ? `flexi-binding limited to ${L.flexiBones.length} bone(s)` : 'flexi-binding to all bones';
+  if (L.type === 'vector') {
+    const pts = Object.values(L.pts), bound = pts.filter((p) => p.b && p.b.length), wt = bound.filter((p) => p.b.length > 1), released = pts.filter((p) => Array.isArray(p.b) && !p.b.length);
+    if (bound.length || released.length) return { B, mode: wt.length ? 'Weighted' : 'Points', text: `Binding: ${bound.length}/${pts.length} points bound${wt.length ? ' (weighted)' : ''}${released.length ? `, ${released.length} released` : ''}; other points: ${flexNote}` };
+  }
+  if (L.type === 'vector' && L.flexi === false) return { B, mode: 'Released', text: 'Released — flexi-binding is off, so the skeleton does not move this layer' };
+  if (L.type === 'vector' && Array.isArray(L.flexiBones) && B.bones.some((b) => b.str > 0)) return { B, mode: 'Flexible', text: `Binding: Flexible — ${flexNote}` };
+  if (L.type === 'bone') return { B, mode: 'Nested', text: 'Nested rig: moved by the parent only if attached; it deforms its own artwork' };
+  if (L.type === 'vector' && !ancestors(L.id).some((a) => a !== B && a.bindBone && boneLayerFor(a) === B) && B.bones.some((b) => b.str > 0)) return { B, mode: 'Flexible', text: 'Binding: Flexible — bends with bones whose strength region covers it' };
+  return { B, mode: 'None', text: 'Not bound — the skeleton does not move this layer yet' };
+}
+
+// ---------- context toolbar: tool options + what the selected layer can do ----------
+function contextHTML() {
+  const L = selLayer(), n = S.selLayers.length, btn = (a, label, title = '') => `<button class="btn" ${a} title="${esc(title)}">${label}</button>`;
+  if (S.camSel) return `<span class="chip">🎥 Camera</span>${btn('data-tool="camera"', 'Camera tool')}${btn('data-cmd="cam.shake"', 'Shake at playhead')}`;
+  if (!L) return `<span class="chip">Nothing selected — drawing creates a new vector layer</span>${btn('data-cmd="layer.new"', '＋ Add layer')}`;
+  if (n > 1) {
+    const types = [...new Set(S.selLayers.map((id) => findLayer(id)).filter(Boolean).map((l) => l.type))];
+    return `<span class="chip">${n} layers (${types.map((t) => LAYER_TYPES[t].name).join(', ')}) — shared: transform, opacity, effects${types.includes('audio') ? '; audio: timing only' : ''}</span>${btn('data-cmd="layer.group"', 'Group them')}`;
+  }
+  let h = '';
+  const bi = bindingInfo(L);
+  const P = parentOf(L.id);
+  if (P && P.type === 'switch') {
+    const active = switchState(P, S.frame).cur === L.id;
+    h += `<span class="chip">Alternative of <b>${esc(P.name)}</b> · ${active ? 'active now' : 'not active at this frame'}</span>${active ? '' : btn('data-ctx="swactivatesel"', 'Set active at playhead', 'Key this drawing as the visible one at the current frame')}`;
+  }
+  switch (L.type) {
+    case 'vector':
+      h += `<span class="chip">Vector · ${Object.keys(L.pts).length} points · ${L.shapes.length} shapes</span>${btn('data-tool="points"', 'Edit points')}`;
+      break;
+    case 'image': h += `<span class="chip">Image · ${L.iw}×${L.ih}</span>${btn('data-cmd="img.native"', 'Native size')}`; break;
+    case 'text': h += `<span class="chip">Text — edit the words in Properties</span>`; break;
+    case 'audio': h += `<span class="chip">Audio · starts at frame ${L.offset}</span>${btn('data-cmd="ai.lipsync"', '✦ Lip sync…')}${btn('data-cmd="audio.fitend"', 'Fit timeline')}`; break;
+    case 'particle': h += `<span class="chip">Particles · ${L.mode}</span><select data-ctx="preset">${['', ...Object.keys(PARTICLE_PRESETS)].map((k) => `<option value="${k}" ${k === (L.preset || '') ? 'selected' : ''}>${k || 'Preset…'}</option>`).join('')}</select>`; break;
+    case 'group':
+      h += `<span class="chip" title="Effects on a child apply to that child only; effects on the group apply after its children are combined">Group · ${L.children.length} children · group effects apply to the combined result</span>${btn('data-cmd="layer.newinside"', '＋ Vector layer inside')}`;
+      break;
+    case 'bone':
+      h += `<span class="chip">Bone Group · ${L.bones.length} bones · ${S.mode === 'setup' ? 'Setup' : 'Animate'}</span>`;
+      if (S.mode === 'setup') h += btn('data-cmd="rig.test"', 'Test deformation') + btn('data-tab="props"', 'Rig settings');
+      else h += btn('data-cmd="pose.save"', 'Save pose') + btn('data-cmd="pose.apply"', 'Pose library') + btn('data-cmd="anim.keyall"', 'Key pose');
+      h += btn('data-cmd="layer.newinside"', '＋ Vector layer inside');
+      break;
+    case 'switch': {
+      const shown = swShown(L), prev = S.swPreview[L.id];
+      h += `<span class="chip">Switch Group</span><label>Showing <select data-ctx="swpick">${L.children.map((c) => `<option value="${c.id}" ${c.id === shown ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>`;
+      h += btn('data-ctx="swprev"', '◀', 'Preview previous alternative') + btn('data-ctx="swnext"', '▶', 'Preview next alternative');
+      h += btn('data-ctx="swset" class="btn pri"', `Set active at frame ${S.frame}`, 'Key the shown alternative at the playhead');
+      if (prev) h += `<span class="chip warn">preview only — not keyed</span>${btn('data-ctx="swclear"', 'Clear preview')}`;
+      h += btn('data-cmd="switch.addchild"', '＋ Alternative') + btn('data-ctx="swalign"', 'Align') + `<label title="Ghost every alternative over the registration point"><input type="checkbox" data-ctx="swoverlay" ${S.alignOverlay ? 'checked' : ''}>Overlay</label>` + btn('data-tab="switch"', 'Switch editor') + btn('data-cmd="ai.lipsync"', '✦ Lip sync');
+      break;
+    }
+  }
+  if (bi && L.type !== 'bone') {
+    h += `<span class="chip rig" title="This layer lives inside a Bone Group">Controlled by: <b>${esc(bi.B.name)}</b> · ${esc(bi.text)}</span>`;
+    if (S.mode === 'animate') h += btn('data-ctx="poseparent"', '✋ Pose parent rig', 'Pose the parent skeleton without changing which layer is selected');
+    else h += btn('data-tool="bind"', '🔗 Attach') + (L.type === 'vector' ? btn('data-cmd="rig.autobind"', 'Bind points…') : '');
+  } else if (bi && L.type === 'bone') h += `<span class="chip rig">${esc(bi.text)}</span>`;
+  return h;
+}
+function renderToolOpts() {
+  const t = TOOLS[S.tool], el = $('#toolopts'); if (!t) return;
+  if (el.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+  const ns = S.newStyle;
+  let h = `<span class="tname" title="${esc(t.hint)}">${t.icon} ${esc(t.name)}</span>`;
+  const styleCtl = `<label title="New-shape fill"><input type="checkbox" data-o="fillOn" ${ns.fillOn ? 'checked' : ''}>Fill <input type="color" data-o="fill" value="${ns.fill}"></label>
+    <label title="New-shape stroke"><input type="checkbox" data-o="strokeOn" ${ns.strokeOn ? 'checked' : ''}>Stroke <input type="color" data-o="stroke" value="${ns.stroke}"></label>
+    <label>Width <input type="number" data-o="width" value="${ns.width}" min="0" step="0.5"></label>`;
+  let opts = '';
+  if (['pen', 'freehand', 'rect', 'ellipse', 'polygon', 'fill'].includes(S.tool)) opts += styleCtl;
+  if (S.tool === 'pen') opts += `<label><input type="checkbox" data-pen="smooth" ${TOOLS.pen.opts.smooth ? 'checked' : ''}>Smooth points</label><button class="btn" id="penDone">Finish path ⏎</button>`;
+  if (S.tool === 'freehand') opts += `<label>Simplify <input type="range" min="0" max="12" step="1" data-g="freehandSmooth" value="${S.freehandSmooth}"></label>`;
+  if (S.tool === 'polygon') opts += `<label>Sides <input type="number" min="3" max="24" data-g="polySides" value="${S.polySides}"></label><label><input type="checkbox" data-g="polyStar" ${S.polyStar ? 'checked' : ''}>Star</label>`;
+  const Bt = activeBoneLayer(), sb = Bt && boneOf(Bt, S.selBone);
+  if (S.tool === 'bonemanip') opts += `<label><input type="checkbox" data-g="ikMode" ${S.ikMode ? 'checked' : ''}>IK (drag pulls parents)</label><span class="chip">Alt = rotate one bone · Shift = move</span>${S.mode === 'setup' ? '<span class="chip warn">Setup: testing only — the pose snaps back</span>' : ''}`;
+  if (S.tool === 'strength') opts += sb ? `<label>Strength of <b>${esc(sb.name)}</b> <input type="number" min="0" data-bopt="str" value="${sb.str || 0}"></label><button class="btn" data-ctx="strauto">Auto (45% of length)</button><button class="btn" data-ctx="strzero">Off</button>` : '<span class="chip">Drag sideways on a bone</span>';
+  if (S.tool === 'vitruvian' && Bt) {
+    const gs = Bt.vgroups || [], tgt = TOOLS.vitruvian.opts.target;
+    opts += `<label>Assign to <select data-ctx="vtarget">${gs.map((g) => `<option ${g === tgt ? 'selected' : ''}>${esc(g)}</option>`).join('') || '<option value="">— no groups —</option>'}</select></label><button class="btn" data-ctx="vadd">＋ Group</button>`;
+    if (gs.length) opts += `<label>Active at frame ${S.frame} <select data-ctx="vactive">${gs.map((g) => `<option ${g === vitActive(Bt, S.frame) ? 'selected' : ''}>${esc(g)}</option>`).join('')}</select></label>`;
+  }
+  if (S.tool === 'sketch') opts += `<label>Bones <input type="number" min="0" max="40" data-sk="count" value="${TOOLS.sketch.opts.count}" title="0 = automatic from segment length"></label><label>Segment length <input type="number" min="5" data-sk="seg" value="${TOOLS.sketch.opts.seg}"></label>`;
+  if (S.tool === 'offset' && Bt) opts += `<span class="chip">${Bt.bones.filter((b) => b.ox || b.oy).length} bone(s) offset</span><button class="btn" data-ctx="offreset">Reset all offsets</button>`;
+  if (S.tool === 'physics') opts += sb ? `<label><input type="checkbox" data-dyn="on" ${sb.dyn && sb.dyn.on ? 'checked' : ''}>Physics on <b>${esc(sb.name)}</b></label>${sb.dyn && sb.dyn.on ? `<label>Spring <input type="number" min="1" data-dyn="spring" value="${sb.dyn.spring ?? 60}"></label><label>Damping <input type="number" min="0" step="0.5" data-dyn="damp" value="${sb.dyn.damp ?? 11}"></label><label>Inertia <input type="number" min="0" step="0.1" data-dyn="inertia" value="${sb.dyn.inertia ?? 0.6}"></label><label><input type="checkbox" data-dyn="lockTip" ${sb.dyn.lockTip ? 'checked' : ''}>Stiff (return to neutral faster)</label>` : ''}` : '<span class="chip">Click a bone</span>';
+  if (S.tool === 'force' && Bt) { const fo = Bt.force || {}; opts += `<label>Wind <input type="number" min="0" data-force="windS" value="${fo.windS || 0}"></label><label>Direction° <input type="number" data-force="windA" value="${fo.windA || 0}"></label><label>Turbulence <input type="number" min="0" max="3" step="0.1" data-force="turb" value="${fo.turb || 0}"></label><label>Gravity <input type="number" min="0" data-force="gravS" value="${fo.gravS || 0}"></label><label>Direction° <input type="number" data-force="gravA" value="${fo.gravA ?? 90}"></label>`; }
+  if (S.tool === 'bonesel' && Bt) {
+    if (sb) opts += `<label>Name <input type="text" data-bname value="${esc(sb.name)}" style="width:110px" title="Rename the bone (the label on the bone uses this name)"></label><label>Colour <input type="color" data-bcolor value="${sb.color && sb.color[0] === '#' ? sb.color : '#6e8cff'}"></label>${sb.color ? '<button class="btn" data-ctx="bcolreset" title="Back to the default bone colour">Reset colour</button>' : ''}`;
+    else opts += '<span class="chip">Click a bone to rename, recolour or give it physics</span>';
+    opts += `<label title="Show each bone's name on the bone"><input type="checkbox" data-ctx="blabels" ${S.boneLabels ? 'checked' : ''}>Labels</label>`;
+    if (sb) opts += '<span class="sep"></span><span class="chip">Physics</span>' + sb ? `<label><input type="checkbox" data-dyn="on" ${sb.dyn && sb.dyn.on ? 'checked' : ''}>Physics on <b>${esc(sb.name)}</b></label>${sb.dyn && sb.dyn.on ? `<label>Spring <input type="number" min="1" data-dyn="spring" value="${sb.dyn.spring ?? 60}"></label><label>Damping <input type="number" min="0" step="0.5" data-dyn="damp" value="${sb.dyn.damp ?? 11}"></label><label>Inertia <input type="number" min="0" step="0.1" data-dyn="inertia" value="${sb.dyn.inertia ?? 0.6}"></label><label><input type="checkbox" data-dyn="lockTip" ${sb.dyn.lockTip ? 'checked' : ''}>Stiff (return to neutral faster)</label>` : ''}` : '<span class="chip">Click a bone</span>';
+    if (Bt.bones.some((b) => b.dyn && b.dyn.on)) { opts += '<span class="sep"></span><span class="chip" title="Drag on empty stage space to set the wind">Force</span>'; const fo = Bt.force || {}; opts += `<label>Wind <input type="number" min="0" data-force="windS" value="${fo.windS || 0}"></label><label>Direction° <input type="number" data-force="windA" value="${fo.windA || 0}"></label><label>Turbulence <input type="number" min="0" max="3" step="0.1" data-force="turb" value="${fo.turb || 0}"></label><label>Gravity <input type="number" min="0" data-force="gravS" value="${fo.gravS || 0}"></label><label>Direction° <input type="number" data-force="gravA" value="${fo.gravA ?? 90}"></label>`;  }
+  }
+  if (S.tool === 'select' || S.tool === 'rotxy') opts += layerPosHTML();
+  if (S.tool === 'bindpts' && Bt) { const Lb = selLayer(), groups = (Lb && Lb.pointGroups) || [];
+    opts += `<label>Bone <select data-ctx="bindbone"><option value="">— select bone —</option>${Bt.bones.map((b) => `<option value="${b.id}" ${b.id === S.selBone ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select></label>`
+      + `<select data-ctx="bindgroup" aria-label="Select point group"><option value="">Select group</option>${groups.map((g) => `<option value="${g.id}">${esc(g.name)}</option>`).join('')}</select>`
+      + `<button class="btn" data-cmd="rig.bindpts" title="Assign the selected points to the selected bone (Space)">Bind points</button><button class="btn" data-cmd="rig.unbindpts" title="Release the selected points: no bone moves them">Un-bind points</button><button class="btn" data-cmd="rig.flexipts" title="Return the selected points to automatic flexi-binding">Flexi-bind points</button>`
+      + `<label><input type="checkbox" data-ctx="bindlasso" ${typeof VEC !== 'undefined' && VEC.lasso ? 'checked' : ''}>Lasso mode</label><span class="chip">${S.selPts.size} point(s) selected · Alt-click a bone to target it</span>`; }
+  if (S.tool === 'reparent') opts += `<span class="chip">${selectedBoneIds().length ? 'Moving: ' + esc(selectedBoneIds().map((id) => (boneOf(Bt, id) || {}).name).join(', ')) + ' → click the new parent' : 'Select bone(s) first'}</span>`;
+  if (S.tool === 'emitter') opts += `<label>Preset <select id="emPreset">${Object.keys(PARTICLE_PRESETS).map((k) => `<option ${k === TOOLS.emitter.opts.preset ? 'selected' : ''}>${k}</option>`).join('')}</select></label>`;
+  if (S.tool === 'camera') opts += `<button class="btn" id="camReset">Reset camera key</button>`;
+  if (opts) h += '<span class="sep"></span>' + opts;
+  h += '<span class="sep"></span>' + contextHTML();
+  if (el._h === h) return; el._h = h;
+  el.innerHTML = h;
+  el.querySelectorAll('[data-o]').forEach((i) => (i.oninput = () => { const k = i.dataset.o; ns[k] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value; el._h = ''; }));
+  el.querySelectorAll('[data-g]').forEach((i) => (i.oninput = () => { const k = i.dataset.g; S[k] = i.type === 'checkbox' ? i.checked : +i.value; el._h = ''; }));
+  el.querySelectorAll('[data-pen]').forEach((i) => (i.oninput = () => { TOOLS.pen.opts.smooth = i.checked; el._h = ''; }));
+  el.querySelectorAll('[data-cmd]').forEach((b) => (b.onclick = () => runCmd(b.dataset.cmd)));
+  el.querySelectorAll('[data-tool]').forEach((b) => (b.onclick = () => setTool(b.dataset.tool)));
+  el.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+  const L = selLayer(), SW = L && L.type === 'switch' ? L : null;
+  const on = (k, ev, fn) => { const x = el.querySelector(`[data-ctx="${k}"]`); if (x) x[ev] = fn; };
+  on('swpick', 'onchange', (e) => { S.swPreview[SW.id] = e.target.value; e.target.blur(); refreshAll(); });
+  on('swprev', 'onclick', () => swPreviewStep(SW, -1)); on('swnext', 'onclick', () => swPreviewStep(SW, 1));
+  on('swset', 'onclick', () => swSetActive(SW)); on('swclear', 'onclick', () => { delete S.swPreview[SW.id]; refreshAll(); });
+  on('swalign', 'onclick', () => alignAlternatives(SW)); on('swoverlay', 'onchange', (e) => { S.alignOverlay = e.target.checked; el._h = ''; requestDraw(); });
+  on('swactivatesel', 'onclick', () => swSetActive(parentOf(L.id), L.id));
+  on('poseparent', 'onclick', () => setTool('bonemanip'));
+  on('preset', 'onchange', (e) => { if (e.target.value) edit('Particle preset', () => applyParticlePreset(L, e.target.value)); });
+  el.querySelectorAll('[data-lpivot]').forEach(i => (i.onchange = () => {const L=selLayer(), v=+i.value;if(L&&Number.isFinite(v))edit('Move pivot',()=>{assertWritable(L);L.p[i.dataset.lpivot]=round(clamp(v,-1e7,1e7),3);});i.blur();}));
+  el.querySelectorAll('[data-lpos]').forEach((i) => (i.onchange = () => { const L = selLayer(), v = +i.value; if (L && Number.isFinite(v)) edit('Layer position', () => setVal(L, i.dataset.lpos, round(clamp(v, i.dataset.lpos === 'opacity' ? 0 : -1e7, i.dataset.lpos === 'opacity' ? 1 : 1e7), 3))); i.blur(); }));
+  if (Bt) {
+    el.querySelectorAll('[data-bopt]').forEach((i) => (i.onchange = () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone ' + i.dataset.bopt, () => (b[i.dataset.bopt] = Math.max(0, +i.value))); el._h = ''; }));
+    el.querySelectorAll('[data-dyn]').forEach((i) => (i.onchange = () => { const b = boneOf(Bt, S.selBone); if (!b) return; edit('Bone physics', () => { b.dyn = { spring: 60, damp: 11, inertia: 0.6, ...(b.dyn || {}) }; b.dyn[i.dataset.dyn] = i.type === 'checkbox' ? i.checked : +i.value; }); el._h = ''; }));
+    el.querySelectorAll('[data-force]').forEach((i) => (i.onchange = () => { edit('Force', () => { Bt.force = Bt.force || {}; Bt.force[i.dataset.force] = +i.value; }); el._h = ''; }));
+    const bn = el.querySelector('[data-bname]');
+    if (bn) { bn.onchange = () => { const b = boneOf(Bt, S.selBone), v = bn.value.trim(); if (b && v && v !== b.name) edit('Rename bone', () => (b.name = v)); el._h = ''; }; bn.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') bn.blur(); }; }
+    const bc = el.querySelector('[data-bcolor]');
+    if (bc) bc.onchange = () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone colour', () => (b.color = bc.value)); el._h = ''; };
+    on('bcolreset', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone colour', () => delete b.color); });
+    on('blabels', 'onchange', (e) => { S.boneLabels = e.target.checked; try { localStorage.setItem('popai.boneLabels', S.boneLabels ? '1' : '0'); } catch {} el._h = ''; requestDraw(); });
+    el.querySelectorAll('[data-sk]').forEach((i) => (i.onchange = () => { TOOLS.sketch.opts[i.dataset.sk] = Math.max(0, +i.value); el._h = ''; }));
+    on('strauto', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone strength', () => (b.str = round(b.len * 0.45))); });
+    on('strzero', 'onclick', () => { const b = boneOf(Bt, S.selBone); if (b) edit('Bone strength', () => (b.str = 0)); });
+    on('vtarget', 'onchange', (e) => { TOOLS.vitruvian.opts.target = e.target.value; e.target.blur(); el._h = ''; });
+    on('vadd', 'onclick', async () => { const n = await askText('Vitruvian construction', 'Group name (e.g. Side arm, Front arm)', 'Construction ' + ((Bt.vgroups || []).length + 1)); if (!n) return; edit('Add construction', () => { Bt.vgroups = [...(Bt.vgroups || []), n]; }); TOOLS.vitruvian.opts.target = n; el._h = ''; refreshAll(); });
+    on('vactive', 'onchange', (e) => { const v = e.target.value; e.target.blur(); edit('Active construction', () => setVal(Bt, 'vit', v, S.frame, true)); });
+    on('bindbone', 'onchange', (e) => { e.target.blur(); const Lb = selLayer(); if (e.target.value && Lb && Lb.pts) bindTargetBone(Lb, e.target.value); else { selectBone(null); refreshAll(); } });
+    on('bindgroup', 'onchange', (e) => { e.target.blur(); const Lb = selLayer(), g = Lb && (Lb.pointGroups || []).find((x) => x.id === e.target.value); if (g) { S.selPts = new Set(g.points.filter((id) => Lb.pts[id])); refreshAll(); } });
+    on('bindlasso', 'onchange', (e) => { VEC.lasso = e.target.checked; el._h = ''; });
+    on('offreset', 'onclick', () => edit('Reset offsets', () => Bt.bones.forEach((b) => { b.ox = 0; b.oy = 0; })));
+  }
+  const pd = $('#penDone'); if (pd) pd.onclick = () => finishPen(false);
+  const ep = $('#emPreset'); if (ep) ep.onchange = () => (TOOLS.emitter.opts.preset = ep.value);
+  const cr = $('#camReset'); if (cr) cr.onclick = () => edit('Reset camera', () => { const c = S.doc.camera; for (const k of ['x', 'y', 'zoom', 'roll']) setVal(c, k, k === 'zoom' ? 1 : 0); });
+}
+
+// Subdued context surfaces keep interpolation and selected-key colors unchanged.
+function timelineContextTheme(){
+  const action=typeof actActive==='function'?actActive()?.action:null;
+  if(action?.kind==='smart')return {kind:'smart',background:'#292334',range:'#342c42',ruler:'#211b2c'};
+  if(action)return {kind:'regular',background:'#193034',range:'#223c40',ruler:'#14282c'};
+  return {kind:'mainline',background:'#1d2026',range:'#23262e',ruler:'#16181d'};
+}
+/* ===================== Popai Animator — timeline (dope sheet + curve editor), playback, audio ===================== */
+
+const TL = { cv: null, ctx: null, dpr: 1, ppf: 14, scrollX: 0, scrollY: 0, mode: 'dope', rows: [], drag: null, NAMEW: 0, RULER: 24, clip: null, curveView: null, pins: new Set(), consolidate: false, contextKey: '', contextHTML: '' };
+
+// ---------- channel naming / grouping ----------
+const CH_LABEL = { x: 'Position X', y: 'Position Y', z: 'Depth Z', rot: 'Rotation', sx: 'Scale X', sy: 'Scale Y', opacity: 'Opacity', sw: 'Switch', color: 'Color', zoom: 'Zoom', roll: 'Roll', shake: 'Shake', shakeFreq: 'Shake freq', gain: 'Gain', visible: 'Render visibility', vit: 'Vitruvian selection' };
+function channelGroups(o) {
+  const groups = new Map();
+  const add = (key,label,path,selected=false) => { if(!groups.has(key))groups.set(key,{key,label,paths:[],selected});groups.get(key).paths.push(path); };
+  const primary=selLayer(),rig=activeBoneLayer(),bones=rig===o?new Set(selectedBoneIds()):new Set();
+  const boneNames={a:'Bone angle',p:'Bone translation',s:'Bone scale'};
+  for(const path of Object.keys(o.ch).sort()) {
+    if(!o.ch[path]?.keys.length)continue;
+    const [kind,id,prop]=path.split(':');
+    if(kind==='pt') { add('pts','Point motion',path);if(primary===o&&S.selPts.has(id))add('selected:pts','Selected point motion',path,true); }
+    else if(kind==='bone') {const label=boneNames[prop]||('Bone '+prop);add('bones:'+prop,label,path);if(bones.has(id))add('selected:bones:'+prop,'Selected '+label.toLowerCase(),path,true);}
+    else if(kind==='fx') {const e=o.fx.find(e=>e.id===id);add(path,(e&&FX[e.type]?FX[e.type].label:'Effect')+' · '+prop,path);}
+    else if(kind==='pv'){const label=({c:'Curvature',hin:'Bézier in',hout:'Bézier out',width:'Line width',alpha:'Point opacity',color:'Point color',strength:'Point color strength'})[prop]||prop;add('point:'+prop,label,path);if(primary===o&&S.selPts.has(id))add('selected:point:'+prop,'Selected '+label.toLowerCase(),path,true);}
+    else if(kind==='curve'){const label=prop.startsWith('hide_')?'Hidden edges':({start:'Stroke exposure start',end:'Stroke exposure end',repeats:'Profile repeats',offset:'Profile offset'})[prop]||prop;add('curves:'+label,label,path);const p=o.paths?.find(p=>p.id===id),shape=o.shapes?.find(s=>s.id===S.selShape);if(primary===o&&(shape?.paths.includes(id)||p?.pts.some(id=>S.selPts.has(id))))add('selected:curves:'+label,'Selected '+label.toLowerCase(),path,true);}
+    else if(kind==='sh')add(path,'Shape '+prop,path);
+    else add(path,CH_LABEL[path]||path,path);
+  }
+  return [...groups.values()];
+}
+function chanName(o, path) {
+  const [kind, id, prop] = path.split(':');
+  if (kind === 'bone') { const b = o.bones && o.bones.find((x) => x.id === id); return (b ? b.name : 'Bone') + ' ' + ({ a: 'angle', p: 'offset', s: 'stretch' }[prop] || prop); }
+  if (kind === 'fx') { const e = o.fx.find((x) => x.id === id); return (e ? FX[e.type].label : 'Effect') + ' ' + prop; }
+  if (kind === 'pt') return 'Point ' + id.slice(-4);
+  if (kind === 'pv') return 'Point '+id.slice(-4)+' · '+({c:'curvature',hin:'Bézier in',hout:'Bézier out',width:'line width',alpha:'opacity',color:'color',strength:'color strength'}[prop]||prop);
+  if (kind === 'curve') return 'Curve '+id.slice(-4)+' · '+(prop.startsWith('hide_')?'hidden edge':prop);
+  if (kind === 'sh') return 'Shape ' + prop;
+  return CH_LABEL[path] || path;
+}
+function rowFrames(o, paths) { const s = new Set(); for (const p of paths) { const c = o.ch[p]; if (c) c.keys.forEach((k) => s.add(k.f)); } return [...s].sort((a, b) => a - b); }
+
+function timelineOwners() {
+  const owners=[],seen=new Set();
+  const add=o=>{if(o&&!seen.has(o.id)){seen.add(o.id);owners.push(o);}};
+  if(S.camSel)add(S.doc.camera);else S.selLayers.forEach(id=>add(findLayer(id)));
+  // Bone tools may edit the parent rig while its artwork remains selected.
+  if(BONE_TOOLS.has(S.tool))add(activeBoneLayer());
+  for(const id of [...TL.pins]) {const o=getOwner(id);if(o)add(o);else TL.pins.delete(id);}
+  return S.doc.activeAction ? owners.filter(o=>actOwnsLayer(o)&&o.type!=='audio') : owners;
+}
+function buildRows() {
+  const owners=timelineOwners(),rows=actActive()?[]:[{kind:'markers',h:18,paths:[]}];
+  for(const o of owners) {
+    const groups=channelGroups(o),paths=groups.filter(g=>!g.selected).flatMap(g=>g.paths);
+    rows.push({kind:'layer',owner:o,label:o.name,depth:0,h:o.type==='audio'?44:20,paths:TL.consolidate?paths:[]});
+    if(!TL.consolidate)for(const g of groups)rows.push({kind:'chan',owner:o,label:g.label,paths:g.paths,depth:0,h:20,gkey:g.key,selected:g.selected});
+    if(!paths.length)rows.push({kind:'empty',owner:o,label:'No animation keys on this layer',paths:[],h:22});
+  }
+  if(!owners.length)rows.push({kind:'empty',label:'Select a layer in the Layers panel to see its animation',paths:[],h:28});
+  const context=JSON.stringify(owners.map(o=>[o.id,channelGroups(o).map(g=>[g.key,g.paths])]).concat([TL.consolidate]));
+  if(context!==TL.contextKey) {
+    const old=TL.contextKey;TL.contextKey=context;
+    const visible=new Set(rows.filter(r=>r.owner).flatMap(r=>r.paths.map(p=>r.owner.id+'|'+p)));
+    S.selKeys=new Set([...S.selKeys].filter(k=>visible.has(k.split('|').slice(0,2).join('|'))));
+    if(old)TL.scrollY=0;
+  }
+  // Rebind after undo/redo: never retain a replaced layer object in the graph.
+  const active=TL.active&&rows.find(r=>r.kind==='chan'&&r.owner.id===TL.active.owner.id&&r.gkey===TL.active.gkey);
+  let next=active;
+  if(!next){const primary=S.camSel?'CAM':selLayer()?.id;next=rows.find(r=>r.kind==='chan'&&r.owner.id===primary&&r.selected)||rows.find(r=>r.kind==='chan'&&r.owner.id===primary)||rows.find(r=>r.kind==='chan');}
+  TL.active=next?{owner:next.owner,paths:next.paths,gkey:next.gkey,label:next.label}:null;
+  let y=0;for(const r of rows){r.y=y;y+=r.h;}TL.rows=rows;TL.totalH=y;return rows;
+}
+function selectVisibleTimelineKeys(){buildRows();S.selKeys=new Set();for(const r of TL.rows)if(r.owner)for(const p of r.paths)for(const k of r.owner.ch[p]?.keys||[])S.selKeys.add(kid(r.owner,p,k.f));requestDraw();}
+function keyCurrentTimelinePose(){
+  if(S.mode==='setup'||S.frame===0)return toast('Move to an animation frame before keying a pose','err');
+  const rig=BONE_TOOLS.has(S.tool)?activeBoneLayer():null;
+  const primary=selLayer();
+  return edit('Key current pose',()=>{
+    if(rig){const selected=new Set(selectedBoneIds().filter(id=>rig.bones.some(b=>b.id===id))),bones=rig.bones.filter(b=>!selected.size||selected.has(b.id));for(const b of bones)for(const p of ['a','p','s']){const path='bone:'+b.id+':'+p;setVal(rig,path,val(rig,path,S.frame),S.frame,true);}return;}
+    if(primary?.type==='vector'&&['points','curvature'].includes(S.tool)){const points=S.selPts.size?[...S.selPts]:Object.keys(primary.pts);for(const id of points){const path='pt:'+id;if(primary.pts[id])setVal(primary,path,val(primary,path,S.frame),S.frame,true);}return;}
+    for(const o of S.camSel?[S.doc.camera]:S.selLayers.map(id=>findLayer(id)).filter(Boolean)){for(const path of o.id==='CAM'?['x','y','zoom','roll','shake']:['x','y','z','rot','sx','sy','opacity'])setVal(o,path,val(o,path,S.frame),S.frame,true);}
+  });
+}
+function renderTimelineContext(){
+  const el=$('#tlcontext');if(!el)return;
+  const owners=timelineOwners(),channels=TL.rows.filter(r=>r.kind==='chan');
+  const html='<span class="tl-scope" title="Only selected and pinned owners are displayed">'+esc(owners.map(o=>o.name).join(' · ')||'No layer selected')+'</span>'+
+    '<select id="tlChannel" aria-label="Timeline channel" title="Choose a channel; hover a timeline row to identify it"><option value="">'+(channels.length?'Choose channel':'No animated channels')+'</option>'+channels.map((r,i)=>'<option value="'+i+'" '+(TL.active&&TL.active.owner.id===r.owner.id&&TL.active.gkey===r.gkey?'selected':'')+'>'+esc(r.owner.name+' · '+r.label)+'</option>').join('')+'</select>'+
+    '<button class="ib sm" id="tlPin" title="Keep the current selection visible when selecting another layer">Pin selection</button>'+
+    '<button class="ib sm" id="tlUnpin" title="Remove all timeline pins">Clear pins ('+TL.pins.size+')</button>'+
+    '<label><input type="checkbox" id="tlConsolidate" '+(TL.consolidate?'checked':'')+'> Consolidate keys</label>';
+  if(el._content===html)return;el._content=html;el.innerHTML=html;
+  $('#tlChannel').onchange=e=>{const r=e.target.value!==''&&channels[+e.target.value];if(r){TL.active={owner:r.owner,paths:r.paths,gkey:r.gkey,label:r.label};TL.scrollY=r.y;requestDraw();}};
+  $('#tlPin').onclick=()=>{(S.camSel?['CAM']:S.selLayers).forEach(id=>TL.pins.add(id));requestDraw();};
+  $('#tlUnpin').onclick=()=>{TL.pins.clear();requestDraw();};
+  $('#tlConsolidate').onchange=e=>{TL.consolidate=e.target.checked;if(TL.consolidate)TL.mode='dope';renderTLBar();requestDraw();};
+}
+const fx2x = (f) => TL.NAMEW + 8 + f * TL.ppf - TL.scrollX;
+const x2f = (x) => (x - TL.NAMEW - 8 + TL.scrollX) / TL.ppf;
+const kid = (o, path, f) => `${o.id}|${path}|${f}`;
+
+// ---------- drawing ----------
+function renderTimeline() {
+  const cv = TL.cv, ctx = TL.ctx, r = cv.getBoundingClientRect(), dpr = (TL.dpr = Math.min(2, window.devicePixelRatio || 1));
+  const W = Math.max(10, Math.round(r.width * dpr)), Hh = Math.max(10, Math.round(r.height * dpr));
+  if (cv.width !== W || cv.height !== Hh) { cv.width = W; cv.height = Hh; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = r.width, h = r.height, d = { ...S.doc, end:timelineEnd(), markers:timelineMarkers() };
+  const contextTheme=timelineContextTheme();
+  ctx.fillStyle = contextTheme.background; ctx.fillRect(0, 0, w, h);
+  buildRows();
+  renderTimelineContext();
+  TL.scrollY = clamp(TL.scrollY, 0, Math.max(0, TL.totalH - (h - TL.RULER) + 20));
+  const top = TL.RULER;
+  // frame area background: work range
+  const xe = fx2x(d.end + 1);
+  ctx.fillStyle = contextTheme.range; ctx.fillRect(TL.NAMEW, top, Math.max(0, Math.min(w, xe) - TL.NAMEW), h - top);
+  // grid lines
+  const step = TL.ppf < 4 ? 10 : TL.ppf < 8 ? 5 : 1;
+  const f0 = Math.max(0, Math.floor(x2f(TL.NAMEW))), f1 = Math.ceil(x2f(w));
+  for (let f = f0; f <= f1; f++) {
+    const x = Math.round(fx2x(f)) + 0.5;
+    if (f % d.fps === 0) { ctx.fillStyle = 'rgba(255,255,255,.07)'; ctx.fillRect(x - 0.5, top, 1, h - top); }
+    else if (f % step === 0 && TL.ppf >= 6) { ctx.fillStyle = 'rgba(255,255,255,.025)'; ctx.fillRect(x - 0.5, top, 1, h - top); }
+  }
+  if (TL.mode === 'curves') drawCurves(ctx, w, h);
+  else drawRows(ctx, w, h);
+  if (S.mode === 'setup') {
+    ctx.fillStyle = 'rgba(22,24,29,.55)'; ctx.fillRect(TL.NAMEW, top, w - TL.NAMEW, h - top);
+    ctx.fillStyle = '#ff8a3d'; ctx.font = '600 12px Inter, system-ui'; ctx.textBaseline = 'middle';
+    ctx.fillText('SETUP MODE — the rest pose has no keys. Click the timeline or press Tab to animate.', TL.NAMEW + 24, top + 40);
+  }
+  // ruler
+  ctx.fillStyle = contextTheme.ruler; ctx.fillRect(0, 0, w, top);
+  ctx.fillStyle = '#9099a8'; ctx.font = '10px Inter, system-ui, sans-serif'; ctx.textBaseline = 'middle';
+  const lab = TL.ppf < 3 ? d.fps : TL.ppf < 7 ? 10 : TL.ppf < 24 ? 5 : 1;
+  for (let f = f0; f <= f1; f++) {
+    const x = fx2x(f);
+    if (x < TL.NAMEW) continue;
+    if (f % lab === 0) { ctx.fillRect(x, top - 8, 1, 8); ctx.fillText(String(f), x + 2, 9); }
+    else if (TL.ppf >= 5) ctx.fillRect(x, top - 4, 1, 4);
+  }
+  // markers in ruler
+  for (const m of d.markers) {
+    const x = fx2x(m.f); if (x < TL.NAMEW) continue;
+    ctx.fillStyle = m.color || '#5ccf8a'; ctx.beginPath(); ctx.moveTo(x - 5, top - 10); ctx.lineTo(x + 5, top - 10); ctx.lineTo(x, top - 3); ctx.fill();
+  }
+  // Full-width ruler; layer selection lives in the main Layers panel.
+  ctx.fillStyle = '#343a46'; ctx.fillRect(0, top - 1, w, 1);
+  // playhead
+  const px = fx2x(S.frame);
+  if (px >= TL.NAMEW) {
+    ctx.fillStyle = 'rgba(255,93,93,.22)'; ctx.fillRect(px, top, Math.max(1, TL.ppf), h - top);
+    ctx.fillStyle = '#ff5d5d'; ctx.fillRect(px, 0, 1.5, h);
+    ctx.beginPath(); ctx.roundRect(px - 13, 2, 27 + String(S.frame).length * 2, 14, 3); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '600 10px Inter, system-ui'; ctx.textAlign = 'center'; ctx.fillText(String(S.frame), px + 1 + String(S.frame).length, 9); ctx.textAlign = 'left';
+  }
+  // end marker
+  if (xe > TL.NAMEW) { ctx.fillStyle = '#ff8a3d'; ctx.fillRect(xe, top, 1, h - top); }
+  // marquee
+  if (TL.drag && TL.drag.mode === 'marquee' && TL.drag.r) { const [x0, y0, x1, y1] = TL.drag.r; ctx.strokeStyle = '#fff'; ctx.setLineDash([3, 3]); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0); ctx.setLineDash([]); }
+  const fr = $('#tlFrame'); if (fr && document.activeElement !== fr) fr.value = S.frame;
+}
+function drawRows(ctx, w, h) {
+  const top = TL.RULER, d = { ...S.doc, markers:timelineMarkers() };
+  ctx.save(); ctx.beginPath(); ctx.rect(0, top, w, h - top); ctx.clip();
+  for (const r of TL.rows) {
+    const y = top + r.y - TL.scrollY; if (y + r.h < top || y > h) continue;
+    const isSel = r.kind === 'layer' && (r.owner.id === 'CAM' ? S.camSel : S.selLayers.includes(r.owner.id));
+    const isAct = r.kind === 'chan' && TL.active && TL.active.owner === r.owner && TL.active.gkey === r.gkey;
+    ctx.fillStyle = isSel ? 'rgba(61,111,214,.35)' : isAct ? 'rgba(255,138,61,.14)' : r.kind === 'chan' ? 'rgba(0,0,0,.12)' : 'transparent';
+    ctx.fillRect(0, y, w, r.h);
+    ctx.fillStyle = 'rgba(255,255,255,.04)'; ctx.fillRect(0, y + r.h - 1, w, 1);
+    if (r.kind === 'markers') {
+      ctx.fillStyle = '#636c7b'; ctx.font = '10px Inter, system-ui'; ctx.textBaseline = 'middle'; 
+      for (const m of d.markers) { const x = fx2x(m.f); if (x < TL.NAMEW - 2) continue; ctx.fillStyle = m.color || '#5ccf8a'; ctx.fillRect(x, y + 2, 2, r.h - 4); ctx.fillText(m.name, x + 4, y + r.h / 2); }
+      continue;
+    }
+    const L = r.owner;
+    if(r.kind==='empty'){ctx.fillStyle='#9099a8';ctx.font='11px Inter, system-ui';ctx.textBaseline='middle';ctx.fillText(r.label,10,y+r.h/2);continue;}
+    if(r.kind==='layer'&&!TL.consolidate){ctx.fillStyle='#b9c4d4';ctx.font='600 11px Inter, system-ui';ctx.textBaseline='middle';ctx.fillText(r.owner.name+(TL.pins.has(r.owner.id)?' · pinned':''),8,y+10);}
+    // audio waveform
+    if (r.kind === 'layer' && L.type === 'audio') drawWave(ctx, L, y, r.h);
+    // keys
+    const frames = rowFrames(L, r.paths);
+    const cy = y + Math.min(r.h, 20) / 2;
+    for (const f of frames) {
+      const x = fx2x(f) + TL.ppf / 2; if (x < TL.NAMEW || x > w + 6) continue;
+      let sel = false, interp = 'smooth', kk = null;
+      for (const p of r.paths) { const k = L.ch[p] && L.ch[p].keys.find((k) => k.f === f); if (k) { interp = k.i || 'smooth'; if (!kk || k.lb || k.hold) kk = k; if (S.selKeys.has(kid(L, p, f))) sel = true; } }
+      const s = r.kind === 'chan' ? 4.5 : 5.5;
+      if (kk && kk.hold) { ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(x, cy - 1.5, kk.hold * TL.ppf, 3); }
+      if (kk && kk.lb) { ctx.strokeStyle = kk.lb; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, cy, s + 3, 0, Math.PI * 2); ctx.stroke(); }
+      if (interp === 'cycle') { ctx.fillStyle = INTERP_COLORS.cycle; ctx.font = '11px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText('↻', x + s + 2, cy); }
+      if (kk && (kk.iv > 1 || kk.stg)) { ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '9px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText(kk.stg ? 'stg' : '×' + kk.iv, x + s + 2, cy + 7); }
+      ctx.beginPath(); ctx.moveTo(x, cy - s); ctx.lineTo(x + s, cy); ctx.lineTo(x, cy + s); ctx.lineTo(x - s, cy); ctx.closePath();
+      ctx.fillStyle = sel ? '#ffffff' : INTERP_COLORS[interp] || '#7fb4ff'; ctx.fill();
+      ctx.strokeStyle = sel ? '#ff8a3d' : 'rgba(0,0,0,.6)'; ctx.lineWidth = sel ? 2 : 1; ctx.stroke();
+      if (r.paths.includes('sw')) {
+        const k = L.ch.sw.keys.find((k) => k.f === f), c = k && L.children && L.children.find((c) => c.id === k.v);
+        if (c && TL.ppf >= 5) { ctx.fillStyle = '#ffd166'; ctx.font = '10px Inter, system-ui'; ctx.fillText(c.name, x + 7, cy); }
+      }
+    }
+  }
+  ctx.restore();
+}
+function audioPeaks(m) {
+  if (m.peaks || !m.buffer) return m.peaks;
+  const ch = m.buffer.getChannelData(0), per = Math.floor(m.buffer.sampleRate / 200), n = Math.ceil(ch.length / per), pk = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let mx = 0; for (let j = i * per, e = Math.min(ch.length, j + per); j < e; j++) { const v = Math.abs(ch[j]); if (v > mx) mx = v; } pk[i] = mx; }
+  return (m.peaks = pk);
+}
+function drawWave(ctx, L, y, h) {
+  const m = S.media[L.media]; if (!m || !m.buffer) return;
+  const pk = audioPeaks(m), fps = S.doc.fps, x0 = fx2x(L.offset), dur = m.buffer.duration, x1 = fx2x(L.offset + dur * fps);
+  ctx.fillStyle = 'rgba(92,207,138,.12)'; ctx.fillRect(Math.max(TL.NAMEW, x0), y + 2, Math.max(0, x1 - Math.max(TL.NAMEW, x0)), h - 4);
+  ctx.fillStyle = L.mute ? '#636c7b' : '#5ccf8a';
+  const cy = y + h / 2 + 2, amp = (h - 10) / 2, g = val(L, 'gain', S.frame);
+  for (let x = Math.max(TL.NAMEW, Math.floor(x0)); x < Math.min(TL.cv.width / TL.dpr, x1); x++) {
+    const t = (x2f(x) - L.offset) / fps, i = Math.floor(t * 200); if (i < 0 || i >= pk.length) continue;
+    const v = Math.min(1, pk[i] * g) * amp; ctx.fillRect(x, cy - v, 1, Math.max(1, v * 2));
+  }
+}
+
+// ---------- curve editor ----------
+function curveTargets() {
+  const a = TL.active; if (!a) return [];
+  const out = [];
+  for (const p of a.paths) {
+    const ch = a.owner.ch[p]; if (!ch || !ch.keys.length) continue;
+    const v0 = ch.keys[0].v;
+    if (typeof v0 === 'number') out.push({ path: p, comp: -1 });
+    else if (Array.isArray(v0)) v0.forEach((_, i) => out.push({ path: p, comp: i }));
+  }
+  return out.slice(0, 12);
+}
+const CURVE_COLORS = ['#ff6b6b', '#4dabf7', '#69db7c', '#ffd43b', '#da77f2', '#ff922b', '#3bc9db', '#f783ac'];
+function curveRange(ts) {
+  let lo = Infinity, hi = -Infinity; const o = TL.active.owner;
+  for (const t of ts) for (let f = 0; f <= timelineEnd(); f += Math.max(1, Math.round(timelineEnd() / 200))) { let v = val(o, t.path, f); if (t.comp >= 0) v = v[t.comp]; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  for (const t of ts) for (const k of o.ch[t.path].keys) { const v = t.comp >= 0 ? k.v[t.comp] : k.v; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.12; return [lo - pad, hi + pad];
+}
+function drawCurves(ctx, w, h) {
+  const top = TL.RULER, ts = curveTargets();
+  ctx.fillStyle = '#9099a8'; ctx.font = '11px Inter, system-ui'; ctx.textBaseline = 'middle';
+  if (!ts.length) { ctx.fillText('Choose a channel above or select a key in the Dope Sheet.', TL.NAMEW + 16, top + 30); return; }
+  const o = TL.active.owner, [lo, hi] = curveRange(ts);
+  const vy = (v) => top + 10 + (1 - (v - lo) / (hi - lo)) * (h - top - 20);
+  TL.curveView = { lo, hi, vy, inv: (y) => lo + (1 - (y - top - 10) / (h - top - 20)) * (hi - lo) };
+  TL.bzHandles = [];
+  // value grid
+  ctx.strokeStyle = 'rgba(255,255,255,.06)';
+  for (let i = 0; i <= 4; i++) { const v = lo + ((hi - lo) * i) / 4, y = vy(v); ctx.beginPath(); ctx.moveTo(TL.NAMEW, y); ctx.lineTo(w, y); ctx.stroke(); ctx.fillStyle = '#636c7b'; ctx.fillText(round(v, 2), TL.NAMEW + 4, y - 6); }
+  ts.forEach((t, i) => {
+    const col = CURVE_COLORS[i % CURVE_COLORS.length];
+    ctx.fillStyle = col; ctx.fillText(`${chanName(o, t.path)}${t.comp >= 0 ? (t.comp ? ' · y' : ' · x') : ''}`, 10, top + 12 + i * 16);
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.beginPath();
+    const fA = Math.max(0, Math.floor(x2f(TL.NAMEW))), fB = Math.ceil(x2f(w));
+    for (let f = fA; f <= fB; f += 0.25) { let v = val(o, t.path, f); if (t.comp >= 0) v = v[t.comp]; const x = fx2x(f) + TL.ppf / 2, y = vy(v); f === fA ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+    ctx.stroke();
+    const kl = o.ch[t.path].keys;
+    for (let j = 0; j < kl.length - 1; j++) {
+      const a = kl[j], b = kl[j + 1]; if (a.i !== 'bezier') continue;
+      const av = t.comp >= 0 ? a.v[t.comp] : a.v, bv = t.comp >= 0 ? b.v[t.comp] : b.v, dv = bv - av, span = b.f - a.f, bz = a.bz || [0.33, 0, 0.67, 1];
+      if (typeof av !== 'number' || Math.abs(dv) < 1e-9) continue;
+      const ax = fx2x(a.f) + TL.ppf / 2, ay = vy(av), bx = fx2x(b.f) + TL.ppf / 2, by = vy(bv);
+      const h1 = [fx2x(a.f + bz[0] * span) + TL.ppf / 2, vy(av + bz[1] * dv)], h2 = [fx2x(a.f + bz[2] * span) + TL.ppf / 2, vy(av + bz[3] * dv)];
+      ctx.strokeStyle = 'rgba(255,169,77,.8)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(h1[0], h1[1]); ctx.moveTo(bx, by); ctx.lineTo(h2[0], h2[1]); ctx.stroke();
+      ctx.fillStyle = '#ffa94d'; for (const h of [h1, h2]) ctx.fillRect(h[0] - 3.5, h[1] - 3.5, 7, 7);
+      TL.bzHandles.push({ o, path: t.path, comp: t.comp, f: a.f, which: 1, x: h1[0], y: h1[1], av, dv, span }, { o, path: t.path, comp: t.comp, f: a.f, which: 2, x: h2[0], y: h2[1], av, dv, span });
+    }
+    for (const k of o.ch[t.path].keys) {
+      const v = t.comp >= 0 ? k.v[t.comp] : k.v, x = fx2x(k.f) + TL.ppf / 2, y = vy(v), sel = S.selKeys.has(kid(o, t.path, k.f));
+      ctx.fillStyle = sel ? '#fff' : col; ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x, y, sel ? 5 : 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+  });
+}
+
+// ---------- interaction ----------
+function rowAt(y) { const yy = y - TL.RULER + TL.scrollY; return TL.rows.find((r) => yy >= r.y && yy < r.y + r.h) || null; }
+function keyHit(r, x) {
+  if (!r || r.kind === 'markers') return null;
+  const frames = rowFrames(r.owner, r.paths);
+  let best = null, bd = 7;
+  for (const f of frames) { const d = Math.abs(fx2x(f) + TL.ppf / 2 - x); if (d < bd) { bd = d; best = f; } }
+  return best;
+}
+function selectRowKeys(r, f, add) {
+  if (!add) S.selKeys = new Set();
+  for (const p of r.paths) if (keyAt(r.owner, p, f)) S.selKeys.add(kid(r.owner, p, f));
+}
+function parseKid(k) { const [oid, path, f] = k.split('|'); return { o: getOwner(oid), path, f: +f }; }
+function moveSelectedKeys(base, df) {
+  // base: [{oid,path,f,k}] snapshot at drag start; doc already restored to drag-start state
+  const items = base.map((b) => ({ ...b, o: getOwner(b.oid) })).filter((b) => b.o && b.o.ch[b.path] && (!actActive() || actOwnsLayer(b.o)));
+  for (const b of items) { const ch = b.o.ch[b.path]; ch.keys = ch.keys.filter((k) => k.f !== b.f); }
+  const ns = new Set();
+  for (const b of items) {
+    const ch = b.o.ch[b.path], nf = Math.max(0, b.f + df);
+    ch.keys = ch.keys.filter((k) => k.f !== nf); ch.keys.push({ ...clone(b.k), f: nf }); ch.keys.sort((a, c) => a.f - c.f);
+    ns.add(kid(b.o, b.path, nf));
+  }
+  S.selKeys = ns;
+}
+function deleteSelectedKeys() {
+  buildRows();
+  if (!S.selKeys.size) return false;
+  edit('Delete keys', () => {
+    for (const k of S.selKeys) {
+      const { o, path, f } = parseKid(k); if (!o || !o.ch[path]) continue;
+      const ch = o.ch[path];
+      if (actActive()) { ch.keys = ch.keys.filter(x=>x.f!==f); if(!ch.keys.length)delete o.ch[path]; continue; }
+      if (ch.keys.length <= 1 || (f === 0 && ch.keys.length > 1 && false)) { baseSet(o, path, ch.keys[0].v); delete o.ch[path]; continue; }
+      ch.keys = ch.keys.filter((x) => x.f !== f);
+      if (ch.keys.length === 1) { baseSet(o, path, ch.keys[0].v); delete o.ch[path]; }
+    }
+    S.selKeys = new Set();
+  });
+  return true;
+}
+function selectedKeyObjs() { const out = []; for (const k of S.selKeys) { const { o, path, f } = parseKid(k); const key = o && keyAt(o, path, f); if (key) out.push({ o, path, key }); } return out; }
+function setInterpSelected(it) {
+  buildRows();
+  if (!S.selKeys.size) return toast('Select keys first');
+  if (it === 'cycle') return keyframePanel('cycle');
+  edit('Set interpolation', () => { for (const { key } of selectedKeyObjs()) { key.i = it; if (it === 'bezier' && !key.bz) key.bz = [0.33, 0, 0.67, 1]; } });
+  if (it === 'bezier') toast('Bézier: open Curves and drag the square handles to shape the motion', 'ok');
+}
+// Keyframe panel (Moho: Window ▸ Keyframe, Ctrl+Alt+E): interpolation and timing of the selected keys
+async function keyframePanel(focus) {
+  const ks = selectedKeyObjs(); if (!ks.length) return toast('Select keys in the timeline first (click a key, Shift-click or drag a box for more)');
+  const k0 = ks[0].key, ch0 = ks[0].o.ch[ks[0].path], firstF = ch0.keys[0].f, prevK = ch0.keys.filter((q) => q.f < k0.f).pop();
+  const it0 = focus === 'cycle' ? 'cycle' : k0.i || 'smooth', bz = k0.bz || [0.33, 0, 0.67, 1];
+  const num = (n, v, a = '') => `<input type="number" name="${n}" value="${v}" ${a}>`;
+  const pr = modal(`Keyframe · ${ks.length} key${ks.length > 1 ? 's' : ''} at frame${new Set(ks.map((q) => q.key.f)).size > 1 ? 's ' + [...new Set(ks.map((q) => q.key.f))].join(', ') : ' ' + k0.f}`, `<div class="form kfp">
+    <label>Interpolation</label><select name="i">${INTERPS.map(([k, n]) => `<option value="${k}" ${k === it0 ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    <label></label><div class="note" id="kfHelp" style="margin:0">${esc(INTERP_HELP[it0] || '')}</div>
+    <label title="Normalized handles of the curve leaving this key: x = time 0–1, y = value 0–1 (beyond 0–1 overshoots)">Bézier handles</label><div class="row4">${num('x1', bz[0], 'step="0.05" min="0" max="1"')}${num('y1', bz[1], 'step="0.05"')}${num('x2', bz[2], 'step="0.05" min="0" max="1"')}${num('y2', bz[3], 'step="0.05"')}</div>
+    <label>Noise</label><div class="row2"><span>amount ${num('na', k0.na ?? 10, 'step="1" min="0"')}</span><span>frames per wiggle ${num('nf', k0.nf ?? 3, 'step="0.5" min="0.5"')}</span></div>
+    <label>Cycle back to</label><div class="row2"><select name="cm"><option value="abs" ${k0.cm !== 'rel' ? 'selected' : ''}>Absolute: frame</option><option value="rel" ${k0.cm === 'rel' ? 'selected' : ''}>Relative: frames back</option></select>${num('cy', k0.cy ?? (k0.cm === 'rel' ? k0.f - firstF : firstF), 'step="1" min="0"')}</div>
+    <label title="Stay on this key's value for this many frames before moving towards the next key">Hold</label><span>${num('hold', k0.hold || 0, 'step="1" min="0"')} frames</span>
+    <label title="Show a new in-between only every N frames — 2 = animation on twos at the project frame rate">Interval</label><span>${num('iv', k0.iv || 1, 'step="1" min="1"')} frame(s)</span>
+    <label title="Uneven stair-step timing">Stagger</label><label style="text-align:left"><input type="checkbox" name="stg" ${k0.stg ? 'checked' : ''}> stair-step the motion</label>
+    <label title="Colour only — helps you find keys; never changes the motion">Label</label><select name="lb">${LABEL_COLORS.map(([c, n]) => `<option value="${c}" ${c === (k0.lb || '') ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    </div><div class="note">Applies to every selected key. Cycle example: keys at 0 (arm down), 12 (up), 24 (down) — set the key at 24 to Cycle, back to frame 0 (absolute) or 24 frames back (relative), and it repeats without extra keys.${prevK ? '' : ''}</div>`,
+    [{ label: 'Cancel', value: false }, { label: 'Apply', value: true, pri: true }], 'kfpanel');
+  const isel = $('#modal select[name=i]'); if (isel) isel.onchange = () => { $('#kfHelp').textContent = INTERP_HELP[isel.value] || ''; };
+  const r = await pr;
+  if (!r || !r.v) return;
+  const d = r.data;
+  edit('Keyframe settings', () => {
+    for (const { key } of ks) {
+      key.i = d.i;
+      if (d.i === 'bezier') key.bz = [clamp(+d.x1, 0, 1), +d.y1, clamp(+d.x2, 0, 1), +d.y2]; else delete key.bz;
+      if (d.i === 'noisy') { key.na = Math.max(0, +d.na); key.nf = Math.max(0.5, +d.nf); } else { delete key.na; delete key.nf; }
+      if (d.i === 'cycle') { key.cm = d.cm; key.cy = Math.max(0, Math.round(+d.cy)); } else { delete key.cm; delete key.cy; }
+      if (+d.hold > 0) key.hold = Math.round(+d.hold); else delete key.hold;
+      if (+d.iv > 1) key.iv = Math.round(+d.iv); else delete key.iv;
+      if (d.stg) key.stg = true; else delete key.stg;
+      if (d.lb) key.lb = d.lb; else delete key.lb;
+    }
+  });
+  if (d.i === 'cycle') { const bad = ks.filter(({ key }) => !(key.f - (d.cm === 'rel' ? key.f - +d.cy : +d.cy) > 0)); if (bad.length) toast('The cycle target must be earlier than the key — that key just holds', 'err'); }
+}
+// right-click on an empty spot of a channel: record its current value as a key
+function addKeysAt(r, f) {
+  const o = r.owner; let paths = r.paths.filter((p) => o.ch[p]);
+  if (!paths.length) paths = o.id === 'CAM' ? ['x', 'y', 'zoom', 'roll'] : ['x', 'y', 'rot', 'sx', 'sy'];
+  edit('Add keyframe', () => {
+    for (const p of paths) {
+      const v = val(o, p, f); if (v === undefined) continue;
+      if (!o.ch[p]) { o.ch[p] = { keys: [] }; if (f !== 0) setKey(o.ch[p], 0, baseGet(o, p), DISCRETE(p) ? 'step' : undefined); }
+      setKey(o.ch[p], f, v, DISCRETE(p) ? 'step' : undefined);
+    }
+    S.selKeys = new Set(paths.filter((p) => o.ch[p]).map((p) => kid(o, p, f)));
+  });
+}
+function copyKeys() {
+  buildRows();
+  if (!S.selKeys.size) return false;
+  const items = [...S.selKeys].map(parseKid).filter((x) => x.o);
+  const f0 = Math.min(...items.map((x) => x.f));
+  TL.clip = items.map((x) => ({ oid: x.o.id, path: x.path, df: x.f - f0, k: clone(keyAt(x.o, x.path, x.f)) })).filter((x) => x.k);
+  toast(`Copied ${TL.clip.length} key(s)`); return true;
+}
+function pasteKeys() {
+  if (!TL.clip || !TL.clip.length) return false;
+  const sel = selLayer();
+  edit('Paste keys', () => {
+    const ns = new Set();
+    for (const c of TL.clip) {
+      let o = getOwner(c.oid);
+      // Ordinary paste preserves the source owner, including pinned parent rigs.
+      if (!o) continue;
+      if(actActive()&&!actOwnsLayer(o))throw Error('Paste keys into a layer inside the active Action');
+      const f = S.frame + c.df;
+      if (!o.ch[c.path]) { o.ch[c.path] = { keys: [] }; if (f !== 0) setKey(o.ch[c.path], 0, baseGet(o, c.path)); }
+      setKey(o.ch[c.path], f, c.k.v, c.k.i); ns.add(kid(o, c.path, f));
+    }
+    S.selKeys = ns;
+  });
+  return true;
+}
+
+function initTimeline() {
+  TL.cv = $('#tlcanvas'); TL.ctx = TL.cv.getContext('2d'); UI.timeline = renderTimeline;
+  const pos = (e) => { const r = TL.cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  TL.cv.addEventListener('pointerdown', (e) => {
+    TL.cv.setPointerCapture(e.pointerId);
+    const [x, y] = pos(e);
+    if (S.playing) stopPlay();
+    if (y < TL.RULER) { // ruler scrub
+      if (x > TL.NAMEW) { TL.drag = { mode: 'scrub' }; setFrame(Math.max(0, Math.floor(x2f(x)))); scrubAudio(); }
+      return;
+    }
+    if (TL.mode === 'curves') return curveDown(e, x, y);
+    const r = rowAt(y);
+    if (x < TL.NAMEW) { // reserved (the timeline has no layer-tree column)
+      if (!r || r.kind === 'markers') return;
+      if (r.kind === 'layer') {
+        const L = r.owner;
+        if (L.id === 'CAM') { S.camSel = true; S.selLayers = []; setTab('props'); }
+        else {
+          S.camSel = false;
+          const ind = 8 + r.depth * 12;
+          if (L.children && x < ind + 12) { L.open = !L.open; refreshAll(); return; }
+          if (e.shiftKey || e.ctrlKey) S.selLayers = S.selLayers.includes(L.id) ? S.selLayers.filter((i) => i !== L.id) : [...S.selLayers, L.id];
+          else S.selLayers = [L.id];
+        }
+        TL.active = null;
+      } else { TL.active = { owner: r.owner, paths: r.paths, gkey: r.gkey, label: r.label }; }
+      refreshAll(); return;
+    }
+    if (e.button === 2) return;
+    if(r?.kind==='chan'){TL.active={owner:r.owner,paths:r.paths,gkey:r.gkey,label:r.label};requestDraw();}
+    const f = keyHit(r, x);
+    if (f !== null && r) {
+      const any = r.paths.some((p) => S.selKeys.has(kid(r.owner, p, f)));
+      if (e.shiftKey || e.ctrlKey) { if (any) r.paths.forEach((p) => S.selKeys.delete(kid(r.owner, p, f))); else selectRowKeys(r, f, true); }
+      else if (!any) selectRowKeys(r, f, false);
+      if (r.kind === 'chan') TL.active = { owner: r.owner, paths: r.paths, gkey: r.gkey, label: r.label };
+      beginEdit('Move keys');
+      const base = [...S.selKeys].map(parseKid).filter((q) => q.o).map((q) => ({ oid: q.o.id, path: q.path, f: q.f, k: clone(keyAt(q.o, q.path, q.f)) })).filter((q) => q.k);
+      TL.drag = { mode: 'keys', x0: x, base, df: 0, snap: H.pending.s };
+      requestDraw(); return;
+    }
+    TL.drag = { mode: 'marquee', x0: x, y0: y, add: e.shiftKey, base: new Set(S.selKeys), moved: false };
+  });
+  TL.cv.addEventListener('pointermove', (e) => {
+    const d = TL.drag; const [x, y] = pos(e);
+    if (!d) { const r=rowAt(y); TL.cv.title=r?.owner ? r.owner.name+' · '+r.label : 'Timeline'; return; }
+    if (d.mode === 'scrub') { const f = clamp(Math.floor(x2f(x)), 0, 99999); if (f !== S.frame) { setFrame(f); scrubAudio(); } return; }
+    if (d.mode === 'keys') {
+      const df = Math.round((x - d.x0) / TL.ppf); if (df === d.df) return; d.df = df;
+      const sk = S.selKeys, pts = S.selPts; restore(d.snap); S.selKeys = sk; S.selPts = pts; moveSelectedKeys(d.base, df); refreshAll(); return;
+    }
+    if (d.mode === 'curve') return curveMove(e, x, y);
+    if (d.mode === 'bzh') {
+      const q = d.h, key = q.o.ch[q.path] && q.o.ch[q.path].keys.find((k) => k.f === q.f); if (!key) return;
+      const f = x2f(x - TL.ppf / 2), v = TL.curveView.inv(y), bz = (key.bz = (key.bz || [0.33, 0, 0.67, 1]).slice());
+      bz[q.which === 1 ? 0 : 2] = round(clamp((f - q.f) / q.span, 0, 1), 3); bz[q.which === 1 ? 1 : 3] = round((v - q.av) / q.dv, 3);
+      REV++; requestDraw(); return;
+    }
+    if (d.mode === 'marquee') {
+      if (Math.hypot(x - d.x0, y - d.y0) < 3 && !d.moved) return; d.moved = true;
+      const r = [Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]; d.r = r;
+      const s = new Set(d.add ? d.base : []);
+      for (const row of TL.rows) {
+        if (!row.owner || !row.paths.length) continue;
+        const ry = TL.RULER + row.y - TL.scrollY + Math.min(row.h, 20) / 2; if (ry < r[1] || ry > r[3]) continue;
+        for (const f of rowFrames(row.owner, row.paths)) { const kx = fx2x(f) + TL.ppf / 2; if (kx >= r[0] && kx <= r[2]) row.paths.forEach((p) => keyAt(row.owner, p, f) && s.add(kid(row.owner, p, f))); }
+      }
+      S.selKeys = s; requestDraw();
+    }
+  });
+  const up = (e) => {
+    const d = TL.drag; TL.drag = null; if (!d) return;
+    if (d.mode === 'keys' || d.mode === 'curve' || d.mode === 'bzh') commitEdit();
+    if (d.mode === 'marquee' && !d.moved) { const [x, y] = pos(e); if (x > TL.NAMEW) { if (!d.add) S.selKeys = new Set(); setFrame(Math.max(0, Math.floor(x2f(x)))); const r = rowAt(y); if (r && r.kind === 'layer' && r.owner.id !== 'CAM' && !S.selLayers.includes(r.owner.id)) { S.selLayers = [r.owner.id]; S.camSel = false; } } }
+    refreshAll();
+  };
+  TL.cv.addEventListener('pointerup', up); TL.cv.addEventListener('pointercancel', up);
+  TL.cv.addEventListener('dblclick', (e) => {
+    const [x, y] = pos(e);
+    if (y < TL.RULER && x > TL.NAMEW) { if(actActive())return; const f = Math.max(0, Math.floor(x2f(x))); askText('Add marker', 'Marker name', 'Beat ' + (S.doc.markers.length + 1)).then((n) => { if (n) edit('Add marker', () => S.doc.markers.push({ id: uid('m'), f, name: n, color: '#5ccf8a' })); }); return; }
+    const r = rowAt(y);
+    if (x < TL.NAMEW && r && r.kind === 'layer' && r.owner.id !== 'CAM') { askText('Rename layer', 'Name', r.owner.name).then((n) => n && edit('Rename layer', () => (r.owner.name = n))); }
+    if (r && r.kind === 'markers') { const m = timelineMarkers().find((m) => Math.abs(fx2x(m.f) - x) < 8); if (m) askText('Marker', 'Name (empty = delete)', m.name).then((n) => edit('Edit marker', () => { if (n === '') S.doc.markers = S.doc.markers.filter((q) => q !== m); else if (n) m.name = n; })); }
+  });
+  TL.cv.addEventListener('contextmenu', (e) => {
+    e.preventDefault(); const [x, y] = pos(e), r = rowAt(y);
+    let emptyAt = null;
+    if (TL.mode === 'dope' && r && x > TL.NAMEW) { const f = keyHit(r, x); if (f !== null && !r.paths.some((p) => S.selKeys.has(kid(r.owner, p, f)))) selectRowKeys(r, f, false); if (f === null && r.owner && r.paths && (r.kind === 'chan' || r.kind === 'layer')) emptyAt = { r, f: Math.max(0, Math.floor(x2f(x))) }; }
+    requestDraw();
+    showMenu(e.clientX, e.clientY, [
+      ...(emptyAt ? [{ label: `Add keyframe at frame ${emptyAt.f} — ${emptyAt.r.kind === 'chan' ? emptyAt.r.label : 'this layer'}`, run: () => addKeysAt(emptyAt.r, emptyAt.f) }, { sep: 1 }] : []),
+      { hd: 'Interpolation' },
+      ...INTERPS.map(([k, n]) => ({ label: k === 'cycle' ? 'Cycle…' : n, run: () => setInterpSelected(k), dot: INTERP_COLORS[k], dis: () => (S.selKeys.size ? false : 'Select keys first') })),
+      { sep: 1 },
+      { label: 'Keyframe settings… (hold, interval, stagger, label)', k: 'Ctrl+Alt+E', run: () => keyframePanel(), dis: () => (S.selKeys.size ? false : 'Select keys first') },
+      { sep: 1 },
+      { label: 'Copy keys', k: 'Ctrl+C', run: copyKeys }, { label: 'Paste keys at playhead', k: 'Ctrl+V', run: pasteKeys },
+      { label: 'Delete keys', k: 'Del', run: deleteSelectedKeys },
+      { label: 'Select all visible keys', run: selectVisibleTimelineKeys },
+    ]);
+  });
+  TL.cv.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) { const [x] = pos(e), f = x2f(x); TL.ppf = clamp(TL.ppf * Math.exp(-e.deltaY * 0.002), 1, 60); TL.scrollX = Math.max(0, f * TL.ppf - (x - TL.NAMEW - 8)); }
+    else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) TL.scrollX = Math.max(0, TL.scrollX + (e.deltaX || e.deltaY));
+    else TL.scrollY = Math.max(0, TL.scrollY + e.deltaY);
+    requestDraw();
+  }, { passive: false });
+  new ResizeObserver(() => requestDraw()).observe(TL.cv);
+  renderTLBar();
+}
+function curveDown(e, x, y) {
+  const ts = curveTargets(); if (!ts.length || !TL.curveView) return;
+  const o = TL.active.owner, cv = TL.curveView;
+  const hh = (TL.bzHandles || []).find((q) => Math.hypot(q.x - x, q.y - y) < 7);
+  if (hh) { beginEdit('Shape Bézier curve'); TL.drag = { mode: 'bzh', h: hh }; return; }
+  for (const t of ts) for (const k of o.ch[t.path].keys) {
+    const v = t.comp >= 0 ? k.v[t.comp] : k.v;
+    if (Math.hypot(fx2x(k.f) + TL.ppf / 2 - x, cv.vy(v) - y) < 7) {
+      if (!e.shiftKey) S.selKeys = new Set(); S.selKeys.add(kid(o, t.path, k.f));
+      beginEdit('Edit curve key');
+      TL.drag = { mode: 'curve', t, f0: k.f, v0: v, x0: x, y0: y, snap: H.pending.s, o };
+      requestDraw(); return;
+    }
+  }
+  setFrame(Math.max(0, Math.floor(x2f(x))));
+}
+function curveMove(e, x, y) {
+  const d = TL.drag, cv = TL.curveView, pts = S.selPts; restore(d.snap); S.selPts = pts;
+  const o = getOwner(d.o.id); const ch = o.ch[d.t.path]; const k = ch.keys.find((q) => q.f === d.f0); if (!k) return;
+  const nv = d.v0 + (cv.inv(y) - cv.inv(d.y0)) * (e.altKey ? 0.1 : 1);
+  const nf = e.shiftKey ? d.f0 : Math.max(0, d.f0 + Math.round((x - d.x0) / TL.ppf));
+  if (d.t.comp >= 0) { k.v = k.v.slice(); k.v[d.t.comp] = round(nv, 3); } else k.v = round(nv, 3);
+  if (nf !== d.f0 && !ch.keys.some((q) => q.f === nf)) { k.f = nf; ch.keys.sort((a, b) => a.f - b.f); }
+  if (k.f === 0 && !actActive()) baseSet(o, d.t.path, k.v);
+  TL.active.owner = o;
+  S.selKeys = new Set([kid(o, d.t.path, k.f)]); requestDraw();
+}
+
+// ---------- timeline toolbar ----------
+function renderTLBar() {
+  const d = { ...S.doc, end:timelineEnd() };
+  $('#tlbar').innerHTML = `
+    <div class="grp"><button class="ib" id="tlFirst" title="First frame (Shift+,)">⏮</button><button class="ib" id="tlPrev" title="Previous frame (,)">◀</button>
+    <button class="ib" id="tlPlay" title="Play / pause (Space)" style="min-width:34px">${S.playing ? '⏸' : '▶'}</button>
+    <button class="ib" id="tlNext" title="Next frame (.)">▶|</button><button class="ib" id="tlLast" title="Last frame (Shift+.)">⏭</button></div>
+    <div class="grp"><label>Frame <input type="number" id="tlFrame" min="0" value="${S.frame}"></label><label>of <input type="number" id="tlEnd" min="1" value="${d.end}" title="End frame"></label>
+    <label>FPS <input type="number" id="tlFps" min="1" max="120" value="${d.fps}" style="width:44px"></label></div>
+    <span class="sep" style="width:1px;height:18px;background:var(--line)"></span>
+    <button class="ib toggle ${S.loop ? 'on' : ''}" id="tlLoop" title="Loop playback">⟳ Loop</button>
+    <button class="ib toggle ${S.autoKey ? 'on' : ''}" id="tlAuto" title="Auto-key: edits at frames other than 0 create keyframes">● Auto-key</button>
+    <label title="Interpolation for new keys">New keys <select id="tlInterp">${INTERPS.filter(([k]) => k !== 'cycle').map(([k, n]) => `<option value="${k}" ${k === S.defInterp ? 'selected' : ''}>${n}</option>`).join('')}<option value="copy" ${S.defInterp === 'copy' ? 'selected' : ''}>Copy previous key</option></select></label>
+    <button class="ib toggle ${S.onion ? 'on' : ''}" id="tlOnion" title="Onion skins for the selected layer (past red, future green)">◐ Onion</button>
+    <input type="number" id="tlOnionN" min="1" max="8" value="${S.onionN}" style="width:40px" title="Onion skin frames each side">
+    <span class="sep" style="width:1px;height:18px;background:var(--line)"></span>
+    <button class="ib toggle ${TL.mode === 'dope' ? 'on' : ''}" id="tlDope">Dope sheet</button><button class="ib toggle ${TL.mode === 'curves' ? 'on' : ''}" id="tlCurves">Curves</button>
+    <span style="margin-left:auto;color:var(--faint)">${Math.floor(S.frame / d.fps)}s ${String(S.frame % d.fps).padStart(2, '0')}f · Ctrl+wheel zooms · right-click keys</span>`;
+  const on = (id, ev, fn) => { const el = $('#' + id); if (el) el[ev] = fn; };
+  on('tlFirst', 'onclick', () => setFrame(0)); on('tlLast', 'onclick', () => setFrame(d.end));
+  on('tlPrev', 'onclick', () => setFrame(Math.max(0, S.frame - 1))); on('tlNext', 'onclick', () => setFrame(S.frame + 1));
+  on('tlPlay', 'onclick', togglePlay);
+  on('tlFrame', 'onchange', (e) => setFrame(Math.max(0, +e.target.value | 0)));
+  on('tlEnd', 'onchange', (e) => edit('Set end frame', () => { const end=Math.max(1, +e.target.value | 0), action=actActive(); if(action)action.action.dur=end;else S.doc.end=end; }));
+  on('tlFps', 'onchange', (e) => edit('Set fps', () => (S.doc.fps = clamp(+e.target.value | 0, 1, 120))));
+  on('tlLoop', 'onclick', () => { S.loop = !S.loop; renderTLBar(); });
+  on('tlAuto', 'onclick', () => { S.autoKey = !S.autoKey; renderTLBar(); toast(S.autoKey ? 'Auto-key ON' : 'Auto-key OFF — edits change static values unless the channel is already animated'); });
+  on('tlInterp', 'onchange', (e) => (S.defInterp = e.target.value));
+  on('tlOnion', 'onclick', () => { S.onion = !S.onion; renderTLBar(); requestDraw(); });
+  on('tlOnionN', 'onchange', (e) => { S.onionN = clamp(+e.target.value | 0, 1, 8); requestDraw(); });
+  on('tlDope', 'onclick', () => { TL.mode = 'dope'; renderTLBar(); requestDraw(); });
+  on('tlCurves', 'onclick', () => { TL.consolidate = false; TL.mode = 'curves'; renderTLBar(); requestDraw(); });
+}
+
+// ---------- frame & playback ----------
+function setFrame(f) {
+  f = Math.max(0, Math.round(f));
+  if (S.mode === 'setup' && f !== 0) { S.mode = 'animate'; updateModeUI(); renderTLBar(); toast('Animate mode — changes record keys at the playhead'); if (toolAvail(S.tool)) setTool(activeBoneLayer() ? 'bonemanip' : 'select'); }
+  if (f !== S.frame) S.swPreview = {};
+  S.frame = f;
+  // keep playhead visible
+  const x = fx2x(S.frame), w = TL.cv ? TL.cv.getBoundingClientRect().width : 0;
+  if (w && (x < TL.NAMEW + 10 || x > w - 20)) TL.scrollX = Math.max(0, S.frame * TL.ppf - (w - TL.NAMEW) / 3);
+  refreshAll();
+}
+const Play = { ac: null, nodes: [], t0: 0, f0: 0, raf: 0 };
+function audioCtx() { if (!Play.ac) Play.ac = new (window.AudioContext || window.webkitAudioContext)(); if (Play.ac.state === 'suspended') Play.ac.resume(); return Play.ac; }
+function audioLayers() { return actActive() ? [] : allLayers().filter((L) => L.type === 'audio' && L.vis && !L.mute && S.media[L.media] && S.media[L.media].buffer && !ancestors(L.id).some((a) => !a.vis)); }
+function startAudio(fromF, dest) {
+  const ac = audioCtx(), fps = S.doc.fps, now = ac.currentTime + 0.03;
+  for (const L of audioLayers()) {
+    const buf = S.media[L.media].buffer, off = (fromF - L.offset) / fps;
+    if (off >= buf.duration) continue;
+    const src = ac.createBufferSource(), g = ac.createGain();
+    src.buffer = buf; g.gain.value = val(L, 'gain', fromF); src.connect(g); g.connect(dest || ac.destination);
+    if (off >= 0) src.start(now, off); else src.start(now - off, 0);
+    Play.nodes.push(src);
+  }
+  return now;
+}
+function stopAudio() { for (const n of Play.nodes) { try { n.stop(); } catch (e) {} } Play.nodes = []; }
+function scrubAudio() {
+  const ls = audioLayers(); if (!ls.length) return;
+  const ac = audioCtx(), fps = S.doc.fps;
+  for (const L of ls) {
+    const buf = S.media[L.media].buffer, off = (S.frame - L.offset) / fps; if (off < 0 || off >= buf.duration) continue;
+    const src = ac.createBufferSource(), g = ac.createGain(); src.buffer = buf; g.gain.value = val(L, 'gain', S.frame) * 0.9;
+    src.connect(g); g.connect(ac.destination); src.start(ac.currentTime, off, 1.4 / fps);
+  }
+}
+function togglePlay() { S.playing ? stopPlay() : startPlay(); }
+function startPlay() {
+  if (S.playing) return;
+  if (S.mode === 'setup') setMode('animate');
+  S.swPreview = {};
+  const end=timelineEnd();
+  if (S.frame >= end) S.frame = 0;
+  S.playing = true; Play.f0 = S.frame;
+  const hasAudio = audioLayers().length > 0;
+  Play.t0 = hasAudio ? startAudio(Play.f0) : performance.now() / 1000;
+  Play.clock = hasAudio ? () => audioCtx().currentTime : () => performance.now() / 1000;
+  let last = -1, fpsN = 0, fpsT = performance.now();
+  const tick = () => {
+    if (!S.playing) return;
+    const t = Play.clock() - Play.t0;
+    let f = Play.f0 + Math.floor(Math.max(0, t) * S.doc.fps);
+    if (f > end) {
+      if (S.loop) { stopAudio(); Play.f0 = 0; Play.t0 = hasAudio ? startAudio(0) : performance.now() / 1000; f = 0; }
+      else { S.frame = end; stopPlay(); return; }
+    }
+    if (f !== last) { S.frame = f; last = f; fpsN++; drawNow(); }
+    const now = performance.now(); if (now - fpsT > 1000) { Play.actualFps = fpsN; fpsN = 0; fpsT = now; const h = $('#hudInfo'); if (h) h.textContent += `  ·  ${Play.actualFps} fps`; }
+    Play.raf = requestAnimationFrame(tick);
+  };
+  renderTLBar(); Play.raf = requestAnimationFrame(tick);
+}
+function stopPlay() { S.playing = false; cancelAnimationFrame(Play.raf); stopAudio(); renderTLBar(); refreshAll(); }
+
+/* ===================== Popai Animator — panels: layers, inspector, style, switch; menus & dialogs ===================== */
+
+// ---------- generic popup menu ----------
+function closeMenus() { $('#menuLayer').innerHTML = ''; $$('#menus>button').forEach((b) => b.classList.remove('open')); }
+function showMenu(x, y, items, anchorBtn) {
+  closeMenus();
+  const dd = document.createElement('div'); dd.className = 'dd';
+  for (const it of items) {
+    if (it.sep) { dd.appendChild(document.createElement('hr')); continue; }
+    if (it.hd) { const h = document.createElement('div'); h.className = 'hd'; h.textContent = it.hd; dd.appendChild(h); continue; }
+    const m = document.createElement('div');
+    const dis = typeof it.dis === 'function' ? it.dis() : it.dis;
+    m.className = 'mi' + (dis ? ' dis' : '');
+    m.innerHTML = `${it.dot ? `<span style="width:8px;height:8px;border-radius:2px;background:${it.dot};display:inline-block"></span>` : ''}<span>${esc(it.label)}</span>${it.tag ? `<span class="tg">${esc(it.tag)}</span>` : ''}${it.k ? `<span class="k">${esc(it.k)}</span>` : ''}`;
+    if (dis && typeof dis === 'string') m.title = dis;
+    m.onclick = (e) => { e.stopPropagation(); closeMenus(); it.run && it.run(); };
+    dd.appendChild(m);
+  }
+  $('#menuLayer').appendChild(dd);
+  const r = dd.getBoundingClientRect();
+  dd.style.left = Math.min(x, innerWidth - r.width - 6) + 'px';
+  dd.style.top = Math.min(y, innerHeight - r.height - 6) + 'px';
+  if (anchorBtn) anchorBtn.classList.add('open');
+}
+document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.dd') && !e.target.closest('#menus')) closeMenus(); });
+
+// Keep the original container, children, animation, IDs, styles and effects.
+function convertGroupLayer(L,type){
+  assertWritable(L);
+  if(L.type!=='group'||!['bone','switch'].includes(type))throw Error('Choose a group layer to convert');
+  if(type==='bone'){
+    const check=child=>{
+      if(child.type==='bone')return;
+      if(child.bindBone||child.flexiBones?.length||Object.values(child.pts||{}).some(p=>p.b?.length))throw Error('Release existing bindings inside this group before converting it to a new Bone layer');
+      (child.children||[]).forEach(check);
+    };
+    L.children.forEach(check);
+    L.type='bone';L.bones=[];
+  }else{L.type='switch';L.p.sw=L.children[0]?.id||null;L.swMode='discrete';L.swFade=4;}
+  L.open=true;S.selLayers=[L.id];S.selBone=null;S.selBones=[];
+  if(type==='switch')setTimeout(()=>setTool('switchlayer'),0);
+}
+
+// ---------- modal dialogs ----------
+let _modalResolve = null;
+function modal(title, bodyHtml, buttons = [{ label: 'OK', value: true, pri: true }], cls = '') {
+  const m = $('#modal');
+  m.innerHTML = `<div class="dlg ${cls}"><h3>${title}<span class="x" data-v="__x">✕</span></h3><div class="db">${bodyHtml}</div>${buttons.length ? `<div class="df">${buttons.map((b, i) => `<button class="btn ${b.pri ? 'pri' : ''}" data-i="${i}">${esc(b.label)}</button>`).join('')}</div>` : ''}</div>`;
+  m.classList.add('show');
+  return new Promise((res) => {
+    _modalResolve = res;
+    m.querySelectorAll('[data-i]').forEach((b) => (b.onclick = () => closeModal(buttons[+b.dataset.i].value)));
+    m.querySelector('[data-v="__x"]').onclick = () => closeModal(null);
+    const f = m.querySelector('input,textarea,select'); if (f) setTimeout(() => f.focus(), 30);
+  });
+}
+function closeModal(v) { const m = $('#modal'); m.classList.remove('show'); const r = _modalResolve; _modalResolve = null; const body = m.querySelector('.db'); const data = body ? formData(body) : {}; m.innerHTML = ''; if (r) r(v === null ? null : { v, data }); }
+function formData(el) { const o = {}; el.querySelectorAll('[name]').forEach((i) => (o[i.name] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value)); return o; }
+async function askText(title, label, def = '') {
+  const r = await modal(esc(title), `<div class="form"><label>${esc(label)}</label><input type="text" name="t" value="${esc(def)}"></div>`, [{ label: 'Cancel', value: false }, { label: 'OK', value: true, pri: true }]);
+  return r && r.v ? r.data.t : null;
+}
+document.addEventListener('keydown', (e) => {
+  if (!$('#modal').classList.contains('show')) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(null); }
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT' && !$('#modal .cmdp')) { const b = $('#modal .btn.pri'); if (b) { e.preventDefault(); b.click(); } }
+}, true);
+
+// ---------- layers panel ----------
+function layerTags(L) {
+  const t = [];
+  if (L.fx.some((e) => e.on)) t.push('fx');
+  if (L.type === 'group' && L.mask !== 'none') t.push('mask');
+  if (Object.keys(L.ch).length) t.push('◆');
+  if (!L.render) t.push('⊘');
+  return t.join(' ');
+}
+function renderLayers() {
+  const el = $('#layerTree'); let h = '';
+  const prim = S.selLayers[S.selLayers.length - 1];
+  const rec = (list, depth, swParent) => {
+    for (const L of list) {
+      const active = swParent && switchState(swParent, S.frame).cur === L.id;
+      const bi = typeof bindingInfo === 'function' ? bindingInfo(L) : null;
+      const att = bi && (bi.mode === 'Attached' ? '↳ ' + bi.text.replace('Attached to: ', '') : bi.mode === 'Weighted' || bi.mode === 'Points' ? '↳ ' + bi.mode.toLowerCase() : '');
+      h += `<div class="lrow ${S.selLayers.includes(L.id) ? 'sel' : ''} ${prim === L.id ? 'prim' : ''} ${swParent && !active ? 'alt-off' : ''}" data-id="${L.id}" draggable="true" style="padding-left:${depth * 14}px;border-left-color:${L.label || 'transparent'}">
+        <span class="tw" data-act="tw">${L.children ? (L.open ? '▾' : '▸') : ''}</span>${swParent ? `<span class="ab ${active ? 'act' : ''}" data-act="activate" title="${active ? 'Active at this frame' : 'Set active at playhead (adds a switch key at frame ' + S.frame + ')'}">${active ? '●' : '○'}</span>` : ''}<span class="ic">${LAYER_TYPES[L.type].icon}</span>
+        <span class="nm" title="${esc(LAYER_TYPES[L.type].name)}${bi ? ' · ' + esc(bi.text) : ''}">${esc(L.name)}</span>${isContainer(L) ? `<span class="tp">${L.type === 'group' ? 'group' : L.type === 'bone' ? 'bones' : 'switch'}</span>` : ''}${att ? `<span class="att">${esc(att)}</span>` : ''}<span class="tag">${layerTags(L)}</span>
+        <span class="vb ${L.vis ? '' : 'off'}" data-act="vis" title="Show/hide">👁</span><span class="lb ${L.lock ? '' : 'off'}" data-act="lock" title="Lock">🔒</span></div>`;
+      if (L.children && L.open) rec(L.children, depth + 1, L.type === 'switch' ? L : null);
+    }
+  };
+  rec(S.doc.layers, 0, null);
+  if (!S.doc.layers.length) h = `<div class="note" style="padding:10px">No layers yet. Pick a drawing tool and draw on the stage, or use <b>＋</b> to add a layer. Drop images or audio onto the stage to import.</div>`;
+  el.innerHTML = h;
+}
+function initLayersPanel() {
+  const el = $('#layerTree');
+  el.addEventListener('click', (e) => {
+    const row = e.target.closest('.lrow'); if (!row) return;
+    const L = findLayer(row.dataset.id); if (!L) return;
+    const act = e.target.dataset.act;
+    if (act === 'tw') { L.open = !L.open; refreshAll(); return; }
+    if (act === 'activate') { const P = parentOf(L.id); if (P && P.type === 'switch') swSetActive(P, L.id); return; }
+    if (act === 'vis') return edit(L.vis ? 'Hide layer' : 'Show layer', () => (L.vis = !L.vis));
+    if (act === 'lock') return edit(L.lock ? 'Unlock layer' : 'Lock layer', () => (L.lock = !L.lock));
+    S.camSel = false;
+    if (e.ctrlKey || e.metaKey) S.selLayers = S.selLayers.includes(L.id) ? S.selLayers.filter((i) => i !== L.id) : [...S.selLayers, L.id];
+    else if (e.shiftKey && S.selLayers.length) {
+      const flat = allLayers().map((l) => l.id), a = flat.indexOf(S.selLayers[S.selLayers.length - 1]), b = flat.indexOf(L.id);
+      S.selLayers = flat.slice(Math.min(a, b), Math.max(a, b) + 1);
+    } else S.selLayers = [L.id];
+    S.selPts = new Set(); S.selShape = null;
+    if (L.type === 'switch' || (parentOf(L.id) || {}).type === 'switch') { /* keep tab */ }
+    refreshAll();
+  });
+  el.addEventListener('dblclick', (e) => {
+    const row = e.target.closest('.lrow'); if (!row || e.target.dataset.act) return;
+    // Moho: double-clicking a layer opens Layer Settings; Alt+double-click renames in place.
+    if (!e.altKey && typeof openLayerSettings === 'function') { if (!S.selLayers.includes(row.dataset.id)) S.selLayers = [row.dataset.id]; refreshAll(); return openLayerSettings(); }
+    const L = findLayer(row.dataset.id), nm = row.querySelector('.nm');
+    nm.innerHTML = `<input type="text" value="${esc(L.name)}">`; const i = nm.querySelector('input'); i.focus(); i.select();
+    const done = (ok) => { if (ok && i.value.trim() && i.value !== L.name) edit('Rename layer', () => (L.name = i.value.trim())); else refreshAll(); };
+    i.onkeydown = (ev) => { if (ev.key === 'Enter') done(true); if (ev.key === 'Escape') done(false); ev.stopPropagation(); };
+    i.onblur = () => done(true);
+  });
+  el.addEventListener('contextmenu', (e) => {
+    const row = e.target.closest('.lrow'); if (!row) return; e.preventDefault();
+    const L = findLayer(row.dataset.id); if (!S.selLayers.includes(L.id)) { S.selLayers = [L.id]; refreshAll(); }
+    showMenu(e.clientX, e.clientY, [
+      { label: 'Rename…', run: () => askText('Rename layer', 'Name', L.name).then((n) => n && edit('Rename', () => (L.name = n))) },
+      { label: 'Duplicate', k: 'Ctrl+D', run: () => runCmd('layer.dup') },
+      { label: 'Group selected', k: 'Ctrl+G', run: () => runCmd('layer.group') },
+      ...(L.type==='group' ? [
+        {label:'Convert to Bone layer',dis:()=>writeReason(L),run:()=>edit('Convert group to Bone layer',()=>convertGroupLayer(L,'bone'))},
+        {label:'Convert to Switch layer',dis:()=>writeReason(L),run:()=>edit('Convert group to Switch layer',()=>convertGroupLayer(L,'switch'))},
+        {sep:1}
+      ] : []),
+      { label: 'Raise layer', run: () => runCmd('layer.up') },
+      { label: 'Lower layer', run: () => runCmd('layer.down') },
+      { label: L.render ? 'Exclude from render' : 'Include in render', run: () => edit('Toggle render', () => (L.render = !L.render)) },
+      { hd: 'Color label' },
+      ...[['None', ''], ['Red', '#ff5d5d'], ['Orange', '#ff8a3d'], ['Green', '#5ccf8a'], ['Blue', '#4dabf7'], ['Purple', '#b26bff']].map(([n, c]) => ({ label: n, dot: c || '#444', run: () => edit('Label', () => (L.label = c)) })),
+      { sep: 1 }, { label: 'Delete', k: 'Del', run: () => runCmd('layer.del') },
+    ]);
+  });
+  // drag & drop reordering
+  let dragId = null;
+  el.addEventListener('dragstart', (e) => { const row = e.target.closest('.lrow'); dragId = row && row.dataset.id; e.dataTransfer.effectAllowed = 'move'; });
+  const where = (e, row) => { const r = row.getBoundingClientRect(), t = (e.clientY - r.top) / r.height, L = findLayer(row.dataset.id); return isContainer(L) && t > 0.3 && t < 0.7 ? 'in' : t < 0.5 ? 'above' : 'below'; };
+  el.addEventListener('dragover', (e) => {
+    const row = e.target.closest('.lrow'); if (!row || !dragId) return; e.preventDefault();
+    $$('.lrow', el).forEach((r) => r.classList.remove('dropin', 'dropabove', 'dropbelow'));
+    row.classList.add('drop' + where(e, row));
+  });
+  el.addEventListener('drop', (e) => {
+    const row = e.target.closest('.lrow'); if (!row || !dragId) return; e.preventDefault();
+    const w = where(e, row), target = findLayer(row.dataset.id), L = findLayer(dragId); dragId = null;
+    if (!L || !target || L === target || ancestors(target.id).includes(L)) return refreshAll();
+    edit('Move layer', () => {
+      reparentLayerSafe(L, target, w);
+    });
+  });
+  el.addEventListener('dragend', () => { dragId = null; $$('.lrow', el).forEach((r) => r.classList.remove('dropin', 'dropabove', 'dropbelow')); });
+  $('#lyAdd').onclick = (e) => { const r = e.target.getBoundingClientRect(); showMenu(r.left, r.bottom + 2, newLayerMenu()); };
+  $('#lyDup').onclick = () => runCmd('layer.dup'); $('#lyDel').onclick = () => runCmd('layer.del'); $('#lyGroup').onclick = () => runCmd('layer.group');
+  $('#lyUp').onclick = () => runCmd('layer.up'); $('#lyDown').onclick = () => runCmd('layer.down');
+}
+function newLayerMenu() {
+  return [
+    ...['vector', 'group', 'bone', 'switch', 'text', 'particle'].map((t) => ({ label: LAYER_TYPES[t].icon + '  ' + LAYER_TYPES[t].name + (/Group/.test(LAYER_TYPES[t].name) ? '' : ' layer'), run: () => addLayer(t) })),
+    { sep: 1 },
+    { label: '🖼  Image… (import)', run: () => pickFile('image/*', importFile) },
+    { label: '♪  Audio… (import)', run: () => pickFile('audio/*', importFile) },
+  ];
+}
+function insertLayer(L) {
+  const sel = selLayer();
+  if (sel && isContainer(sel) && sel.type !== 'switch') { sel.children.unshift(L); sel.open = true; }
+  else if (sel) { const sib = siblingsOf(sel.id); sib.splice(sib.indexOf(sel), 0, L); }
+  else S.doc.layers.unshift(L);
+  S.selLayers = [L.id]; S.camSel = false;
+}
+function addLayer(type) {
+  edit('New ' + LAYER_TYPES[type].name + ' layer', () => {
+    const L = mkLayer(type);
+    if (type === 'particle') applyParticlePreset(L, 'Magic');
+    insertLayer(L);
+  });
+}
+function cloneLayer(L) {
+  const map = {};
+  const c = clone(L);
+  const reid = (x) => { const n = uid('L'); map[x.id] = n; x.id = n; if (x.children) x.children.forEach(reid); };
+  reid(c);
+  const fix = (x) => {
+    if (x.type === 'switch') { if (map[x.p.sw]) x.p.sw = map[x.p.sw]; if (x.ch.sw) x.ch.sw.keys.forEach((k) => (k.v = map[k.v] || k.v)); }
+    for (const e of x.fx) { const ne = uid('fx'); for (const k of Object.keys(x.ch)) if (k.startsWith('fx:' + e.id + ':')) { x.ch[k.replace(e.id, ne)] = x.ch[k]; delete x.ch[k]; } e.id = ne; }
+    if (x.children) x.children.forEach(fix);
+  };
+  fix(c);
+  return c;
+}
+
+// ---------- inspector ----------
+let currentTab = 'props', inspFilter = '';
+function setTab(t) { if(t==='switch'&&selLayer()?.type!=='switch')t='props'; currentTab = t; $$('#sideTabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === t)); _panelsDirty = true; drawNow(); }
+function keyBtn(o, path) {
+  const anim = isKeyed(o, path), here = anim && keyAt(o, path, S.frame);
+  return `<button class="kbtn ${here ? 'here' : anim ? 'anim' : ''}" data-key="${esc(path)}" data-owner="${o.id}" title="${here ? 'Remove key at this frame' : 'Add key at this frame'}">${here ? '◆' : anim ? '◈' : '◇'}</button>`;
+}
+function numRow(o, path, label, opt = {}) {
+  let v = val(o, path, S.frame); if (opt.comp !== undefined) v = v[opt.comp];
+  if (opt.scale) v *= opt.scale;
+  const st = opt.step ?? 1;
+  return `<div class="prow" data-label="${esc(label.toLowerCase())}"><span class="pl" data-scrub="${esc(path)}" data-owner="${o.id}" data-step="${st}" data-comp="${opt.comp ?? ''}" data-scale="${opt.scale || 1}" data-min="${opt.min ?? ''}" data-max="${opt.max ?? ''}" title="Drag to change">${esc(label)}</span>
+    <span class="pv"><input type="number" step="${st}" value="${round(v, opt.dec ?? 2)}" data-path="${esc(path)}" data-owner="${o.id}" data-comp="${opt.comp ?? ''}" data-scale="${opt.scale || 1}" ${opt.min !== undefined ? `min="${opt.min}"` : ''} ${opt.max !== undefined ? `max="${opt.max}"` : ''}>${opt.unit ? `<span style="color:var(--faint)">${opt.unit}</span>` : ''}</span>
+    ${opt.nokey ? '<span></span>' : keyBtn(o, path)}</div>`;
+}
+function colorRow(o, path, label, opt = {}) {
+  return `<div class="prow" data-label="${esc(label.toLowerCase())}"><span class="pl nodrag">${esc(label)}</span><span class="pv"><input type="color" value="${val(o, path, S.frame)}" data-path="${esc(path)}" data-owner="${o.id}"><span style="color:var(--faint)">${val(o, path, S.frame)}</span></span>${opt.nokey ? '<span></span>' : keyBtn(o, path)}</div>`;
+}
+function fieldRow(label, html) { return `<div class="prow" data-label="${esc(label.toLowerCase())}"><span class="pl nodrag">${esc(label)}</span><span class="pv">${html}</span><span></span></div>`; }
+function sec(title, body, right = '', free = false) { return `<div class="sec"><h4>${title}<span class="r">${right}</span></h4><div class="body ${free ? 'free' : ''}">${body}</div></div>`; }
+function sel_(name, opts, cur, attrs = '') { return `<select ${attrs} data-f="${name}">${opts.map(([v, n]) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>`; }
+
+function renderProps() {
+  const el = $('#tabBody');
+  let h = `<input type="text" class="insp-search" id="inspSearch" placeholder="Search properties (e.g. opacity, blur)…" value="${esc(inspFilter)}">`;
+  if (S.camSel) h += cameraProps();
+  else {
+    const L = selLayer();
+    if (!L) h += docProps();
+    else h += layerProps(L);
+  }
+  el.innerHTML = h;
+  bindProps(el);
+  applyInspFilter();
+  const s = $('#inspSearch'); s.oninput = () => { inspFilter = s.value; applyInspFilter(); };
+}
+function applyInspFilter() {
+  const q = inspFilter.trim().toLowerCase();
+  $$('#tabBody .prow').forEach((r) => {
+    const m = !q || (r.dataset.label || '').includes(q);
+    [...r.children].forEach((c) => { c.style.display = m ? '' : 'none'; c.classList.toggle('hl', !!q && m && c.classList.contains('pl')); });
+  });
+  $$('#tabBody .sec').forEach((s) => { if (!q) { s.style.display = ''; return; } const any = [...s.querySelectorAll('.prow')].some((r) => (r.dataset.label || '').includes(q)); s.style.display = any ? '' : 'none'; });
+}
+function docProps() {
+  const d = S.doc;
+  return sec('🎬 Project', `
+    ${fieldRow('Name', `<input type="text" data-doc="name" value="${esc(d.name)}">`)}
+    ${fieldRow('Width', `<input type="number" data-doc="w" value="${d.w}" min="16">`)}
+    ${fieldRow('Height', `<input type="number" data-doc="h" value="${d.h}" min="16">`)}
+    ${fieldRow('Frame rate', `<input type="number" data-doc="fps" value="${d.fps}" min="1" max="120">`)}
+    ${fieldRow('End frame', `<input type="number" data-doc="end" value="${d.end}" min="1">`)}
+    ${fieldRow('Background', `<input type="color" data-doc="bg" value="${d.bg}">`)}`) +
+    sec('Getting started', `<div class="note">
+      <b>Draw:</b> pick Pen, Freehand, Rectangle or Ellipse and draw on the stage — a vector layer is created for you.<br>
+      <b>Animate:</b> move to another frame on the timeline and move/rotate something — keys are created automatically (Auto-key). Frame 0 is the setup pose.<br>
+      <b>Rig:</b> add a Bone layer, draw bones with <b>Add bone</b>, put artwork inside, then bind it (Bind tool or Rig ▸ Auto-bind points).<br>
+      <b>Lip sync:</b> import audio, create a Switch layer with mouth drawings, then AI ▸ Lip sync.<br>
+      <b>AI:</b> open the AI tab and type things like “make it jump at frame 12, leave a glowing trail, shake the camera on landing and add dust”.<br>
+      Press <kbd>Ctrl Shift P</kbd> to search every command.</div>`, '', true);
+}
+function cameraProps() {
+  const c = S.doc.camera;
+  return sec('🎥 Camera', numRow(c, 'x', 'Track X') + numRow(c, 'y', 'Track Y') + numRow(c, 'zoom', 'Zoom', { step: 0.01, min: 0.05 }) + numRow(c, 'roll', 'Roll', { unit: '°' }) +
+    numRow(c, 'shake', 'Shake amount', { min: 0 }) + numRow(c, 'shakeFreq', 'Shake frequency', { step: 0.5, min: 0 })) +
+    sec('Notes', `<div class="note">Layers with a <b>Depth Z</b> value move with parallax when the camera tracks (2.5D multiplane). Use the <b>Camera</b> tool (K) to drag the camera directly. Shake is deterministic, so renders repeat exactly.</div>`, '', true);
+}
+function layerProps(L) {
+  const f = S.frame, multi = S.selLayers.length > 1;
+  let h = '';
+  const B = boneLayerFor(L);
+  h += sec(`${LAYER_TYPES[L.type].icon} ${esc(LAYER_TYPES[L.type].name)} layer${multi ? ` <span style="color:var(--faint)">(+${S.selLayers.length - 1} more selected)</span>` : ''}`,
+    fieldRow('Name', `<input type="text" data-lf="name" value="${esc(L.name)}">`) +
+    fieldRow('Blend mode', sel_('blend', [['source-over', 'Normal'], ['multiply', 'Multiply'], ['screen', 'Screen'], ['overlay', 'Overlay'], ['lighter', 'Add'], ['darken', 'Darken'], ['lighten', 'Lighten'], ['color-dodge', 'Color dodge'], ['difference', 'Difference']], L.blend, 'data-lsel="blend"')) +
+    fieldRow('Render', `<label><input type="checkbox" data-lchk="render" ${L.render ? 'checked' : ''}> include in export</label>`));
+  if (B && L.type !== 'audio') {
+    const bi = bindingInfo(L);
+    h += sec('🦴 Controlled by ' + esc(B.name), fieldRow('Attached to', sel_('bind', [['', '— not attached —'], ...B.bones.map((b) => [b.id, b.name])], L.bindBone || '', 'data-lsel="bindBone"' + (S.mode !== 'setup' ? ' disabled title="Switch to Setup (Tab) to change attachments"' : ''))) +
+      `<div class="note" style="grid-column:1/-1"><b>${esc(bi.text)}.</b> ${L.type === 'vector' ? 'Whole-layer attachment moves the layer as one unit and overrides point binding. Bound points follow one bone each; released points ignore the skeleton; all other points are flexi-bound.' : L.type === 'bone' ? '' : 'Everything inside this layer follows the bone it is attached to; Switch and other animation still work inside it.'}</div>` +
+      (L.type === 'vector' ? `<div style="grid-column:1/-1" class="btnrow"><button class="btn" data-cmd="rig.bindpts">Bind selected points → selected bone</button><button class="btn" data-cmd="rig.unbindpts">Un-bind (release) points</button><button class="btn" data-cmd="rig.flexipts">Flexi-bind points</button><button class="btn" data-cmd="rig.autobind">Weighted binding…</button></div>` : '') +
+      (L.type !== 'bone' ? `<div style="grid-column:1/-1" class="btnrow"><button class="btn" data-cmd="rig.releaselayer">Release layer</button><button class="btn" data-cmd="rig.flexilayer">Flexi-bind layer</button><button class="btn" data-cmd="rig.flexiselected">Use selected bones for flexi-binding</button><button class="btn" data-cmd="rig.flexiall">Use all bones</button></div>` : '') +
+      (S.mode !== 'setup' ? `<div style="grid-column:1/-1" class="btnrow"><button class="btn" data-cmd="mode.setup">Enter Setup to change binding</button><button class="btn" data-ctx2="poseparent">✋ Pose parent rig</button></div>` : ''));
+  }
+  if (L.type === 'vector') {
+    const nsel = S.selPts.size;
+    h += sec('Vector', `<div class="note">${Object.keys(L.pts).length} points · ${L.paths.length} paths · ${L.shapes.length} shapes${nsel ? ` · <b>${nsel} selected</b>` : ''}</div>
+      <div class="btnrow"><button class="btn" data-tool="points">Edit points</button><button class="btn" data-tab="style">Style…</button>${nsel ? '<button class="btn" data-cmd="pts.del">Delete points</button>' : ''}${S.selShape ? '<button class="btn" data-cmd="shape.del">Delete shape</button>' : ''}</div>`, '', true);
+    if (nsel === 1) { const id = [...S.selPts][0]; h += sec('Selected point', numRow(L, 'pt:' + id, 'X', { comp: 0 }) + numRow(L, 'pt:' + id, 'Y', { comp: 1 }) + fieldRow('Curvature', `<input type="number" step="0.05" min="0" max="2.5" data-curv="${id}" value="${L.pts[id].c ?? 1}">`)); }
+  }
+  if (L.type === 'text') h += sec('Text', `<div class="prow" data-label="text"><span class="pl nodrag">Text</span><span class="pv"><textarea rows="2" data-lf="text" style="width:100%">${esc(L.text)}</textarea></span><span></span></div>` +
+    fieldRow('Size', `<input type="number" data-lfn="size" value="${L.size}" min="1">`) + fieldRow('Font', sel_('font', [['Inter, system-ui, sans-serif', 'Sans'], ['Georgia, serif', 'Serif'], ['"Comic Sans MS", "Comic Neue", cursive', 'Comic'], ['Impact, "Arial Black", sans-serif', 'Impact'], ['ui-monospace, monospace', 'Mono']], L.font, 'data-lsel="font"')) +
+    fieldRow('Bold', `<input type="checkbox" data-lchk="bold" ${L.bold ? 'checked' : ''}>`) + colorRow(L, 'color', 'Color'));
+  if (L.type === 'image') { const m = S.media[L.media]; h += sec('Image', `<div class="note" style="grid-column:1/-1">Source: <b>${esc(m ? m.name : 'missing')}</b>${m ? '' : ' — relink via File ▸ Import'}</div>` + fieldRow('Width', `<input type="number" data-lfn="iw" value="${L.iw}">`) + fieldRow('Height', `<input type="number" data-lfn="ih" value="${L.ih}">`) + `<div class="btnrow" style="grid-column:1/-1"><button class="btn" data-cmd="img.native">Reset to native size</button></div>`); }
+  if (L.type === 'audio') {
+    const m = S.media[L.media];
+    h += sec('♪ Audio', `<div class="note" style="grid-column:1/-1">${m ? `<b>${esc(m.name)}</b> · ${m.buffer ? round(m.buffer.duration, 2) + ' s · ' + Math.ceil(m.buffer.duration * S.doc.fps) + ' frames' : 'decoding…'}` : 'Missing media'}</div>` +
+      fieldRow('Start frame', `<input type="number" data-lfn="offset" value="${L.offset}">`) + numRow(L, 'gain', 'Gain', { step: 0.05, min: 0, max: 4 }) + fieldRow('Mute', `<input type="checkbox" data-lchk="mute" ${L.mute ? 'checked' : ''}>`) +
+      `<div class="btnrow" style="grid-column:1/-1"><button class="btn pri" data-cmd="ai.lipsync">Lip sync from this audio…</button><button class="btn" data-cmd="audio.fitend">Fit timeline to audio</button></div>`);
+  }
+  if (L.type === 'group') h += sec('Group', fieldRow('Masking', sel_('mask', [['none', 'No mask'], ['bottom', 'Bottom child masks the rest'], ['invert', 'Bottom child cuts out (invert)']], L.mask, 'data-lsel="mask"')) +
+    `<div class="note" style="grid-column:1/-1">Moving or rotating the group carries its ${L.children.length} children around the group pivot. Effects on a child affect only that child; effects on this group apply after the children are combined. Reordering inside the group never moves a child outside it.</div>`);
+  if (L.type === 'switch') {
+    const st = switchState(L, f), act = L.children.find((c) => c.id === st.cur);
+    h += sec('⇄ Switch Group', `<div class="note" style="grid-column:1/-1">${L.children.length} alternatives · active at frame ${f}: <b>${esc(act ? act.name : '—')}</b>. Keys store each drawing’s permanent ID, so renaming never breaks animation.</div>` +
+      fieldRow('Transition', sel_('swMode', [['discrete', 'Discrete (instant)'], ['crossfade', 'Crossfade']], L.swMode || 'discrete', 'data-lsel="swMode"')) +
+      (L.swMode === 'crossfade' ? fieldRow('Fade frames', `<input type="number" data-lfn="swFade" value="${L.swFade || 4}" min="1" max="48">`) : '') +
+      `<div class="note" style="grid-column:1/-1">Vector morphing needs drawings with matching point structure, so it isn’t offered automatically. Crossfade works with any drawings but can show a double image while overlapping.</div>
+      <div class="btnrow" style="grid-column:1/-1"><button class="btn" data-tab="switch">Switch editor</button><button class="btn" data-cmd="switch.align">Align alternatives</button><button class="btn" data-cmd="ai.lipsync">Lip sync…</button></div>`);
+  }
+  if (L.type === 'bone') {
+    const b = L.bones.find((x) => x.id === S.selBone);
+    if (b) h += sec('Bone: ' + esc(b.name), fieldRow('Name', `<input type="text" data-bf="name" value="${esc(b.name)}">`) +
+      fieldRow('Parent', sel_('parent', [['', '— root —'], ...L.bones.filter((x) => x.id !== b.id && !boneDescends(L, x.id, b.id)).map((x) => [x.id, x.name])], b.parent || '', 'data-bsel="parent"')) +
+      numRow(L, 'bone:' + b.id + ':a', 'Angle', { unit: '°' }) + numRow(L, 'bone:' + b.id + ':p', 'Position X', { comp: 0 }) + numRow(L, 'bone:' + b.id + ':p', 'Position Y', { comp: 1 }) + numRow(L, 'bone:' + b.id + ':s', 'Scale', { step: 0.01 }) +
+      fieldRow('Color', `<input type="color" data-bf="color" value="${b.color && b.color[0] === '#' ? b.color : '#6e8cff'}">`) +
+      fieldRow('Strength', `<input type="number" data-bfn="str" value="${b.str || 0}" min="0" title="Influence region for flexible binding (Bone strength tool)">`) +
+      fieldRow('Offset (exploded rig)', `<input type="number" data-bfn="ox" value="${b.ox || 0}" style="width:50%"><input type="number" data-bfn="oy" value="${b.oy || 0}" style="width:50%">`) +
+      ((L.vgroups || []).length ? fieldRow('Vitruvian group', sel_('vg', [['', '— all constructions —'], ...L.vgroups.map((g) => [g, g])], b.vg || '', 'data-bf="vg"')) : '') +
+      fieldRow('Physics', `<label><input type="checkbox" data-bdyn="on" ${b.dyn && b.dyn.on ? 'checked' : ''}> springy follow-through</label>`) +
+      (b.dyn && b.dyn.on ? fieldRow('Spring / damping', `<input type="number" data-bdyn="spring" value="${b.dyn.spring ?? 60}" style="width:50%"><input type="number" data-bdyn="damp" value="${b.dyn.damp ?? 11}" style="width:50%">`) : '') +
+      fieldRow('Length (setup)', `<input type="number" data-bfn="len" value="${b.len}" min="1">`) +
+      fieldRow('Angle limits', `<input type="number" data-bfn="min" value="${b.min ?? ''}" placeholder="min" style="width:50%"><input type="number" data-bfn="max" value="${b.max ?? ''}" placeholder="max" style="width:50%">`) +
+      fieldRow('IK', `<label><input type="checkbox" data-bchk="ikStop" ${b.ikStop ? 'checked' : ''}> stop IK chain here</label>`) +
+      `<div class="btnrow" style="grid-column:1/-1"><button class="btn danger" data-cmd="bone.del">Delete bone</button></div>`);
+  }
+  if (L.type === 'particle') {
+    h += sec('✦ Emitter', fieldRow('Preset', sel_('preset', [['', '— custom —'], ...Object.keys(PARTICLE_PRESETS).map((k) => [k, k])], L.preset || '', 'data-lsel="preset"')) +
+      fieldRow('Mode', sel_('mode', [['continuous', 'Continuous'], ['burst', 'Burst (one shot)']], L.mode, 'data-lsel="mode"')) +
+      fieldRow(L.mode === 'burst' ? 'Burst at frame' : 'Start frame', `<input type="number" data-lfn="startF" value="${L.startF}">`) +
+      (L.mode === 'burst' ? fieldRow('Burst count', `<input type="number" data-lfn="burst" value="${L.burst}" min="1" max="3000">`) : fieldRow('End frame', `<input type="number" data-lfn="endF" value="${L.endF}">`) + numRow(L, 'rate', 'Rate /s', { min: 0 })) +
+      fieldRow('Shape', sel_('shape', [['soft', 'Soft puff'], ['circle', 'Circle'], ['square', 'Square'], ['streak', 'Streak'], ['star', 'Star']], L.shape, 'data-lsel="shape"')) +
+      fieldRow('Emit from', sel_('emit', [['point', 'Point'], ['circle', 'Circle'], ['line', 'Line']], L.emit, 'data-lsel="emit"')) +
+      fieldRow('Seed', `<input type="number" data-lfn="seed" value="${L.seed}">`));
+    h += sec('Particle motion', numRow(L, 'life', 'Life (s)', { step: 0.05, min: 0.05 }) + numRow(L, 'speed', 'Speed') + numRow(L, 'speedVar', 'Speed random', { step: 0.05, min: 0, max: 1 }) + numRow(L, 'angle', 'Direction', { unit: '°' }) + numRow(L, 'spread', 'Spread', { unit: '°' }) +
+      numRow(L, 'gravity', 'Gravity') + numRow(L, 'wind', 'Wind') + numRow(L, 'drag', 'Drag', { step: 0.05, min: 0 }) + numRow(L, 'spin', 'Spin') + numRow(L, 'emitR', 'Emitter size', { min: 0 }));
+    h += sec('Over life', numRow(L, 'size0', 'Size start', { min: 0 }) + numRow(L, 'size1', 'Size end', { min: 0 }) + numRow(L, 'alpha0', 'Opacity start', { step: 0.01, min: 0, max: 1 }) + numRow(L, 'alpha1', 'Opacity end', { step: 0.01, min: 0, max: 1 }) + colorRow(L, 'color0', 'Color start') + colorRow(L, 'color1', 'Color end'));
+  }
+  // effects stack
+  let fx = '';
+  L.fx.forEach((e, i) => {
+    const def = FX[e.type]; let rows = '';
+    for (const [k, d] of Object.entries(def.params)) {
+      const path = 'fx:' + e.id + ':' + k;
+      if (typeof d[0] === 'string') rows += colorRow(L, path, k);
+      else if (typeof d[0] === 'boolean') rows += `<div class="prow" data-label="${k}"><span class="pl nodrag">${k}</span><span class="pv"><input type="checkbox" data-fxb="${e.id}:${k}" ${e.p[k] ? 'checked' : ''}></span><span></span></div>`;
+      else rows += numRow(L, path, k, { step: d[3], min: d[1], max: d[2] });
+    }
+    fx += `<div class="fxitem ${e.on ? '' : 'off'}"><div class="fxh"><input type="checkbox" data-fxon="${e.id}" ${e.on ? 'checked' : ''} title="Enable / bypass"><b>${i + 1}. ${esc(def.label)}</b>
+      <button class="ib sm" data-fxmv="${e.id}:-1" title="Move up (earlier)">▲</button><button class="ib sm" data-fxmv="${e.id}:1" title="Move down (later)">▼</button><button class="ib sm" data-fxrm="${e.id}" title="Remove">✕</button></div>
+      <div class="body" style="padding:5px 6px;display:grid;grid-template-columns:86px 1fr 22px;gap:4px 6px">${rows}</div></div>`;
+  });
+  h += sec('✨ Effects stack', `${fx || '<div class="note">No effects. Effects run top to bottom; order changes the result.</div>'}
+    <div class="btnrow"><select id="fxAdd"><option value="">＋ Add effect…</option>${Object.entries(FX).map(([k, d]) => `<option value="${k}">${d.label}</option>`).join('')}</select>
+    ${L.fx.length ? '<button class="btn" data-cmd="fx.savepreset">Save stack as preset</button>' : ''}${(S.doc.fxPresets || []).length ? '<button class="btn" data-cmd="fx.applypreset">Apply preset…</button>' : ''}</div>`, '', true);
+  return h;
+}
+function boneTree(B) {
+  const use = (id) => { let n = 0; walk(B.children, (A) => { if (A.bindBone === id) n++; if (A.pts) for (const p of Object.values(A.pts)) if (p.b && p.b.some((q) => q[0] === id)) { n++; } }); return n; };
+  const sel = new Set(selectedBoneIds());
+  const rec = (pid, d) => B.bones.filter((b) => (b.parent || null) === pid).map((b) => `<div class="bn ${sel.has(b.id) ? 'on' : ''}" data-bone="${b.id}" style="padding-left:${4 + d * 14}px">🦴 ${esc(b.name)}${b.dyn && b.dyn.on ? ' 〰' : ''}${b.vg ? ` <span style="color:var(--acc2)">[${esc(b.vg)}]</span>` : ''}<i>${use(b.id) ? use(b.id) + ' bound' : ''}${b.str ? ` · str ${b.str}` : ''}</i></div>` + rec(b.id, d + 1)).join('');
+  return rec(null, 0) || '<div class="note">No bones yet.</div>';
+}
+function multiRow(ls, path, label, step = 1) {
+  const vs = ls.map((l) => val(l, path, S.frame)), same = vs.every((v) => Math.abs(v - vs[0]) < 1e-9);
+  return `<div class="prow" data-label="${esc(label.toLowerCase())}"><span class="pl nodrag">${esc(label)}</span><span class="pv"><input type="number" step="${step}" class="${same ? '' : 'mixed'}" data-multi="${path}" value="${same ? round(vs[0], 3) : ''}" placeholder="${same ? '' : 'Mixed'}"></span><span></span></div>`;
+}
+function boneDescends(B, id, ancestorId) { let b = B.bones.find((x) => x.id === id); while (b && b.parent) { if (b.parent === ancestorId) return true; b = B.bones.find((x) => x.id === b.parent); } return false; }
+
+function bindProps(el) {
+  const L = selLayer();
+  // numeric fields
+  el.querySelectorAll('input[data-path]').forEach((inp) => {
+    const o = getOwner(inp.dataset.owner), path = inp.dataset.path, comp = inp.dataset.comp, sc = +inp.dataset.scale || 1;
+    const apply = (v) => { if (comp !== '') { const cur = val(o, path, S.frame).slice(); cur[+comp] = v; setVal(o, path, cur); } else setVal(o, path, v); };
+    if (inp.type === 'color') {
+      inp.oninput = () => { if (!H.pending) beginEdit('Change color'); apply(inp.value); requestDraw(); };
+      inp.onchange = () => commitEdit();
+    } else inp.onchange = () => { let v = +inp.value / sc; if (inp.min !== '') v = Math.max(+inp.min, v); if (inp.max !== '') v = Math.min(+inp.max, v); edit('Set ' + path, () => apply(v)); };
+  });
+  // drag-scrub labels
+  el.querySelectorAll('[data-scrub]').forEach((lab) => {
+    lab.onpointerdown = (e) => {
+      const o = getOwner(lab.dataset.owner), path = lab.dataset.scrub, comp = lab.dataset.comp, step = +lab.dataset.step || 1;
+      const mn = lab.dataset.min === '' ? -Infinity : +lab.dataset.min, mx = lab.dataset.max === '' ? Infinity : +lab.dataset.max;
+      let v0 = val(o, path, S.frame); if (comp !== '') v0 = v0[+comp];
+      const x0 = e.clientX; lab.setPointerCapture(e.pointerId); beginEdit('Adjust ' + path);
+      lab.onpointermove = (ev) => {
+        let v = clamp(v0 + (ev.clientX - x0) * step * (ev.shiftKey ? 10 : ev.altKey ? 0.1 : 1), mn, mx); v = round(v, 3);
+        if (comp !== '') { const cur = val(o, path, S.frame).slice(); cur[+comp] = v; setVal(o, path, cur); } else setVal(o, path, v);
+        const inp = lab.parentElement.querySelector(`input[data-path="${CSS.escape(path)}"]${comp !== '' ? `[data-comp="${comp}"]` : ''}`); if (inp) inp.value = v;
+        requestDraw();
+      };
+      lab.onpointerup = () => { lab.onpointermove = null; commitEdit(); };
+    };
+  });
+  // key buttons
+  el.querySelectorAll('[data-key]').forEach((b) => (b.onclick = () => {
+    const o = getOwner(b.dataset.owner), path = b.dataset.key, f = S.frame;
+    edit('Toggle key', () => {
+      const k = keyAt(o, path, f);
+      if (actActive()&&!actOwnsLayer(o))throw Error('Select a layer inside the active Action');
+      if (k) { const ch = o.ch[path]; ch.keys = ch.keys.filter((x) => x !== k); if (!ch.keys.length || (!actActive() && ch.keys.length === 1)) { if (ch.keys.length) baseSet(o, path, ch.keys[0].v); delete o.ch[path]; } }
+      else { const v = val(o, path, f); if (!o.ch[path]) { o.ch[path] = { keys: [] }; if (f !== 0) setKey(o.ch[path], 0, baseGet(o, path), DISCRETE(path) ? 'step' : undefined); } setKey(o.ch[path], f, v, DISCRETE(path) ? 'step' : undefined); }
+    });
+  }));
+  // document fields
+  el.querySelectorAll('[data-doc]').forEach((i) => (i.onchange = () => edit('Project settings', () => { const k = i.dataset.doc; S.doc[k] = i.type === 'number' ? Math.max(1, +i.value | 0) : i.value; if (k === 'name') updateTitle(); })));
+  if (!L) return bindCommon(el);
+  el.querySelectorAll('[data-multi]').forEach((i) => (i.onchange = () => { if (i.value === '') return; const v = +i.value, ls = S.selLayers.map((id) => findLayer(id)).filter((l) => l && l.type !== 'audio'); edit(`Set ${i.dataset.multi} on ${ls.length} layers`, () => ls.forEach((l) => setVal(l, i.dataset.multi, v))); }));
+  el.querySelectorAll('[data-piv]').forEach((i) => (i.onchange = () => edit('Move pivot', () => (L.p[i.dataset.piv] = +i.value))));
+  el.querySelectorAll('[data-bone]').forEach((i) => (i.onclick = (e) => selectBone(i.dataset.bone, e.shiftKey)));
+  el.querySelectorAll('[data-ctx2="poseparent"]').forEach((i) => (i.onclick = () => setTool('bonemanip')));
+  el.querySelectorAll('[data-lf]').forEach((i) => (i.onchange = () => edit('Edit ' + i.dataset.lf, () => (L[i.dataset.lf] = i.value))));
+  el.querySelectorAll('[data-lfn]').forEach((i) => (i.onchange = () => edit('Edit ' + i.dataset.lfn, () => (L[i.dataset.lfn] = +i.value))));
+  el.querySelectorAll('[data-lchk]').forEach((i) => (i.onchange = () => edit('Toggle ' + i.dataset.lchk, () => (L[i.dataset.lchk] = i.checked))));
+  el.querySelectorAll('[data-lsel]').forEach((i) => (i.onchange = () => edit('Set ' + i.dataset.lsel, () => {
+    const k = i.dataset.lsel;
+    if (k === 'preset') { if (i.value) applyParticlePreset(L, i.value); else L.preset = ''; }
+    else if (k === 'bindBone') { L.bindBone = i.value || null; if (S.frame !== 0) toast('Tip: bind at frame 0 so the rest pose matches', 'err'); }
+    else L[k] = i.value;
+  })));
+  el.querySelectorAll('[data-curv]').forEach((i) => (i.onchange = () => edit('Curvature', () => (L.pts[i.dataset.curv].c = clamp(+i.value, 0, 2.5)))));
+  // bones
+  const b = L.bones && L.bones.find((x) => x.id === S.selBone);
+  if (b) {
+    el.querySelectorAll('[data-bf]').forEach((i) => (i.onchange = () => edit('Bone ' + i.dataset.bf, () => (b[i.dataset.bf] = i.value))));
+    el.querySelectorAll('[data-bdyn]').forEach((i) => (i.onchange = () => edit('Bone physics', () => { b.dyn = { spring: 60, damp: 11, inertia: 0.6, ...(b.dyn || {}) }; b.dyn[i.dataset.bdyn] = i.type === 'checkbox' ? i.checked : +i.value; })));
+    el.querySelectorAll('[data-bfn]').forEach((i) => (i.onchange = () => edit('Bone ' + i.dataset.bfn, () => { if (i.value === '') delete b[i.dataset.bfn]; else b[i.dataset.bfn] = +i.value; })));
+    el.querySelectorAll('[data-bchk]').forEach((i) => (i.onchange = () => edit('Bone IK', () => (b[i.dataset.bchk] = i.checked))));
+    el.querySelectorAll('[data-bsel]').forEach((i) => (i.onchange = () => edit('Reparent bone', () => reparentBone(L, b, i.value || null))));
+  }
+  // effects
+  el.querySelectorAll('[data-fxon]').forEach((i) => (i.onchange = () => edit('Toggle effect', () => { const e = L.fx.find((x) => x.id === i.dataset.fxon); e.on = i.checked; })));
+  el.querySelectorAll('[data-fxb]').forEach((i) => (i.onchange = () => edit('Effect option', () => { const [id, k] = i.dataset.fxb.split(':'); L.fx.find((x) => x.id === id).p[k] = i.checked; })));
+  el.querySelectorAll('[data-fxrm]').forEach((i) => (i.onclick = () => edit('Remove effect', () => { const id = i.dataset.fxrm; L.fx = L.fx.filter((x) => x.id !== id); deleteChannelsMatching(L, (k) => k.startsWith('fx:' + id + ':')); })));
+  el.querySelectorAll('[data-fxmv]').forEach((i) => (i.onclick = () => edit('Reorder effect', () => { const [id, d] = i.dataset.fxmv.split(':'); const a = L.fx.findIndex((x) => x.id === id), t = a + +d; if (t < 0 || t >= L.fx.length) return; const [e] = L.fx.splice(a, 1); L.fx.splice(t, 0, e); })));
+  const fa = $('#fxAdd'); if (fa) fa.onchange = () => { if (fa.value) addEffect(L, fa.value); };
+  bindCommon(el);
+}
+function bindCommon(el) {
+  el.querySelectorAll('[data-cmd]').forEach((b) => (b.onclick = () => runCmd(b.dataset.cmd)));
+  el.querySelectorAll('[data-tool]').forEach((b) => (b.onclick = () => setTool(b.dataset.tool)));
+  el.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+}
+function addEffect(L, type, params = {}) {
+  let e;
+  edit('Add effect: ' + FX[type].label, () => { e = { id: uid('fx'), type, on: true, p: { ...fxDefaults(type), ...params } }; L.fx.push(e); });
+  return e;
+}
+
+// ---------- style panel ----------
+function renderStyle() {
+  const el = $('#tabBody'), ns = S.newStyle, L = selLayer();
+  const sh = L && L.type === 'vector' && L.shapes.find((s) => s.id === S.selShape);
+  let h = sec('New shape defaults', fieldRow('Fill', `<input type="checkbox" data-ns="fillOn" ${ns.fillOn ? 'checked' : ''}><input type="color" data-ns="fill" value="${ns.fill}">`) +
+    fieldRow('Stroke', `<input type="checkbox" data-ns="strokeOn" ${ns.strokeOn ? 'checked' : ''}><input type="color" data-ns="stroke" value="${ns.stroke}">`) +
+    fieldRow('Line width', `<input type="number" data-ns="width" value="${ns.width}" min="0" step="0.5">`) +
+    `<div class="note" style="grid-column:1/-1">These apply to <b>new</b> shapes you draw. They never change existing artwork.</div>`);
+  if (sh) {
+    const st = shapeStyle(L, sh, S.frame), linked = sh.styleId && S.doc.styles.find((s) => s.id === sh.styleId);
+    h += sec('Selected shape', (linked ? `<div class="note" style="grid-column:1/-1">Appearance comes from shared style <b>${esc(linked.name)}</b>. Unlink to edit or animate it here.</div>` :
+      fieldRow('Fill on', `<input type="checkbox" data-shc="fillOn" ${sh.fillOn ? 'checked' : ''}>`) + colorRow(L, 'sh:' + sh.id + ':fill', 'Fill color') +
+      fieldRow('Stroke on', `<input type="checkbox" data-shc="strokeOn" ${sh.strokeOn ? 'checked' : ''}>`) + colorRow(L, 'sh:' + sh.id + ':stroke', 'Stroke color') + numRow(L, 'sh:' + sh.id + ':width', 'Line width', { step: 0.5, min: 0 })) +
+      fieldRow('Shared style', sel_('styleId', [['', '— none (own style) —'], ...S.doc.styles.map((s) => [s.id, s.name])], sh.styleId || '', 'data-shstyle="1"')) +
+      `<div class="btnrow" style="grid-column:1/-1"><button class="btn" data-cmd="shape.up">Raise</button><button class="btn" data-cmd="shape.down">Lower</button><button class="btn" data-cmd="shape.defaults">Apply defaults</button><button class="btn" data-cmd="style.fromshape">New shared style from shape</button><button class="btn danger" data-cmd="shape.del">Delete shape</button></div>`);
+    void st;
+  } else h += sec('Selected shape', `<div class="note">Select a shape with the <b>Select</b> tool (click it) or the <b>Points</b> tool to edit its fill and stroke.</div>`, '', true);
+  let stl = S.doc.styles.map((s) => `<div class="fxitem"><div class="fxh"><span class="sw" style="background:${s.fill}"></span><span class="sw" style="background:${s.stroke}"></span>
+     <input type="text" data-st="${s.id}:name" value="${esc(s.name)}" style="flex:1"><button class="ib sm" data-strm="${s.id}" title="Delete style">✕</button></div>
+     <div class="body" style="display:grid;grid-template-columns:86px 1fr 22px;gap:4px 6px;padding:5px 6px">
+     ${fieldRow('Fill', `<input type="checkbox" data-st="${s.id}:fillOn" ${s.fillOn ? 'checked' : ''}><input type="color" data-st="${s.id}:fill" value="${s.fill}">`)}
+     ${fieldRow('Stroke', `<input type="checkbox" data-st="${s.id}:strokeOn" ${s.strokeOn ? 'checked' : ''}><input type="color" data-st="${s.id}:stroke" value="${s.stroke}">`)}
+     ${fieldRow('Width', `<input type="number" data-st="${s.id}:width" value="${s.width}" min="0" step="0.5">`)}
+     <div class="note" style="grid-column:1/-1">Used by ${allLayers().filter((l) => l.shapes).reduce((n, l) => n + l.shapes.filter((x) => x.styleId === s.id).length, 0)} shapes</div></div></div>`).join('');
+  h += sec('Shared styles', (stl || '<div class="note">Shared styles (e.g. Skin, Jacket, Outline) update every linked shape at once.</div>') + `<div class="btnrow"><button class="btn" data-cmd="style.new">＋ New style from defaults</button></div>`, '', true);
+  h += sec('Document palette', `<div class="swatches">${S.doc.palette.map((c, i) => `<span class="sw" style="background:${c}" data-pal="${i}" title="${c} — click: fill · Shift: stroke · right-click: remove"></span>`).join('')}<button class="ib sm" data-cmd="pal.add" title="Add current fill color">＋</button></div>
+    <div class="btnrow"><button class="btn" data-cmd="pal.export">Export .gpl</button><button class="btn" data-cmd="pal.import">Import .gpl</button></div>`, '', true);
+  el.innerHTML = h;
+  el.querySelectorAll('[data-ns]').forEach((i) => (i.oninput = () => { const k = i.dataset.ns; ns[k] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value; renderToolOpts(); }));
+  if (sh) {
+    el.querySelectorAll('[data-shc]').forEach((i) => (i.onchange = () => edit('Shape ' + i.dataset.shc, () => (sh[i.dataset.shc] = i.checked))));
+    const ss = el.querySelector('[data-shstyle]'); if (ss) ss.onchange = () => edit('Link style', () => {
+      if (!ss.value && sh.styleId) { const s = S.doc.styles.find((x) => x.id === sh.styleId); if (s) Object.assign(sh, { fill: s.fill, stroke: s.stroke, width: s.width, fillOn: s.fillOn, strokeOn: s.strokeOn }); }
+      sh.styleId = ss.value || null;
+    });
+  }
+  el.querySelectorAll('[data-st]').forEach((i) => {
+    const [id, k] = i.dataset.st.split(':'), s = S.doc.styles.find((x) => x.id === id);
+    if (i.type === 'color') { i.oninput = () => { if (!H.pending) beginEdit('Edit style'); s[k] = i.value; requestDraw(); }; i.onchange = () => commitEdit(); }
+    else i.onchange = () => edit('Edit style', () => (s[k] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value));
+  });
+  el.querySelectorAll('[data-strm]').forEach((i) => (i.onclick = () => edit('Delete style', () => {
+    const s = S.doc.styles.find((x) => x.id === i.dataset.strm);
+    for (const l of allLayers()) if (l.shapes) for (const x of l.shapes) if (x.styleId === s.id) Object.assign(x, { fill: s.fill, stroke: s.stroke, width: s.width, fillOn: s.fillOn, strokeOn: s.strokeOn, styleId: null });
+    S.doc.styles = S.doc.styles.filter((x) => x !== s);
+  })));
+  el.querySelectorAll('[data-pal]').forEach((i) => {
+    i.onclick = (e) => { const c = S.doc.palette[+i.dataset.pal]; if (e.shiftKey) ns.stroke = c; else ns.fill = c; if (sh && !sh.styleId) edit('Apply palette color', () => setVal(L, 'sh:' + sh.id + (e.shiftKey ? ':stroke' : ':fill'), c)); else { renderToolOpts(); refreshAll(); } };
+    i.oncontextmenu = (e) => { e.preventDefault(); edit('Remove swatch', () => S.doc.palette.splice(+i.dataset.pal, 1)); };
+  });
+  bindCommon(el);
+}
+
+// ---------- switch panel ----------
+function switchTarget() { const L = selLayer(); if (!L) return null; if (L.type === 'switch') return L; const P = parentOf(L.id); return P && P.type === 'switch' ? P : null; }
+function renderSwitch() {
+  const el = $('#tabBody'), SW = switchTarget();
+  if (!SW) { el.innerHTML = sec('Switch Groups', `<div class="note">A <b>Switch Group</b> holds alternatives — mouths, hands, eyes, costumes, whole sub-groups — and renders one at a time. Keys store each alternative's permanent ID, so renaming “MBP” to “Closed lips” never breaks animation.<br><br>Select a Switch Group (or one of its alternatives) to manage it here.</div><div class="btnrow"><button class="btn pri" data-cmd="switch.mouthkit">Create starter mouth set</button><button class="btn" data-cmd="layer.newswitch">New empty Switch Group</button></div>`, '', true); bindCommon(el); return; }
+  const st = switchState(SW, S.frame), shown = swShown(SW), sel = selLayer();
+  const act = SW.children.find((c) => c.id === st.cur), prev = S.swPreview[SW.id] && SW.children.find((c) => c.id === S.swPreview[SW.id]);
+  el.innerHTML = sec('⇄ ' + esc(SW.name), `<div class="note" style="margin-top:0">Active at frame ${S.frame}: <b>${esc(act ? act.name : '—')}</b>${prev ? ` · previewing <b style="color:#4dabf7">${esc(prev.name)}</b> (not keyed) <a href="#" id="swClr" style="color:var(--acc)">clear</a>` : ''}</div>
+    <div class="note"><b>Click</b> a card to preview it · <b>Set active</b> keys it at the playhead · <b>Edit</b> selects that drawing so you can change it (no key is added).</div>
+    <div class="swgrid">${SW.children.map((c, i) => `<div class="swcard ${c.id === st.cur ? 'on' : ''} ${prev && c.id === prev.id ? 'prev' : ''}" data-swprev="${c.id}" title="Preview ${esc(c.name)}"><canvas width="140" height="104" data-th="${c.id}"></canvas><span>${i < 9 ? `<kbd>${i + 1}</kbd> ` : ''}${esc(c.name)}${c.id === st.cur ? ' ●' : ''}${sel === c ? ' ✎' : ''}</span>
+      <div class="acts"><button class="btn" data-swset="${c.id}" title="Key as active at frame ${S.frame}">Set active</button><button class="btn" data-swedit="${c.id}" title="Select to edit (no key)">Edit</button></div></div>`).join('') || '<div class="note">No alternatives yet.</div>'}</div>
+    <div class="btnrow" style="margin-top:8px"><button class="btn" data-cmd="switch.addchild">＋ Alternative</button><button class="btn" data-cmd="switch.align">Align on registration point</button><label class="note" style="margin:0 4px"><input type="checkbox" id="swOv" ${S.alignOverlay ? 'checked' : ''}> overlay</label></div>
+    <div class="btnrow"><button class="btn pri" data-cmd="ai.lipsync">✦ Lip sync…</button><button class="btn" data-cmd="switch.exportdat">Export Moho .dat</button><button class="btn" data-cmd="switch.importdat">Import .dat</button></div>
+    <div class="note">Number keys 1–9 set the matching alternative active at the playhead while this panel is open.</div>`, '', true);
+  el.querySelectorAll('[data-swprev]').forEach((c) => (c.onclick = (e) => { if (e.target.closest('button')) return; S.swPreview[SW.id] = c.dataset.swprev; refreshAll(); }));
+  el.querySelectorAll('[data-swset]').forEach((b) => (b.onclick = () => swSetActive(SW, b.dataset.swset)));
+  el.querySelectorAll('[data-swedit]').forEach((b) => (b.onclick = () => { S.selLayers = [b.dataset.swedit]; S.camSel = false; delete S.swPreview[SW.id]; refreshAll(); }));
+  const clr = $('#swClr'); if (clr) clr.onclick = (e) => { e.preventDefault(); delete S.swPreview[SW.id]; refreshAll(); };
+  const ov = $('#swOv'); if (ov) ov.onchange = () => { S.alignOverlay = ov.checked; refreshAll(); };
+  el.querySelectorAll('canvas[data-th]').forEach((cv) => drawThumb(cv, cv.dataset.th));
+  bindCommon(el);
+}
+function drawThumb(cv, id) {
+  const L = findLayer(id); if (!L) return;
+  const x = cv.getContext('2d'); x.fillStyle = '#ffffff'; x.fillRect(0, 0, cv.width, cv.height);
+  // fit the drawing: measure via stage-independent bbox
+  const lc = evalLC(L, S.frame); let pts = [];
+  const gather = (A, m) => { if (A.type === 'vector') { const P = deformedPts(A, S.frame, null); for (const k in P) pts.push(M.ap(m, P[k][0], P[k][1])); } if (A.children) A.children.forEach((c) => gather(c, M.mul(m, layerLocalM(c, S.frame)))); };
+  gather(L, lc.world);
+  if (!pts.length) return;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]), x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const s = Math.min((cv.width - 12) / Math.max(1, x1 - x0), (cv.height - 12) / Math.max(1, y1 - y0));
+  const view = M.chain(M.t(cv.width / 2, cv.height / 2), M.s(s), M.t(-(x0 + x1) / 2, -(y0 + y1) / 2));
+  const R = { f: S.frame, view, cam: () => M.I(), rec: null, export: false, W: cv.width, H: cv.height, only: null, onlyAnc: null, noTrail: true };
+  const pc = { base: M.mul(lc.base, M.I()), rel: lc.relParent, z: 0, B: lc.B, inOnly: false };
+  try { drawLayer(x, Object.assign({}, L, { vis: true }), R, pc); } catch (e) { console.warn(e); }
+}
+document.addEventListener('keydown', (e) => {
+  if (currentTab !== 'switch' || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
+  const n = +e.key; if (!(n >= 1 && n <= 9)) return;
+  const SW = switchTarget(); if (!SW || !SW.children[n - 1]) return;
+  e.preventDefault(); e.stopImmediatePropagation(); swSetActive(SW, SW.children[n - 1].id);
+}, true);
+
+function renderSide() {
+  if (document.activeElement && $('#tabBody').contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && document.activeElement.id !== 'inspSearch') return;
+  const st = $('#tabBody').scrollTop;
+  if (currentTab === 'props') renderProps();
+  else if (currentTab === 'style') renderStyle();
+  else if (currentTab === 'switch') renderSwitch();
+  else if (currentTab === 'ai') renderAI();
+  else if (currentTab === 'jobs') renderJobs();
+  $('#tabBody').scrollTop = st;
+}
+function initSide() {
+  $$('#sideTabs button').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+  $('#tabBody').addEventListener('focusout', () => setTimeout(() => { if (!$('#tabBody').contains(document.activeElement)) { _panelsDirty = true; requestDraw(); } }, 0));
+}
+
+/* ===================== Popai Animator — AI assistant (structured commands), lip sync, jobs ===================== */
+
+// ---------- job system ----------
+const Jobs = { list: [] };
+function runJob(name, kind, fn) {
+  const job = { id: uid('j'), name, kind, status: 'running', progress: 0, msg: 'Starting…', cancel: false, t0: Date.now() };
+  Jobs.list.unshift(job); updateJobBadge(); if (currentTab === 'jobs') refreshAll();
+  const tick = (p, msg) => { job.progress = clamp(p, 0, 1); if (msg) job.msg = msg; if (currentTab === 'jobs') renderJobs(); };
+  Promise.resolve().then(() => fn(job, tick)).then((r) => {
+    if (job.cancel) { job.status = 'cancelled'; job.msg = kind.includes('render') || kind.includes('recording') ? 'Cancelled — completed download parts may remain' : 'Cancelled — project unchanged'; }
+    else { job.status = 'done'; job.progress = 1; job.msg = (r && r.msg) || 'Done'; }
+  }).catch((e) => { console.error(e); job.status = 'failed'; job.msg = e.message || String(e); toast(name + ' failed: ' + job.msg, 'err'); })
+    .finally(() => { job.t1 = Date.now(); updateJobBadge(); if (currentTab === 'jobs') renderJobs(); });
+  return job;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function updateJobBadge() { const n = Jobs.list.filter((j) => j.status === 'running').length; $('#jobBadge').textContent = n ? n : ''; }
+function renderJobs() {
+  const el = $('#tabBody');
+  el.innerHTML = sec('Jobs', Jobs.list.length ? Jobs.list.map((j) => `<div class="job ${j.status}"><div style="display:flex;gap:6px;align-items:center"><b style="flex:1">${esc(j.name)}</b><span style="color:var(--dim)">${j.status}</span>${j.status === 'running' ? `<button class="ib sm" data-jc="${j.id}">Cancel</button>` : ''}</div>
+    <div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><div class="note">${esc(j.msg)}${j.t1 ? ` · ${round((j.t1 - j.t0) / 1000, 1)} s` : ''} · ${j.kind}</div></div>`).join('') :
+    '<div class="note">Long tasks — lip-sync analysis, image-sequence and video export — run here with progress and cancel. Cancelling never leaves a half-written result in your project.</div>', Jobs.list.some((j) => j.status !== 'running') ? '<button class="ib sm" id="jobsClear">Clear finished</button>' : '', true);
+  el.querySelectorAll('[data-jc]').forEach((b) => (b.onclick = () => { const j = Jobs.list.find((x) => x.id === b.dataset.jc); if (j) { j.cancel = true; j.msg = 'Cancelling…'; renderJobs(); } }));
+  const c = $('#jobsClear'); if (c) c.onclick = () => { Jobs.list = Jobs.list.filter((j) => j.status === 'running'); renderJobs(); };
+}
+
+// ---------- assistant: natural language -> validated document commands ----------
+const COLORS = { red: '#e63946', orange: '#ff8a3d', yellow: '#ffd166', gold: '#f4c542', green: '#5ccf8a', blue: '#3a86ff', cyan: '#3bc9db', teal: '#20a39e', purple: '#9b5de5', violet: '#9b5de5', pink: '#ff8fb1', white: '#ffffff', black: '#111111', brown: '#8d5a3b', grey: '#8a8a8a', gray: '#8a8a8a', fire: '#ff6a00', electric: '#7df9ff' };
+const NUMW = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twice: 2, once: 1, thrice: 3, half: 0.5 };
+const AI_SUGGEST = ['make it jump at frame 12, leave a glowing trail, shake the camera on landing and add dust', 'fade in over 12 frames', 'move this layer left 200 over 24 frames', 'spin twice over 48 frames', 'add a blue glow', 'push the camera in to 140% over 36 frames', 'make these keys linear', 'duplicate this 3 times', 'make it bounce 3 times', 'add sparks at frame 20'];
+
+function aiNum(s, re, def) { const m = s.match(re); if (!m) return def; const t = m[1]; return isNaN(+t) ? NUMW[t] ?? def : +t; }
+function aiColor(s) { for (const k in COLORS) if (new RegExp('\\b' + k + '\\b').test(s)) return COLORS[k]; const m = s.match(/#[0-9a-f]{6}/i); return m ? m[0] : null; }
+function aiFindLayer(s) {
+  let best = null;
+  for (const L of allLayers()) { const n = L.name.toLowerCase(); if (n.length >= 2 && nameMentioned(s,n) && (!best || n.length > best.name.length)) best = L; }
+  return best;
+}
+function parseAI(text) {
+  const out = { cmds: [], notes: [] };
+  const fps = S.doc.fps, ctx = { landing: null };
+  const clauses = text.toLowerCase().replace(/[.!?]+$/, '').split(/\s*(?:,(?!\s*-?\d+\s*\))|;|\bthen\b|\band also\b|\band\b)\s*/).filter((c) => c.trim());
+  let lastTarget = null;
+  const NUM = '(\\d+(?:\\.\\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|twice|once|thrice)';
+  for (const c of clauses) {
+    const named = aiFindLayer(c);
+    const targets = named ? [named.id] : lastTarget ? lastTarget : S.selLayers.slice();
+    const at = aiNum(c, /(?:at|on|from) frame (\d+)/, null) ?? aiNum(c, /\bat (\d+)\b/, null);
+    let dur = aiNum(c, new RegExp('(?:over|in|for|within) ' + NUM + ' frames?'), null);
+    const secs = aiNum(c, new RegExp('(?:over|in|for|within) ' + NUM + ' (?:seconds?|secs?|s)\\b'), null);
+    if (secs !== null) dur = Math.round(secs * fps);
+    const onLanding = /land|impact|hit/.test(c) && ctx.landing !== null;
+    const isEvent = /shake|dust|smoke|sparks?|impact|puff/.test(c) && ctx.landing !== null; // follow-up effects attach to the last landing
+    const start = at ?? (onLanding || isEvent ? ctx.landing : S.frame);
+    const need = (op) => { if (!targets.length) { out.notes.push(`“${c}” — select a layer (or name one) for ${op}.`); return false; } return true; };
+    const add = (cmd) => { out.cmds.push(cmd); };
+    lastTarget = named ? [named.id] : lastTarget;
+    let m;
+    if (/lip ?sync|viseme|mouth sync/.test(c)) { add({ op: 'lipsync', desc: 'Open lip-sync setup' }); continue; }
+    // switch groups: choose an alternative by name ("show O at frame 10", "set the hand to fist")
+    const tL = targets.length === 1 ? findLayer(targets[0]) : null;
+    const SWt = tL && (tL.type === 'switch' ? tL : (parentOf(tL.id) || {}).type === 'switch' ? parentOf(tL.id) : null);
+    if (SWt) {
+      const alt = SWt.children.filter((ch) => new RegExp('\\b' + ch.name.toLowerCase().replace(/[^a-z0-9 ]/g, '') + '\\b').test(c)).sort((a, b) => b.name.length - a.name.length)[0];
+      if (alt && /(show|set|switch|use|make|change|pick|to)\b/.test(c)) { add({ op: 'swset', target: SWt.id, child: alt.id, start, desc: `Set “${SWt.name}” to “${alt.name}” at frame ${start}` }); continue; }
+    }
+    if (/\b(angry|happy|sad|surprised|scared|shocked|smile|smiling|frown|cry|crying|expression|mood)\b/.test(c)) {
+      const word = c.match(/\b(angry|happy|sad|surprised|scared|shocked|smile|smiling|frown|cry|crying)\b/);
+      const sws = (tL && isContainer(tL) ? [tL, ...allLayersIn(tL)] : tL ? [tL] : []).filter((l) => l.type === 'switch');
+      const hits = word ? sws.map((sw) => ({ sw, alt: sw.children.find((ch) => ch.name.toLowerCase().includes(word[1].replace(/ing$/, ''))) })).filter((x) => x.alt) : [];
+      hits.forEach(({ sw, alt }) => add({ op: 'swset', target: sw.id, child: alt.id, start, desc: `Set “${sw.name}” to “${alt.name}”` }));
+      out.notes.push(`An expression usually involves several parts — brows, eyes, mouth and head. ${hits.length ? 'I only changed the switch drawings named for it in your selection.' : 'Nothing in your selection has a drawing named for it.'} Select the head group (or those parts) and name the drawings to use; I won't change unrelated layers on my own.`);
+      continue;
+    }
+    if (tL && tL.type === 'particle' && (m = c.match(/\b(dust|smoke|sparks?|fire|snow|rain|magic)\b/)) && !/\badd\b/.test(c)) {
+      const key = { dust: 'Dust', smoke: 'Smoke', spark: 'Sparks', sparks: 'Sparks', fire: 'Fire', snow: 'Snow', rain: 'Rain', magic: 'Magic' }[m[1]];
+      add({ op: 'ppreset', target: tL.id, preset: key, desc: `Change “${tL.name}” to the ${key} preset` }); continue;
+    }
+    if (/\bjump/.test(c)) {
+      if (!need('jump')) continue;
+      const h = aiNum(c, /(\d+)\s*(?:px|pixels?)?\s*(?:high|tall)/, 160), d = dur ?? 16;
+      for (const t of targets) add({ op: 'jump', target: t, start, dur: d, height: h, desc: `Jump ${h}px at frame ${start} (${d} frames, squash & stretch)` });
+      ctx.landing = start + d; continue;
+    }
+    if (/bounce/.test(c)) {
+      if (!need('bounce')) continue;
+      const n = aiNum(c, new RegExp(NUM + ' times?'), 3), d = dur ?? 12 * n;
+      for (const t of targets) add({ op: 'bounce', target: t, start, dur: d, n, height: aiNum(c, /(\d+)\s*(?:px|pixels?)/, 140), desc: `Bounce ${n}× from frame ${start} over ${d} frames` });
+      ctx.landing = start + d; continue;
+    }
+    if (/shake/.test(c) && /camera|screen|cam\b/.test(c) || /camera shake/.test(c)) {
+      const amp = aiNum(c, /(?:strength|amount|by) (\d+)/, /big|hard|strong|huge/.test(c) ? 32 : /small|subtle|light|little/.test(c) ? 8 : 18);
+      const d = dur ?? 10;
+      add({ op: 'camshake', start, dur: d, amp, desc: `Camera shake ${amp}px at frame ${start} decaying over ${d} frames` }); continue;
+    }
+    if (/camera|cam\b/.test(c) && /dolly/.test(c)) {
+      const clean=c.replace(/(?:at|on|from) frame \d+/g,'').replace(/(?:over|in|for|within) \d+(?:\.\d+)? (?:frames?|seconds?|secs?)/g,'');
+      let distance=aiNum(clean,/(-?\d+(?:\.\d+)?)/,200);if(/back|out|away/.test(c))distance=-Math.abs(distance);
+      add({op:'camdolly',start,dur:dur??36,distance,desc:`Dolly camera ${distance>=0?'forward':'back'} ${Math.abs(distance)} units`});continue;
+    }
+    if (/camera|cam\b/.test(c) && /pan|tilt|roll|turn/.test(c) && /degrees?|°/.test(c)) {
+      const amount=aiNum(c,/(-?\d+(?:\.\d+)?)\s*(?:degrees?|°)/,15),d=dur??24;
+      const pan=/pan|turn/.test(c)?(/left/.test(c)?-Math.abs(amount):amount):0,tilt=/tilt/.test(c)?(/down/.test(c)?-Math.abs(amount):amount):0,roll=/roll/.test(c)?(/counter|anticlock/.test(c)?-Math.abs(amount):amount):0;
+      add({op:'camturn',start,dur:d,pan,tilt,roll,desc:`Turn camera: pan ${pan}°, tilt ${tilt}°, roll ${roll}°`});continue;
+    }
+    if (/camera|cam\b/.test(c) && /(zoom|push|pull)/.test(c)) {
+      let z = aiNum(c, /(\d+(?:\.\d+)?)\s*%/, null); z = z !== null ? z / 100 : /out|pull|back/.test(c) ? 0.75 : 1.35;
+      const d = dur ?? 36;
+      add({ op: 'camzoom', start, dur: d, zoom: z, desc: `Camera zoom to ${Math.round(z * 100)}% over ${d} frames from ${start}` }); continue;
+    }
+    if (/camera|cam\b/.test(c) && /(pan|track|move)/.test(c)) {
+      const amt = aiNum(c.replace(/(?:at|on|from) frame \d+/g, '').replace(/(?:over|in|for|within) \d+(?:\.\d+)? (?:frames?|seconds?|secs?)/g, ''), /(\d+(?:\.\d+)?)\b(?!\s*(?:frames?|%|seconds?|secs?|s\b))/, 200), d = dur ?? 36;
+      const dx = /left/.test(c) ? -amt : /right/.test(c) ? amt : 0, dy = /\bup\b/.test(c) ? -amt : /down/.test(c) ? amt : 0;
+      add({ op: 'campan', start, dur: d, dx, dy, desc: `Camera track (${dx}, ${dy}) over ${d} frames` }); continue;
+    }
+    if ((m = c.match(/\b(dust|smoke|sparks?|fire|snow|rain|magic|sparkles?)\b/)) && /(add|with|leave|kick|spawn|emit|make|create|puff)/.test(c + ' add')) {
+      const key = { dust: 'Dust', smoke: 'Smoke', spark: 'Sparks', sparks: 'Sparks', fire: 'Fire', snow: 'Snow', rain: 'Rain', magic: 'Magic', sparkle: 'Magic', sparkles: 'Magic' }[m[1]];
+      add({ op: 'particles', preset: key, target: targets[0] || null, start, desc: `${key} emitter at frame ${start}${targets[0] ? ' at ' + findLayer(targets[0]).name : ''}` }); continue;
+    }
+    if (/trail|echo|ghost/.test(c)) {
+      if (!need('a trail')) continue;
+      const glowing = /glow/.test(c); const col = aiColor(c) || '#ffd27a';
+      for (const t of targets) add({ op: 'trail', target: t, glow: glowing, color: col, desc: `Motion trail${glowing ? ' + glow' : ''} effect` }); continue;
+    }
+    const fxWords = { glow: 'glow', bloom: 'glow', blur: 'blur', shadow: 'shadow', outline: 'outline', pixel: 'pixelate', mosaic: 'pixelate', grain: 'noise', noise: 'noise', chromatic: 'chroma', 'directional blur': 'streak', 'motion blur': 'streak' };
+    let fxType = null; for (const k in fxWords) if (c.includes(k)) fxType = fxWords[k];
+    if (fxType && /(add|give|apply|put|make|with)/.test(c + ' add')) {
+      if (!need('an effect')) continue;
+      const params = {}; const col = aiColor(c);
+      if (col && 'color' in FX[fxType].params) params.color = col;
+      if (fxType === 'blur') params.radius = aiNum(c, /(\d+)/, 8);
+      for (const t of targets) add({ op: 'fx', target: t, type: fxType, params, desc: `Add ${FX[fxType].label}${col ? ' (' + col + ')' : ''}` }); continue;
+    }
+    if (/fade/.test(c)) {
+      if (!need('fade')) continue;
+      const out_ = /out/.test(c), d = dur ?? 12;
+      for (const t of targets) add({ op: 'fade', target: t, start, dur: d, out: out_, desc: `Fade ${out_ ? 'out' : 'in'} over ${d} frames from ${start}` }); continue;
+    }
+    if (/spin|rotate|turn/.test(c)) {
+      if (!need('rotate')) continue;
+      let deg = aiNum(c, /(-?\d+)\s*(?:°|deg|degrees?)/, null);
+      if (deg === null) { const n = aiNum(c, new RegExp(NUM + ' (?:times?|turns?|spins?|full)'), /spin/.test(c) ? 1 : null); deg = n !== null ? n * 360 : 90; }
+      if (/counter|anti|left/.test(c)) deg = -Math.abs(deg);
+      const d = dur ?? (/spin/.test(c) ? 24 : 0);
+      for (const t of targets) add({ op: 'rotate', target: t, start, dur: d, deg, desc: `Rotate ${deg}°${d ? ` over ${d} frames` : ''}` }); continue;
+    }
+    if (/scale|grow|shrink|bigger|smaller|size/.test(c)) {
+      if (!need('scale')) continue;
+      let k = aiNum(c, /(\d+(?:\.\d+)?)\s*%/, null); k = k !== null ? k / 100 : aiNum(c, /(?:by|to|x)\s*(\d+(?:\.\d+)?)/, /shrink|smaller/.test(c) ? 0.5 : 1.5);
+      const d = dur ?? 0;
+      for (const t of targets) add({ op: 'scale', target: t, start, dur: d, k, desc: `Scale to ${Math.round(k * 100)}%${d ? ` over ${d} frames` : ''}` }); continue;
+    }
+    if (/\b(move|slide|shift|nudge|go)\b/.test(c) && /(left|right|up|down|to )/.test(c)) {
+      if (!need('move')) continue;
+      const amt = aiNum(c.replace(/(?:at|on|from) frame \d+/g, '').replace(/(?:over|in|for|within) \d+(?:\.\d+)? (?:frames?|seconds?|secs?)/g, ''), /(\d+(?:\.\d+)?)\b(?!\s*(?:frames?|%|seconds?|secs?|s\b))/, /nudge/.test(c) ? 10 : 100);
+      let dx = 0, dy = 0;
+      if (/left/.test(c)) dx = -amt; if (/right/.test(c)) dx = amt; if (/\bup\b/.test(c)) dy = -amt; if (/down/.test(c)) dy = amt;
+      const abs = c.match(/to\s*\(?\s*(-?\d+)\s*,\s*(-?\d+)/);
+      const d = dur ?? 0;
+      for (const t of targets) add({ op: 'move', target: t, start, dur: d, dx, dy, abs: abs ? [+abs[1], +abs[2]] : null, desc: abs ? `Move to (${abs[1]}, ${abs[2]})` : `Move (${dx}, ${dy})${d ? ` over ${d} frames` : ''}` });
+      continue;
+    }
+    if (/duplicate|copy|clone/.test(c)) {
+      if (!need('duplicate')) continue;
+      const n = Math.min(50, aiNum(c, new RegExp(NUM + ' (?:times?|copies)'), 1));
+      for (const t of targets) add({ op: 'dup', target: t, n, spacing: aiNum(c, /(\d+)\s*(?:px|apart)/, 120), desc: `Duplicate ×${n}, spaced 120px` }); continue;
+    }
+    if ((m = c.match(/keys? (?:to |)(linear|smooth|step|stepped|hold|ease(?: in| out)?|bounce|elastic)/)) || (m = c.match(/(linear|smooth|stepped|ease in|ease out|eased) keys?/))) {
+      const it = { linear: 'linear', smooth: 'smooth', step: 'step', stepped: 'step', hold: 'step', ease: 'ease', eased: 'ease', 'ease in': 'easein', 'ease out': 'easeout', bounce: 'bounce', elastic: 'elastic' }[m[1]];
+      add({ op: 'interp', interp: it, targets: S.selKeys.size ? null : targets, desc: `Set ${S.selKeys.size ? S.selKeys.size + ' selected' : 'all'} keys to ${it}` }); continue;
+    }
+    if (/\b(hide|show)\b/.test(c)) { if (!need('visibility')) continue; for (const t of targets) add({ op: 'vis', target: t, on: /show/.test(c), desc: (/show/.test(c) ? 'Show ' : 'Hide ') + findLayer(t).name }); continue; }
+    if ((m = c.match(/rename (?:it |this |layer )?to (.+)/))) { if (!need('rename')) continue; add({ op: 'rename', target: targets[0], name: text.match(/rename (?:it |this |layer )?to (.+?)(?:,|$)/i)[1].trim(), desc: 'Rename to “' + m[1] + '”' }); continue; }
+    if (/(clear|remove|delete) (?:all )?(?:the )?(animation|keys)/.test(c)) { if (!need('clear animation')) continue; for (const t of targets) add({ op: 'clear', target: t, desc: 'Clear all animation on ' + findLayer(t).name }); continue; }
+    const col = aiColor(c);
+    if (col && /(make|color|colour|paint|turn|fill)/.test(c)) { if (!need('recolor')) continue; for (const t of targets) add({ op: 'color', target: t, color: col, desc: `Fill color → ${col}` }); continue; }
+    out.notes.push(`I couldn't map “${c}” to a supported command.`);
+  }
+  return out;
+}
+// what each layer type can sensibly receive (AI follows the same rules as the toolbar)
+const AI_CAN = {
+  audio: new Set(['lipsync', 'vis', 'rename']),
+  switch: null, group: null, bone: null, vector: null, image: null, text: null,
+  particle: new Set(['move', 'fade', 'rotate', 'scale', 'fx', 'trail', 'dup', 'vis', 'rename', 'clear', 'ppreset', 'interp', 'jump', 'bounce']),
+};
+function validateCmd(cmd) {
+  if (!cmd.target) return null;
+  const L = findLayer(cmd.target);
+  if (!L) return 'target layer no longer exists';
+  if (L.lock || ancestors(L.id).some((a) => a.lock)) return `“${L.name}” is locked — skipped`;
+  const can = AI_CAN[L.type];
+  if (can && !can.has(cmd.op)) return L.type === 'audio' ? `“${L.name}” is audio — it has no picture to ${cmd.op}; try lip sync or change its start frame` : `a ${LAYER_TYPES[L.type].name} layer can't do “${cmd.op}”`;
+  if (cmd.op === 'color' && (L.type === 'image' || L.type === 'particle')) return `recolouring needs vector shapes or text — “${L.name}” is ${LAYER_TYPES[L.type].name.toLowerCase()}`;
+  if (cmd.op === 'ppreset' && L.type !== 'particle') return 'presets apply to particle layers';
+  return null;
+}
+function allLayersIn(G) { const a = []; walk(G.children || [], (x) => { a.push(x); }); return a; }
+function aiSuggestions() {
+  const L = selLayer();
+  if (S.camSel) return ['zoom the camera to 140% over 36 frames', 'dolly the camera forward 300 over 48 frames', 'pan the camera right 15 degrees over 24 frames', 'shake the camera at frame 20'];
+  if (!L) return ['add snow', 'push the camera in to 130% over 48 frames', 'shake the camera at frame 30'];
+  const P = parentOf(L.id);
+  switch (L.type) {
+    case 'switch': return ['lip sync', ...L.children.slice(0, 3).map((c) => `show ${c.name} at frame ${S.frame + 6}`), 'make him angry'];
+    case 'bone': return ['make it jump at frame 12, leave a glowing trail, shake the camera on landing and add dust', 'move it right 300 over 48 frames', 'make it bounce 3 times', 'add dust at frame 20'];
+    case 'audio': return ['lip sync'];
+    case 'particle': return ['make it fire', 'make it smoke', 'fade out over 24 frames'];
+    case 'image': return ['add a drop shadow', 'fade in over 12 frames', 'add a blur', 'spin twice over 48 frames'];
+    case 'text': return ['fade in over 12 frames', 'make it gold', 'add an outline', 'make it bounce 2 times'];
+    case 'group': return ['fade in over 12 frames', 'add a soft shadow', 'move it left 200 over 24 frames', 'duplicate this 3 times'];
+    default: return [...(P && P.type === 'switch' ? [`show ${L.name} at frame ${S.frame}`] : []), 'make it red', 'add a blue glow', 'fade in over 12 frames', 'make it bounce 3 times', 'spin twice over 48 frames'];
+  }
+}
+function bottomCenterWorld(L, f) {
+  const lc = evalLC(L, f); let pts = [];
+  const gather = (A, m) => { if (A.type === 'vector') { const P = deformedPts(A, f, null); for (const k in P) pts.push(M.ap(m, P[k][0], P[k][1])); } if (A.type === 'image') [[-1, 1], [1, 1]].forEach(([x, y]) => pts.push(M.ap(m, (x * A.iw) / 2, (y * A.ih) / 2))); if (A.children) A.children.forEach((c) => gather(c, M.mul(m, layerLocalM(c, f)))); };
+  gather(L, lc.world);
+  if (!pts.length) return M.ap(lc.world, 0, 0);
+  const ys = pts.map((p) => p[1]), xs = pts.map((p) => p[0]);
+  return [(Math.min(...xs) + Math.max(...xs)) / 2, Math.max(...ys)];
+}
+function keyPair(o, path, f0, v0, f1, v1, i0) {
+  setVal(o, path, v0, f0, true); if (i0) { const k = keyAt(o, path, f0); if (k) k.i = i0; }
+  setVal(o, path, v1, f1, true);
+}
+function applyCmd(cmd) {
+  const L = cmd.target ? findLayer(cmd.target) : null, f = cmd.start ?? S.frame, cam = S.doc.camera;
+  switch (cmd.op) {
+    case 'jump': {
+      const y0 = val(L, 'y', f), d = cmd.dur, h = cmd.height, apex = f + Math.round(d / 2), land = f + d;
+      setVal(L, 'y', y0, f, true); keyAt(L, 'y', f).i = 'easeout';
+      setVal(L, 'y', y0 - h, apex, true); keyAt(L, 'y', apex).i = 'easein';
+      setVal(L, 'y', y0, land, true); keyAt(L, 'y', land).i = 'linear';
+      const sy0 = val(L, 'sy', f), sx0 = val(L, 'sx', f);
+      for (const [ff, k] of [[f - 3, 1], [f, 0.82], [f + 2, 1.14], [apex, 1], [land, 0.78], [land + 4, 1]]) { if (ff < 0) continue; setVal(L, 'sy', round(sy0 * k, 3), ff, true); setVal(L, 'sx', round(sx0 * (2 - k), 3), ff, true); }
+      return `jump keys on ${L.name}`;
+    }
+    case 'bounce': {
+      const y0 = val(L, 'y', f), seg = cmd.dur / cmd.n;
+      for (let i = 0; i < cmd.n; i++) {
+        const s = f + Math.round(i * seg), a = f + Math.round((i + 0.5) * seg), e = f + Math.round((i + 1) * seg), hh = cmd.height * Math.pow(0.6, i);
+        setVal(L, 'y', y0, s, true); keyAt(L, 'y', s).i = 'easeout'; setVal(L, 'y', y0 - hh, a, true); keyAt(L, 'y', a).i = 'easein'; setVal(L, 'y', y0, e, true);
+      }
+      return 'bounce keys';
+    }
+    case 'camshake': {
+      const s = Math.max(0, f - 1);
+      if (s < f) { setVal(cam, 'shake', 0, s, true); keyAt(cam, 'shake', s).i = 'linear'; }
+      setVal(cam, 'shake', cmd.amp, f, true); keyAt(cam, 'shake', f).i = 'easeout';
+      setVal(cam, 'shake', 0, f + cmd.dur, true);
+      return 'camera shake keys';
+    }
+    case 'camzoom': { const z0 = val(cam, 'zoom', f); keyPair(cam, 'zoom', f, z0, f + cmd.dur, round(cmd.zoom, 3), 'ease'); return 'camera zoom keys'; }
+    case 'campan': { const x0 = val(cam, 'x', f), y0 = val(cam, 'y', f); keyPair(cam, 'x', f, x0, f + cmd.dur, x0 + cmd.dx, 'ease'); keyPair(cam, 'y', f, y0, f + cmd.dur, y0 + cmd.dy, 'ease'); return 'camera track keys'; }
+    case 'camdolly': { const state=cameraStateAt(f);for(const [i,k]of ['x','y','z'].entries()){const start=val(cam,k,f);keyPair(cam,k,f,start,f+cmd.dur,start+state.forward[i]*cmd.distance,'ease');}return 'camera dolly keys'; }
+    case 'camturn': { for(const k of ['pan','tilt','roll'])if(cmd[k]){const start=val(cam,k,f);keyPair(cam,k,f,start,f+cmd.dur,clamp(start+cmd[k],...CAMERA_LIMITS[k]),'ease');}return 'camera rotation keys'; }
+    case 'particles': {
+      const P = mkLayer('particle', cmd.preset + (L ? ' · ' + L.name : ''));
+      applyParticlePreset(P, cmd.preset);
+      const pos = L ? bottomCenterWorld(L, f) : [0, 0];
+      if (cmd.preset === 'Snow' || cmd.preset === 'Rain') { P.p.x = 0; P.p.y = -S.doc.h / 2 - 40; } else { P.p.x = round(pos[0]); P.p.y = round(pos[1]); }
+      P.startF = f; if (P.mode === 'continuous' && cmd.preset !== 'Snow' && cmd.preset !== 'Rain' && cmd.preset !== 'Fire' && cmd.preset !== 'Smoke') P.endF = f + 24;
+      S.doc.layers.unshift(P);
+      return P.name + ' layer (editable emitter)';
+    }
+    case 'trail': {
+      L.fx.push({ id: uid('fx'), type: 'trail', on: true, p: { ...fxDefaults('trail') } });
+      if (cmd.glow) L.fx.push({ id: uid('fx'), type: 'glow', on: true, p: { ...fxDefaults('glow'), color: cmd.color, radius: 14, intensity: 1.2 } });
+      return 'trail effect';
+    }
+    case 'fx': L.fx.push({ id: uid('fx'), type: cmd.type, on: true, p: { ...fxDefaults(cmd.type), ...cmd.params } }); return FX[cmd.type].label;
+    case 'fade': {
+      const end = f + cmd.dur;
+      if (cmd.out) keyPair(L, 'opacity', f, val(L, 'opacity', f), end, 0, 'ease');
+      else { const o1 = val(L, 'opacity', end) || 1; keyPair(L, 'opacity', f, 0, end, o1 > 0 ? o1 : 1, 'ease'); }
+      return 'opacity keys';
+    }
+    case 'rotate': { const r0 = val(L, 'rot', f); if (cmd.dur) keyPair(L, 'rot', f, r0, f + cmd.dur, r0 + cmd.deg, cmd.deg % 360 === 0 ? 'linear' : 'ease'); else setVal(L, 'rot', r0 + cmd.deg, f); return 'rotation'; }
+    case 'scale': {
+      const a = val(L, 'sx', f), b = val(L, 'sy', f);
+      if (cmd.dur) { keyPair(L, 'sx', f, a, f + cmd.dur, round(a * cmd.k, 3), 'ease'); keyPair(L, 'sy', f, b, f + cmd.dur, round(b * cmd.k, 3), 'ease'); }
+      else { setVal(L, 'sx', round(a * cmd.k, 3), f); setVal(L, 'sy', round(b * cmd.k, 3), f); }
+      return 'scale';
+    }
+    case 'move': {
+      const x0 = val(L, 'x', f), y0 = val(L, 'y', f), x1 = cmd.abs ? cmd.abs[0] : x0 + cmd.dx, y1 = cmd.abs ? cmd.abs[1] : y0 + cmd.dy;
+      if (cmd.dur) { keyPair(L, 'x', f, x0, f + cmd.dur, x1, 'ease'); keyPair(L, 'y', f, y0, f + cmd.dur, y1, 'ease'); }
+      else { setVal(L, 'x', x1, f); setVal(L, 'y', y1, f); }
+      return 'position';
+    }
+    case 'dup': {
+      const sib = siblingsOf(L.id); let idx = sib.indexOf(L);
+      for (let i = 1; i <= cmd.n; i++) { const c = cloneLayer(L); c.name = L.name + ' ' + (i + 1); c.p.x = (c.p.x || 0) + cmd.spacing * i; if (c.ch.x) c.ch.x.keys.forEach((k) => (k.v += cmd.spacing * i)); sib.splice(idx, 0, c); }
+      return cmd.n + ' copies';
+    }
+    case 'interp': {
+      if (!cmd.targets) { for (const k of S.selKeys) { const q = parseKid(k), key = q.o && keyAt(q.o, q.path, q.f); if (key) key.i = cmd.interp; } return 'selected keys'; }
+      let n = 0; for (const t of cmd.targets) { const T = findLayer(t); if (T) for (const p in T.ch) T.ch[p].keys.forEach((k) => { k.i = cmd.interp; n++; }); }
+      return n + ' keys';
+    }
+    case 'vis': setVal(L, 'visible', cmd.on, f, true); return 'visibility key';
+    case 'swset': { const c = L.children.find((x) => x.id === cmd.child); setVal(L, 'sw', cmd.child, f, true); return `${L.name} → ${c ? c.name : '?'}`; }
+    case 'ppreset': applyParticlePreset(L, cmd.preset); return cmd.preset + ' preset';
+    case 'rename': L.name = cmd.name; return 'name';
+    case 'clear': for (const p of Object.keys(L.ch)) { const v = val(L, p, 0); baseSet(L, p, v); delete L.ch[p]; } return 'animation cleared';
+    case 'color': {
+      const apply = (A) => { if (A.shapes) for (const sh of A.shapes) { if (!sh.styleId) { setVal(A, 'sh:' + sh.id + ':fill', cmd.color); sh.fillOn = true; } } if (A.type === 'text') setVal(A, 'color', cmd.color); if (A.children) A.children.forEach(apply); };
+      apply(L); return 'fill colors';
+    }
+  }
+  throw new Error('unknown op ' + cmd.op);
+}
+async function aiPlan(text) {
+  const cfg = aiConfig();
+  if (cfg.useLLM && cfg.url && cfg.model) {
+    try { return await llmPlan(text, cfg); } catch (e) { toast('LLM engine failed, used local interpreter: ' + e.message, 'err'); }
+  }
+  return parseAI(text);
+}
+function aiConfig() { try { return JSON.parse(lsGet('popai.llm') || '{}'); } catch (e) { return {}; } }
+async function llmPlan(text, cfg) {
+  const ctx = { frame: S.frame, fps: S.doc.fps, end: S.doc.end, selected: S.selLayers.map((id) => findLayer(id)).filter(Boolean).map((L) => ({ id: L.id, name: L.name, type: L.type })), layers: allLayers().map((L) => ({ id: L.id, name: L.name, type: L.type })) };
+  const sys = `You convert animation requests into JSON commands for an animation editor. Reply ONLY with JSON: {"cmds":[...],"notes":[...]}. Allowed ops and fields:
+jump{target,start,dur,height} bounce{target,start,dur,n,height} camshake{start,dur,amp} camzoom{start,dur,zoom(absolute scale, 1.4 = 140%)} campan{start,dur,dx,dy}
+camdolly{start,dur,distance(positive forward, negative backward)} camturn{start,dur,pan,tilt,roll(angle changes in degrees, unused axes 0)}
+particles{preset:Dust|Fire|Smoke|Sparks|Snow|Rain|Magic,target?,start} trail{target,glow:boolean,color} fx{target,type:${Object.keys(FX).join('|')},params}
+fade{target,start,dur,out:boolean} rotate{target,start,dur,deg} scale{target,start,dur,k} move{target,start,dur,dx,dy} dup{target,n,spacing}
+interp{interp:${INTERPS.map((i) => i[0]).join('|')},targets:[ids]} vis{target,on} rename{target,name} clear{target} color{target,color:"#rrggbb"} lipsync{}
+swset{target:switchLayerId,child:childLayerId,start} ppreset{target,preset}
+Rules: audio layers only accept lipsync/vis/rename; only act on selected or explicitly named layers; for expressions spanning several parts, add a note instead of changing unselected layers.
+Each cmd also needs "desc" (short human description). target = layer id. Use selected layers when unspecified. Frames are integers.`;
+  const r = await fetch(cfg.url.replace(/\/$/, '') + '/chat/completions', {
+    method: 'POST', signal: AbortSignal.timeout(60000), headers: { 'Content-Type': 'application/json', ...(cfg.key ? { Authorization: 'Bearer ' + cfg.key } : {}) },
+    body: JSON.stringify({ model: cfg.model, temperature: 0, messages: [{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify({ request: text, context: ctx }) }] }),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const j = await r.json(), content = j.choices[0].message.content, js = content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1);
+  const plan = JSON.parse(js); if (!Array.isArray(plan.cmds) || plan.cmds.length > 200) throw new Error('Invalid command plan'); plan.notes = Array.isArray(plan.notes) ? plan.notes.filter(n => typeof n === 'string').slice(0, 50) : []; plan.engine = cfg.model;
+  return plan;
+}
+let aiPending = null, aiImmediate = false;
+function renderAI() {
+  const el = $('#tabBody'), log = S.doc.ai.log, cfg = aiConfig();
+  const scope = S.selLayers.map((id) => findLayer(id)).filter(Boolean);
+  el.innerHTML = `<div class="note" style="margin-top:0">Engine: <b>${cfg.useLLM && cfg.model ? esc(cfg.model) + ' (your endpoint)' : 'Local interpreter'}</b> · ${cfg.useLLM && cfg.url && cfg.model ? 'sends requests and layer names/IDs to your configured endpoint; no artwork' : 'local command parser; no network requests'}. Requests become ordinary, editable keys, effects and emitters — one Undo reverts each.</div>
+    <div class="ai-log">${log.map((m, i) => `<div class="ai-msg ${m.who}">${m.who === 'user' ? esc(m.text) : m.html}${m.who === 'bot' && m.pending && aiPending && aiPending.i === i ? `<div class="btnrow"><button class="btn pri" id="aiApply">Apply</button><button class="btn" id="aiDiscard">Discard</button></div>` : ''}${m.applied ? `<div class="btnrow"><button class="btn" data-aiundo="${i}">Revert</button></div>` : ''}</div>`).join('') || `<div class="note">Try one of these — select a layer first so I know what “it” means:</div>`}</div>
+    <div class="ai-input"><div class="chips"><span class="chip">Scope: <b>${scope.length ? esc(scope.map((l) => l.name).join(', ')) : 'nothing selected'}</b></span><span class="chip">Frame <b>${S.frame}</b></span>${[...S.selKeys].length ? `<span class="chip"><b>${S.selKeys.size}</b> keys</span>` : ''}</div>
+      <textarea id="aiText" placeholder="e.g. make it jump at frame 12, leave a glowing trail, shake the camera on landing and add dust"></textarea>
+      <div style="display:flex;gap:6px;align-items:center"><button class="btn pri" id="aiGo">Send ⏎</button><label style="color:var(--dim)"><input type="checkbox" id="aiImm" ${aiImmediate ? 'checked' : ''}> apply immediately</label><span style="margin-left:auto"></span><button class="ib sm" id="aiCfg" title="Engine settings">⚙</button>${log.length ? '<button class="ib sm" id="aiClear" title="Clear conversation">🧹</button>' : ''}</div>
+      <div class="sugg">${aiSuggestions().map((s) => `<button>${esc(s)}</button>`).join('')}</div></div>`;
+  const ta = $('#aiText');
+  ta.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); aiSend(ta.value); } e.stopPropagation(); };
+  $('#aiGo').onclick = () => aiSend(ta.value);
+  $('#aiImm').onchange = (e) => (aiImmediate = e.target.checked);
+  $$('.sugg button', el).forEach((b) => (b.onclick = () => { ta.value = b.textContent; ta.focus(); }));
+  const ap = $('#aiApply'); if (ap) ap.onclick = aiApplyPending;
+  const dc = $('#aiDiscard'); if (dc) dc.onclick = () => { const m = S.doc.ai.log[aiPending.i]; m.pending = false; m.html += '<div class="note">Discarded.</div>'; aiPending = null; renderAI(); };
+  $('#aiCfg').onclick = aiSettings;
+  const cl = $('#aiClear'); if (cl) cl.onclick = () => { S.doc.ai.log = []; aiPending = null; renderAI(); };
+  $$('[data-aiundo]', el).forEach((b) => (b.onclick = () => { const m = S.doc.ai.log[+b.dataset.aiundo]; const idx = H.undo.findIndex((u) => u.id === m.undoId); if (idx === H.undo.length - 1) { undo(); m.applied = false; m.html += '<div class="note">Reverted.</div>'; renderAI(); } else toast('Other edits happened after this — use Undo history (Ctrl+Z) to step back', 'err'); }));
+  el.scrollTop = el.scrollHeight;
+}
+async function aiSend(text) {
+  const originEpoch = documentEpoch, scope = requestScope(text), signature = sceneSignature();
+  text = (text || '').trim(); if (!text) return;
+  S.doc.ai.log.push({ who: 'user', text });
+  const plan = await aiPlan(text);
+  if (documentEpoch !== originEpoch || sceneSignature() !== signature) return toast('The scene changed while planning; send the request again', 'err');
+  if (!Array.isArray(plan.cmds) || plan.cmds.length > 200) return toast('Invalid or oversized AI plan', 'err');
+  for (const c of plan.cmds) { c._scope = scope; if(c.op === "interp" && !c.targets) c._keys = [...S.selKeys]; }
+  const items = plan.cmds.map((c) => { const err = validateCmd(c); return `<li class="${err ? 'err' : ''}">${esc(c.desc || c.op)}${err ? ' — ' + esc(err) : ''}</li>`; }).join('');
+  const html = plan.cmds.length ? `Plan (${plan.cmds.length} command${plan.cmds.length > 1 ? 's' : ''}):<ul class="cmds">${items}</ul>${plan.notes.map((n) => `<div class="note">${esc(n)}</div>`).join('')}<div class="note">Output: editable keyframes / effects / emitters.</div>`
+    : `Nothing to do yet.${plan.notes.map((n) => `<div class="note">${esc(n)}</div>`).join('')}<div class="note">I understand moves, fades, rotation, scale, jumps, bounces, camera shake/zoom/track, effects (glow, blur, shadow, outline, trail…), particles (dust, smoke, sparks, fire, snow, rain, magic), duplicates, key interpolation, colors and lip sync.</div>`;
+  S.doc.ai.log.push({ who: 'bot', html, pending: plan.cmds.length > 0 });
+  aiPending = plan.cmds.length ? { i: S.doc.ai.log.length - 1, plan, text, originEpoch, signature } : null;
+  if (aiPending && (aiImmediate || plan.cmds.every((c) => c.op === 'lipsync'))) return aiApplyPending();
+  renderAI();
+}
+function aiApplyPending() {
+  if (!aiPending) return;
+  const { plan, text, i, originEpoch, signature } = aiPending; aiPending = null;
+  if (originEpoch !== documentEpoch || signature !== sceneSignature()) return toast('The scene changed; generate a fresh plan before applying', 'err');
+  const errors = plan.cmds.map(validateCmd).filter(Boolean);
+  if (errors.length) return toast(errors.join('; '), 'err');
+  const m = S.doc.ai.log[i]; m.pending = false;
+  if (plan.cmds.some((c) => c.op === 'lipsync')) { setTimeout(openLipSync, 50); plan.cmds = plan.cmds.filter((c) => c.op !== 'lipsync'); if (!plan.cmds.length) { m.html += '<div class="note">Opened lip-sync setup.</div>'; renderAI(); return; } }
+  const results = [];
+  const undoLen = H.undo.length;
+  const appliedOK = edit('AI: ' + text.slice(0, 40), () => {
+    for (const c of plan.cmds) { const err = validateCmd(c); if (err) { results.push('skipped: ' + err); continue; } results.push(applyCmd(c)); }
+  });
+  if (appliedOK === false) { m.html += '<div class="note">Failed; all changes rolled back.</div>'; renderAI(); return; }
+  if (H.undo.length > undoLen) { const u = H.undo[H.undo.length - 1]; u.id = uid('u'); m.undoId = u.id; m.applied = true; }
+  m.html += `<div class="note" style="color:var(--good)">Applied: ${esc(results.join(' · '))}. Inspect them in the timeline and Properties.</div>`;
+  renderAI();
+}
+async function aiSettings() {
+  const c = aiConfig();
+  const r = await modal('AI engine settings', `<div class="note">The built-in <b>local interpreter</b> needs no connection. Optionally connect any <b>OpenAI-compatible</b> chat endpoint (e.g. a local LLM server, or OpenRouter). Requests send your text plus layer names/ids — no artwork. The model can only propose the same validated commands.</div>
+    <div class="form"><label>Use endpoint</label><input type="checkbox" name="useLLM" ${c.useLLM ? 'checked' : ''}>
+    <label>Base URL</label><input type="text" name="url" value="${esc(c.url || '')}" placeholder="https://openrouter.ai/api/v1">
+    <label>API key</label><input type="password" autocomplete="off" name="key" value="${esc(c.key || '')}" placeholder="optional (stored only in this browser)">
+    <label>Model</label><input type="text" name="model" value="${esc(c.model || '')}" placeholder="e.g. meta-llama/llama-3.1-8b-instruct"></div>`, [{ label: 'Cancel', value: false }, { label: 'Save', value: true, pri: true }]);
+  if (r && r.v) { try { lsSet('popai.llm', JSON.stringify(r.data)); } catch (e) {} renderAI(); }
+}
+
+// ---------- lip sync (sound-based: listens to the audio itself, not words — language independent) ----------
+const VISEMES = ['rest', 'MBP', 'AI', 'E', 'O', 'U', 'FV', 'L', 'WQ', 'etc'];
+const VISEME_FALLBACK = { WQ: ['WQ', 'U', 'O'], U: ['U', 'O', 'WQ'], O: ['O', 'U', 'AI'], E: ['E', 'etc', 'AI'], L: ['L', 'etc', 'E'], FV: ['FV', 'etc', 'MBP'], etc: ['etc', 'E', 'AI'], AI: ['AI', 'O', 'E'], MBP: ['MBP', 'rest'], rest: ['rest', 'MBP'] };
+function fftMag(re) { // in-place radix-2 FFT on real input -> magnitude (n/2)
+  const n = re.length, im = new Float32Array(n);
+  for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const a = i + j, b = a + len / 2, tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+  const m = new Float32Array(n / 2); for (let i = 0; i < n / 2; i++) m[i] = Math.hypot(re[i], im[i]); return m;
+}
+async function analyzeSpeech(buffer, fps, opt, job, tick) {
+  const sr = buffer.sampleRate, n = buffer.length, chs = buffer.numberOfChannels, mono = new Float32Array(n);
+  for (let c = 0; c < chs; c++) { const d = buffer.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / chs; }
+  const frames = Math.ceil((n / sr) * fps), N = 2048, hz = sr / N, feats = [];
+  const band = (m, a, b) => { let s = 0; for (let i = Math.floor(a / hz); i <= Math.min(m.length - 1, Math.ceil(b / hz)); i++) s += m[i] * m[i]; return s; };
+  const win = new Float32Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1));
+  for (let f = 0; f < frames; f++) {
+    if (job.cancel) return null;
+    const c = Math.floor(((f + 0.5) / fps) * sr), s0 = c - N / 2, buf = new Float32Array(N);
+    let rms = 0, zc = 0, prev = 0;
+    for (let i = 0; i < N; i++) { const v = mono[s0 + i] || 0; buf[i] = v * win[i]; rms += v * v; if ((v >= 0) !== (prev >= 0)) zc++; prev = v; }
+    rms = Math.sqrt(rms / N);
+    const m = fftMag(buf);
+    // first formant: strongest peak between 250 and 1000 Hz (above the voice pitch)
+    let pk = 0, f1Hz = 0; for (let i = Math.floor(250 / hz); i <= Math.ceil(1000 / hz); i++) if (m[i] > pk) { pk = m[i]; f1Hz = i * hz; }
+    feats.push({ rms, zcr: zc / N, f1Hz, b1: band(m, 250, 1000), b2: band(m, 1000, 1700), bE: band(m, 1700, 3200), b3: band(m, 2400, 5000), b4: band(m, 5000, 10000) });
+    if (f % 40 === 0) { tick(f / frames * 0.85, `Listening… frame ${f}/${frames}`); await sleep(0); }
+  }
+  const sorted = feats.map((x) => x.rms).sort((a, b) => a - b), p95 = sorted[Math.floor(sorted.length * 0.95)] || 1e-6;
+  const thr = clamp(0.32 - opt.sensitivity * 0.03, 0.03, 0.4);
+  let lab = feats.map((x) => {
+    const rel = x.rms / p95; if (rel < thr) return 'rest';
+    const hi = (x.b3 + x.b4) / (x.b1 + x.b2 + 1e-12), front = x.bE / (x.b1 + x.b2 + x.bE + 1e-12);
+    if (hi > 1.4 || (x.zcr > 0.18 && hi > 0.6)) return rel < 0.45 ? 'FV' : 'etc'; // hiss: s, sh, f, v, t, ch
+    if (front > 0.35) return rel > 0.4 ? 'E' : 'L';   // strong high second formant: ee / eh
+    if (x.f1Hz > 620) return rel > 0.35 ? 'AI' : 'etc'; // open jaw: ah
+    if (x.f1Hz > 420) return 'O';                       // mid, rounded: oh
+    return rel > 0.45 ? 'U' : 'WQ';                     // closed, rounded: oo / w
+  });
+  // closures: frame before speech onset becomes MBP; one-frame energy dips inside speech too
+  if (opt.closure) {
+    for (let i = 1; i < lab.length; i++) if (lab[i] !== 'rest' && lab[i - 1] === 'rest') lab[i - 1] = 'MBP';
+    for (let i = 1; i < lab.length - 1; i++) { const a = feats[i - 1].rms, b = feats[i].rms, c = feats[i + 1].rms; if (lab[i] !== 'rest' && b < a * 0.45 && b < c * 0.45) lab[i] = 'MBP'; }
+  }
+  // median smoothing then minimum hold
+  lab = lab.map((v, i) => { const w = [lab[i - 1], v, lab[i + 1]].filter(Boolean); const cnt = {}; w.forEach((x) => (cnt[x] = (cnt[x] || 0) + 1)); return Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][1] > 1 ? Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0] : v; });
+  const runs = []; for (let i = 0; i < lab.length; i++) { if (runs.length && runs[runs.length - 1].v === lab[i]) runs[runs.length - 1].n++; else runs.push({ f: i, v: lab[i], n: 1 }); }
+  const merged = [];
+  for (const r of runs) { if (merged.length && r.n < opt.minHold && r.v !== 'MBP') merged[merged.length - 1].n += r.n; else merged.push({ ...r }); }
+  tick(0.95, 'Writing keys…');
+  return merged.map((r) => ({ f: r.f, v: r.v }));
+}
+function mouthMapFor(SW) {
+  const map = {};
+  for (const v of VISEMES) {
+    for (const cand of VISEME_FALLBACK[v] || [v]) {
+      const c = SW.children.find((ch) => ch.name.toLowerCase().replace(/[^a-z]/g, '') === cand.toLowerCase());
+      if (c) { map[v] = c.id; break; }
+    }
+    if (!map[v]) map[v] = (SW.children[0] || {}).id || '';
+  }
+  return map;
+}
+async function openLipSync() {
+  const audios = allLayers().filter((L) => L.type === 'audio' && S.media[L.media] && S.media[L.media].buffer);
+  const sws = allLayers().filter((L) => L.type === 'switch');
+  if (!audios.length) return modal('Lip sync', '<div class="note">Import a WAV or MP3 first (File ▸ Import, or drop it on the stage).</div>', [{ label: 'OK', value: true, pri: true }]);
+  if (!sws.length) {
+    const r = await modal('Lip sync', '<div class="note">You need a <b>Switch layer</b> holding the mouth drawings. Create a starter mouth set (10 standard mouths you can redraw)?</div>', [{ label: 'Cancel', value: false }, { label: 'Create mouth set', value: true, pri: true }]);
+    if (!r || !r.v) return; runCmd('switch.mouthkit'); return openLipSync();
+  }
+  const sel = selLayer(), aDef = sel && sel.type === 'audio' ? sel.id : audios[0].id, swDef = switchTarget() ? switchTarget().id : sws[0].id;
+  const SW0 = findLayer(swDef), map0 = mouthMapFor(SW0);
+  const mapRows = (SW, map) => VISEMES.map((v) => `<label>${v}</label><select name="map_${v}">${SW.children.map((c) => `<option value="${c.id}" ${map[v] === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`).join('');
+  const body = `<div class="note">Engine: <b>Sound-based (local)</b> — it listens to the sound of the voice (energy, vowel colour, hiss), not to words, so it works the same for <b>Shona, English, or a mix</b>. It is a fast first pass: correct any mouth in the Switch panel afterwards. Your audio is never modified.</div>
+    <div class="form"><label>Audio layer</label><select name="audio">${audios.map((a) => `<option value="${a.id}" ${a.id === aDef ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+    <label>Switch (mouth) layer</label><select name="sw" id="lsSw">${sws.map((s) => `<option value="${s.id}" ${s.id === swDef ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
+    <label>Sensitivity</label><input type="range" name="sensitivity" min="0" max="10" value="5">
+    <label>Minimum hold (frames)</label><input type="number" name="minHold" value="2" min="1" max="8">
+    <label>Anticipation (frames)</label><input type="number" name="lead" value="1" min="0" max="4" title="Mouths lead the sound slightly, which reads as better sync">
+    <label>Closure bias</label><label><input type="checkbox" name="closure" checked> close the mouth (MBP) before words</label>
+    <label>Replace existing keys</label><label><input type="checkbox" name="replace" checked> in the audio's time range</label></div>
+    <h4 style="margin:12px 0 6px">Mouth mapping <span style="color:var(--faint);font-weight:400">— viseme → your drawing (auto-matched by name)</span></h4><div class="form" id="lsMap">${mapRows(SW0, map0)}</div>`;
+  setTimeout(() => { const s = $('#lsSw'); if (s) s.onchange = () => { const SW = findLayer(s.value); $('#lsMap').innerHTML = mapRows(SW, mouthMapFor(SW)); }; }, 30);
+  const r = await modal('✦ Auto lip sync', body, [{ label: 'Cancel', value: false }, { label: 'Analyze & create keys', value: true, pri: true }]);
+  if (!r || !r.v) return;
+  const originEpoch = documentEpoch, signature = sceneSignature();
+  const o = r.data, A = findLayer(o.audio), SW = findLayer(o.sw), media = S.media[A.media];
+  const map = {}; for (const v of VISEMES) map[v] = o['map_' + v];
+  setTab('jobs');
+  runJob('Lip sync: ' + A.name + ' → ' + SW.name, 'local · sound-based', async (job, tick) => {
+    const res = await analyzeSpeech(media.buffer, S.doc.fps, { sensitivity: +o.sensitivity, minHold: Math.max(1, o.minHold | 0), closure: o.closure }, job, tick);
+    if (!res || job.cancel) return;
+    if (documentEpoch !== originEpoch || sceneSignature() !== signature) throw new Error('Scene changed during analysis; run lip sync again');
+    const why = writeReason(findLayer(SW.id)); if (why) throw new Error(why);
+    const off = A.offset, lead = o.lead | 0, endF = off + Math.ceil(media.buffer.duration * S.doc.fps);
+    edit('Lip sync', () => {
+      const L = findLayer(SW.id);
+      if (!L.ch.sw) { L.ch.sw = { keys: [] }; if (off > 0) setKey(L.ch.sw, 0, map.rest, 'step'); }
+      if (o.replace) L.ch.sw.keys = L.ch.sw.keys.filter((k) => k.f < off - lead || k.f > endF);
+      let prev = null;
+      for (const k of res) { const id = map[k.v]; if (!id || id === prev) continue; setKey(L.ch.sw, Math.max(0, k.f + off - lead), id, 'step'); prev = id; }
+      setKey(L.ch.sw, endF, map.rest, 'step');
+      if (!L.ch.sw.keys.length) delete L.ch.sw;
+    });
+    const n = res.length;
+    setTimeout(() => { S.selLayers = [SW.id]; setTab('switch'); toast(`Lip sync: ${n} mouth changes written — scrub to review, click a mouth to fix any frame`, 'ok'); }, 50);
+    return { msg: `${n} mouth keys written to “${SW.name}”` };
+  });
+}
+// Moho / Papagayo switch data
+function exportDat() {
+  const SW = switchTarget(); if (!SW) return toast('Select a Switch layer');
+  const keys = (SW.ch.sw ? SW.ch.sw.keys : []).filter((k) => k.f > 0);
+  if (!keys.length) return toast('This switch layer has no keys yet', 'err');
+  const lines = ['MohoSwitch1', ...keys.map((k) => `${k.f} ${(SW.children.find((c) => c.id === k.v) || { name: 'rest' }).name}`)];
+  download(new Blob([lines.join('\n') + '\n'], { type: 'text/plain' }), (SW.name || 'switch') + '.dat');
+}
+function importDatText(txt) {
+  const SW = switchTarget(); if (!SW) return toast('Select the Switch layer to receive the .dat keys', 'err');
+  const lines = txt.split(/\r?\n/).map((l) => l.trim()).filter(Boolean); if (!/^MohoSwitch1/i.test(lines[0])) return toast('Not a MohoSwitch1 .dat file', 'err');
+  let miss = new Set();
+  edit('Import .dat', () => {
+    if (!SW.ch.sw) SW.ch.sw = { keys: [] };
+    for (const l of lines.slice(1)) { const [f, ...nm] = l.split(/\s+/); const name = nm.join(' '); const c = SW.children.find((x) => x.name.toLowerCase() === name.toLowerCase()); if (!c) { miss.add(name); continue; } setKey(SW.ch.sw, +f, c.id, 'step'); }
+  });
+  toast(miss.size ? `Imported; no drawing named: ${[...miss].join(', ')}` : 'Imported switch keys', miss.size ? 'err' : 'ok');
+}
+
+/* ===================== Popai Animator — files: save/open, import, export, autosave, templates ===================== */
+
+async function download(blob, name) {
+  if(blob.type.startsWith('video/') && window.popaiDesktop?.saveVideo){
+    if(blob.size===0||blob.size>128*1024*1024)throw Error('Video is empty or exceeds the 128 MiB limit');
+    const result=await window.popaiDesktop.saveVideo({name,bytes:new Uint8Array(await blob.arrayBuffer())});
+    return {...result,confirmed:!result.canceled};
+  }
+  // Hosted on claude.ai: saves go through the platform's downloads capability (viewer confirms each file)
+  let dl = null;
+  try { if (window.claude && window.claude.use) dl = await window.claude.use('downloads'); } catch (e) { dl = null; }
+  if (dl) {
+    let fn = name;
+    if (!/\.(gif|png|jpe?g|webp|mp4|webm|txt|json|md|csv|html|svg|pdf|zip)$/i.test(fn)) fn += '.txt';
+    try {
+      await dl.save({ filename: fn, data: blob });
+      if (fn !== name) toast(`Saved as ${fn} — rename it to ${name} to use it`, 'ok');
+    } catch (e) { throw new Error('Save declined or failed: ' + ((e && (e.message || e.code)) || e)); }
+    return { confirmed: true };
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+  return { confirmed: false };
+}
+function pickFile(accept, cb, multiple = false) {
+  const i = $('#fileIn'); i.value = ''; i.accept = accept; i.multiple = multiple;
+  i.onchange = () => { [...i.files].forEach(cb); };
+  i.click();
+}
+const readAsDataURL = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+const readAsText = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsText(file); });
+function dataURLtoBuf(url) { const b = atob(url.split(',')[1]); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u.buffer; }
+
+// ---------- media ----------
+async function loadMedia(id, m) {
+  // m: {name, type:'image'|'audio', url(dataURL)}
+  S.media[id] = { ...m };
+  const targetMedia = S.media;
+  if (m.type === 'image') {
+    await new Promise((res) => { const img = new Image(); img.onload = () => { targetMedia[id].el = img; res(); }; img.onerror = () => { targetMedia[id].error = "Image decoding failed"; res(); }; img.src = m.url; });
+  } else if (m.type === 'audio') {
+    try { targetMedia[id].buffer = await audioCtx().decodeAudioData(dataURLtoBuf(m.url)); } catch (e) { toast('Could not decode audio “' + m.name + '”', 'err'); }
+  }
+  refreshAll();
+}
+async function importFile(file) {
+  const originEpoch = documentEpoch;
+  const name = file.name, low = name.toLowerCase();
+  if (low.endsWith('.json') || low.endsWith('.popai')) return openProjectFile(file);
+  if (low.endsWith('.dat')) return importDatText(await readAsText(file));
+  if (low.endsWith('.gpl')) return importGpl(await readAsText(file));
+  const type = file.type.startsWith('image') ? 'image' : file.type.startsWith('audio') || /\.(wav|mp3|ogg|m4a|flac)$/.test(low) ? 'audio' : null;
+  if (!type) return toast('Unsupported file: ' + name, 'err');
+  const url = await readAsDataURL(file), id = uid('m');
+  if (originEpoch !== documentEpoch) return toast('Project changed; import the file again', 'err');
+  S.doc.media[id] = { name, type, url };
+  await loadMedia(id, { name, type, url });
+  if (originEpoch !== documentEpoch) return toast('Project changed during decoding; import again', 'err');
+  edit('Import ' + name, () => {
+    const L = mkLayer(type, name.replace(/\.[^.]+$/, ''));
+    L.media = id;
+    if (type === 'image') {
+      const el = S.media[id].el, w = el ? el.naturalWidth : 200, h = el ? el.naturalHeight : 200;
+      const k = Math.min(1, (S.doc.w * 0.9) / w, (S.doc.h * 0.9) / h);
+      L.iw = Math.round(w * k); L.ih = Math.round(h * k); L.nw = w; L.nh = h;
+    } else {
+      L.offset = S.frame || 1;
+      const b = S.media[id].buffer; if (b) { const need = L.offset + Math.ceil(b.duration * S.doc.fps); if (need > S.doc.end) S.doc.end = need; }
+    }
+    insertLayer(L);
+  });
+  toast('Imported ' + name, 'ok');
+}
+
+// ---------- project save / open ----------
+function serialize() { return JSON.stringify({ app: 'Popai Animator', format: 1, saved: new Date().toISOString(), doc: S.doc }); }
+function saveProject() {
+  download(new Blob([serialize()], { type: 'application/json' }), (S.doc.name || 'project').replace(/[^\w\- ]+/g, '_') + '.popai.json');
+  S.dirtyDoc = false; toast('Project saved (includes all media)', 'ok');
+}
+async function openProjectFile(file) {
+  try { if (await loadProjectJSON(await readAsText(file)) !== false) toast('Opened ' + file.name, 'ok'); }
+  catch (e) { console.error(e); toast('Could not open project: ' + e.message, 'err'); }
+}
+async function loadProjectJSON(txt) {
+  if (typeof txt !== 'string' || txt.length > 150 * 1024 * 1024) throw new Error('Project exceeds 150 MiB import budget');
+  const j = JSON.parse(txt), d = validateProject(j);
+  if (S.dirtyDoc && !window.confirm("Replace the current unsaved project? Save it first if needed.")) return false;
+  if (!d.layers || !d.camera) throw new Error('not a Popai Animator project');
+  const fresh = newDoc(); for (const k in fresh) if (d[k] === undefined) d[k] = fresh[k];
+  stopPlay && S.playing && stopPlay();
+  documentEpoch++; invalidateScene(); S.doc = d; S.dirtyDoc = false; S.mode = "animate"; S.swPreview = {}; aiPending = null; S.media = {}; S.frame = 0; S.selLayers = []; S.selPts = new Set(); S.selKeys = new Set(); S.selBone = null; S.camSel = false;
+  H.undo = []; H.redo = []; H.pending = null; updateModeUI();
+  await Promise.all(Object.entries(d.media || {}).map(([id, m]) => loadMedia(id, m)));
+  const missing = allLayers().filter((L) => L.media && (L.type === 'image' ? !S.media[L.media]?.el : L.type === 'audio' ? !S.media[L.media]?.buffer : false));
+  if (missing.length) toast(missing.length + ' layer(s) have missing media — re-import to relink', 'err');
+  closeModal(null); updateTitle(); renderTLBar(); fitView(); refreshAll();
+}
+function autosave() {
+  if (!S.dirtyDoc || !S.doc) return;
+  if (lsSet('popai.autosave', serialize())) { lsSet('popai.autosave.t', new Date().toLocaleString()); S.dirtyDoc = false; return; }
+  // too big for browser storage (media) — keep at least the animation data
+  const media = S.doc.media; S.doc.media = {}; if (lsSet('popai.autosave', serialize())) lsSet('popai.autosave.t', new Date().toLocaleString() + ' (without media)'); S.doc.media = media;
+}
+
+// ---------- export ----------
+function renderFrameCanvas(f, scale = 1, transparent = false) {
+  const d = S.doc, c = document.createElement('canvas'); c.width = Math.round(d.w * scale); c.height = Math.round(d.h * scale);
+  const x = c.getContext('2d');
+  if (!transparent) { x.fillStyle = d.bg; x.fillRect(0, 0, c.width, c.height); }
+  renderScene(x, f, M.chain(M.t(c.width / 2, c.height / 2), M.s(scale)), { export: true });
+  return c;
+}
+const canvasBlob = (c, type = 'image/png') => new Promise((r) => c.toBlob(r, type));
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u) { let c = 0xffffffff; for (let i = 0; i < u.length; i++) c = CRC[(c ^ u[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function makeZip(files) { // store-only zip
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  for (const f of files) {
+    const nm = enc.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+    const h = new DataView(new ArrayBuffer(30)); h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint32(14, crc, true); h.setUint32(18, sz, true); h.setUint32(22, sz, true); h.setUint16(26, nm.length, true);
+    parts.push(h.buffer, nm, f.data);
+    const c = new DataView(new ArrayBuffer(46)); c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint32(16, crc, true); c.setUint32(20, sz, true); c.setUint32(24, sz, true); c.setUint16(28, nm.length, true); c.setUint32(42, off, true);
+    central.push(c.buffer, nm); off += 30 + nm.length + sz;
+  }
+  const csz = central.reduce((s, b) => s + (b.byteLength ?? b.length), 0);
+  const e = new DataView(new ArrayBuffer(22)); e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, csz, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, e.buffer], { type: 'application/zip' });
+}
+async function exportDialog() {
+  const d = S.doc;
+  const r = await modal('Export', `<div class="form">
+    <label>Format</label><select name="fmt"><option value="png">PNG — current frame</option><option value="seq">PNG sequence (.zip)</option><option value="webm">WebM video (+ audio)</option><option value="dat">Moho switch data (.dat) — selected switch layer</option><option value="project">Project package (.popai.json)</option></select>
+    <label>Frame range</label><span><input type="number" name="from" value="1" min="0" style="width:70px"> to <input type="number" name="to" value="${d.end}" min="0" style="width:70px"></span>
+    <label>Scale</label><select name="scale"><option value="0.5">50%</option><option value="1" selected>100% (${d.w}×${d.h})</option><option value="2">200%</option></select>
+    <label>Transparent</label><label><input type="checkbox" name="transparent"> no background (PNG only)</label></div>
+    <div class="note">Export uses the same renderer as the preview, so frames match. Video records in real time (with audio); PNG sequences can be cancelled from the Jobs tab.</div>`,
+  [{ label: 'Cancel', value: false }, { label: 'Export', value: true, pri: true }]);
+  if (!r || !r.v) return;
+  const o = r.data, sc = +o.scale, from = Math.max(0, o.from | 0), to = Math.max(from, o.to | 0), base = (d.name || 'render').replace(/[^\w\- ]+/g, '_');
+  if (o.fmt === 'png') { const b = await canvasBlob(renderFrameCanvas(S.frame, sc, o.transparent)); download(b, `${base}_${String(S.frame).padStart(4, '0')}.png`); return; }
+  if (o.fmt === 'dat') return exportDat();
+  if (o.fmt === 'project') return saveProject();
+  setTab('jobs');
+  if (o.fmt === 'seq') runJob(`PNG sequence ${from}–${to}`, 'local render', async (job, tick) => {
+    const files = [];
+    for (let f = from; f <= to; f++) {
+      if (job.cancel) return;
+      const b = await canvasBlob(renderFrameCanvas(f, sc, o.transparent));
+      files.push({ name: `${base}_${String(f).padStart(4, '0')}.png`, data: new Uint8Array(await b.arrayBuffer()) });
+      tick((f - from + 1) / (to - from + 1), `Rendered frame ${f}`);
+      if (f % 4 === 0) await sleep(0);
+    }
+    if (files.length !== to - from + 1) throw new Error('missing frames');
+    download(makeZip(files), `${base}_png.zip`);
+    return { msg: `${files.length} frames written to ${base}_png.zip` };
+  });
+  if (o.fmt === 'webm') runJob(`WebM video ${from}–${to}`, 'local render (real time)', async (job, tick) => {
+    if (!window.MediaRecorder) throw new Error('This browser cannot record video');
+    const c = document.createElement('canvas'); c.width = Math.round(d.w * sc); c.height = Math.round(d.h * sc);
+    const x = c.getContext('2d'), stream = c.captureStream(0), track = stream.getVideoTracks()[0];
+    const ac = audioCtx(), dest = ac.createMediaStreamDestination();
+    const hasAudio = audioLayers().length > 0;
+    if (hasAudio) dest.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
+    const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8e6 }), chunks = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    const done = new Promise((r) => (rec.onstop = r));
+    const view = M.chain(M.t(c.width / 2, c.height / 2), M.s(sc));
+    const draw = (f) => { x.setTransform(1, 0, 0, 1, 0, 0); x.fillStyle = d.bg; x.fillRect(0, 0, c.width, c.height); renderScene(x, f, view, { export: true }); track.requestFrame && track.requestFrame(); };
+    draw(from); rec.start();
+    const t0 = hasAudio ? startAudio(from, dest) : performance.now() / 1000, clock = hasAudio ? () => ac.currentTime : () => performance.now() / 1000;
+    for (let f = from; f <= to; f++) {
+      if (job.cancel) break;
+      while (clock() - t0 < (f - from) / d.fps) await sleep(2);
+      draw(f); tick((f - from + 1) / (to - from + 1), `Recording frame ${f}`);
+    }
+    await sleep(1000 / d.fps); stopAudio(); rec.stop(); await done;
+    if (job.cancel) return;
+    download(new Blob(chunks, { type: 'video/webm' }), `${base}.webm`);
+    return { msg: `Video saved: ${base}.webm` };
+  });
+}
+function exportGpl() {
+  const lines = ['GIMP Palette', 'Name: ' + S.doc.name, '#', ...S.doc.palette.map((c) => { const [r, g, b] = hexToRgb(c); return `${String(r).padStart(3)} ${String(g).padStart(3)} ${String(b).padStart(3)}\t${c}`; })];
+  download(new Blob([lines.join('\n')], { type: 'text/plain' }), S.doc.name + '.gpl');
+}
+function importGpl(txt) {
+  const cols = txt.split(/\r?\n/).map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+(\d+)/)).filter(Boolean).map((m) => rgbToHex(+m[1], +m[2], +m[3]));
+  if (!cols.length) return toast('No colors found', 'err');
+  edit('Import palette', () => (S.doc.palette = [...new Set([...S.doc.palette, ...cols])]));
+}
+
+// ---------- programmatic drawing helpers (templates) ----------
+function vShape(L, pts, closed, style, c = 1) {
+  const ids = pts.map((p) => addPoint(L, round(p[0]), round(p[1]), p[2] ?? c));
+  const path = { id: uid('a'), pts: ids, closed }; L.paths.push(path);
+  return addShape(L, [path.id], { fill: '#ffffff', stroke: '#2b2b2b', width: 4, fillOn: true, strokeOn: true, ...style });
+}
+function vEllipse(L, cx, cy, rx, ry, style) { const p = []; for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; p.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, 1.105]); } return vShape(L, p, true, style); }
+function vRect(L, x, y, w, h, style) { return vShape(L, [[x, y, 0], [x + w, y, 0], [x + w, y + h, 0], [x, y + h, 0]], true, style); }
+function mouthKit(name = 'Mouth') {
+  const SW = mkLayer('switch', name);
+  const lip = { stroke: '#5a2a1e', width: 4 }, dark = { fill: '#5a1f1f', ...lip }, line = { fillOn: false, ...lip };
+  const defs = [
+    ['rest', (L) => vShape(L, [[-22, 0], [0, 4], [22, 0]], false, line)],
+    ['MBP', (L) => vShape(L, [[-20, 0, 0], [20, 0, 0]], false, { ...line, width: 7 })],
+    ['AI', (L) => { vEllipse(L, 0, 4, 24, 18, dark); vEllipse(L, 0, 14, 12, 5, { fill: '#e2677a', strokeOn: false }); }],
+    ['E', (L) => { vEllipse(L, 0, 2, 26, 9, dark); vRect(L, -18, -5, 36, 5, { fill: '#ffffff', strokeOn: false }); }],
+    ['O', (L) => vEllipse(L, 0, 3, 15, 17, dark)],
+    ['U', (L) => vEllipse(L, 0, 2, 9, 10, dark)],
+    ['FV', (L) => { vEllipse(L, 0, 2, 20, 7, dark); vRect(L, -12, -5, 24, 6, { fill: '#ffffff', strokeOn: false }); }],
+    ['L', (L) => { vEllipse(L, 0, 3, 20, 13, dark); vEllipse(L, 0, -2, 8, 5, { fill: '#e2677a', strokeOn: false }); }],
+    ['WQ', (L) => vEllipse(L, 0, 2, 7, 8, dark)],
+    ['etc', (L) => { vEllipse(L, 0, 2, 19, 9, dark); vRect(L, -12, -4, 24, 4, { fill: '#ffffff', strokeOn: false }); }],
+  ];
+  for (const [n, fn] of defs) { const L = mkLayer('vector', n); fn(L); SW.children.push(L); }
+  SW.p.sw = SW.children[0].id; SW.open = false;
+  return SW;
+}
+function demoProject() {
+  const d = newDoc({ name: 'Popai demo — jump & talk', w: 1280, h: 720, fps: 24, end: 96, bg: '#bfe3ff' });
+  S.doc = d; S.media = {};
+  // background planes (2.5D depth)
+  const sky = mkLayer('vector', 'Sky'); vRect(sky, -1400, -800, 2800, 1100, { fill: '#9fd3ff', strokeOn: false }); sky.p.z = -900;
+  const sun = mkLayer('vector', 'Sun'); vEllipse(sun, 0, 0, 60, 60, { fill: '#ffe066', strokeOn: false }); sun.p.x = 420; sun.p.y = -220; sun.p.z = -700;
+  sun.fx.push({ id: uid('fx'), type: 'glow', on: true, p: { ...fxDefaults('glow'), color: '#fff3a8', radius: 40, intensity: 1.2 } });
+  const hills = mkLayer('vector', 'Hills'); vShape(hills, [[-1300, 260], [-800, 60], [-300, 220], [200, 40], [700, 210], [1300, 80], [1300, 600, 0], [-1300, 600, 0]], true, { fill: '#7cc576', stroke: '#4f8f4a', width: 3 }); hills.p.z = -350;
+  const ground = mkLayer('vector', 'Ground'); vRect(ground, -1000, 250, 2000, 400, { fill: '#c9a46a', stroke: '#8d6b3c', width: 3 });
+  // character rig
+  const rig = mkLayer('bone', 'Popo (rig)'); rig.p.y = 40;
+  const B = (name, parent, x, y, a, len) => { const b = { id: uid('b'), name, parent, x, y, a, len, s: 1 }; rig.bones.push(b); return b; };
+  const root = B('Body', null, 0, 190, -90, 230), head = B('Head', root.id, 230, 0, 0, 100);
+  const armA = B('Arm upper', root.id, 195, 55, 110, 70), armB = B('Arm lower', armA.id, 70, 0, -20, 65);
+  const legs = mkLayer('vector', 'Legs'); vShape(legs, [[-30, 140], [-36, 210]], false, { fillOn: false, stroke: '#2b2b2b', width: 14 }); vShape(legs, [[30, 140], [36, 210]], false, { fillOn: false, stroke: '#2b2b2b', width: 14 }); legs.bindBone = root.id;
+  const body = mkLayer('vector', 'Body'); vEllipse(body, 0, 70, 78, 95, { fill: '#ff8a3d', stroke: '#2b2b2b', width: 5 }); body.bindBone = root.id;
+  const arm = mkLayer('vector', 'Arm'); vShape(arm, [[55, -5], [121, 19], [186, 19]], false, { fillOn: false, stroke: '#e0702a', width: 18 });
+  const headL = mkLayer('vector', 'Head'); vEllipse(headL, 0, -120, 74, 70, { fill: '#ffd7b5', stroke: '#2b2b2b', width: 5 }); vEllipse(headL, -26, -138, 9, 12, { fill: '#2b2b2b', strokeOn: false }); vEllipse(headL, 26, -138, 9, 12, { fill: '#2b2b2b', strokeOn: false }); headL.bindBone = head.id;
+  const mouth = mouthKit('Mouth'); mouth.p.y = -92; mouth.bindBone = head.id;
+  rig.children = [mouth, headL, arm, body, legs];
+  sortBones(rig);
+  autoBindPoints(arm, rig, Object.keys(arm.pts));
+  // wave the arm (bone keys)
+  const kA = (b, f, a) => { const p = 'bone:' + b.id + ':a'; if (!rig.ch[p]) rig.ch[p] = { keys: [] }; setKey(rig.ch[p], f, a, 'smooth'); };
+  kA(armA, 0, 110); kA(armA, 8, 30); kA(armA, 16, 20); kA(armA, 24, 30); kA(armA, 32, 110);
+  kA(armB, 0, -20); kA(armB, 8, -50); kA(armB, 16, 25); kA(armB, 24, -50); kA(armB, 32, -20);
+  kA(head, 0, 0); kA(head, 12, 8); kA(head, 24, -6); kA(head, 36, 0);
+  // talking mouth keys
+  const ids = Object.fromEntries(mouth.children.map((c) => [c.name, c.id]));
+  mouth.ch.sw = { keys: [] };
+  [[0, 'rest'], [4, 'MBP'], [6, 'AI'], [9, 'E'], [12, 'O'], [15, 'L'], [17, 'AI'], [20, 'etc'], [23, 'U'], [26, 'MBP'], [28, 'rest']].forEach(([f, n]) => setKey(mouth.ch.sw, f, ids[n], 'step'));
+  // jump at 40 with squash & stretch + trail + dust + camera shake (same recipe the AI assistant builds)
+  const title = mkLayer('text', 'Title'); title.text = 'Popai Animator'; title.size = 64; title.p.y = -270; title.p.color = '#1d3557';
+  title.fx.push({ id: uid('fx'), type: 'shadow', on: true, p: { ...fxDefaults('shadow'), dx: 4, dy: 5, softness: 4, opacity: 0.35 } });
+  title.ch.opacity = { keys: [{ f: 0, v: 0, i: 'ease' }, { f: 14, v: 1, i: 'smooth' }] };
+  d.layers = [title, rig, ground, hills, sun, sky];
+  S.selLayers = [rig.id];
+  const saveF = S.frame;
+  applyCmd({ op: 'jump', target: rig.id, start: 40, dur: 18, height: 190 });
+  applyCmd({ op: 'trail', target: rig.id, glow: false });
+  rig.fx[rig.fx.length - 1].p = { samples: 4, spacing: 2, decay: 0.45 };
+  applyCmd({ op: 'camshake', start: 58, dur: 10, amp: 16 });
+  applyCmd({ op: 'particles', preset: 'Dust', target: rig.id, start: 58 });
+  // gentle camera push in
+  d.camera.ch.zoom = { keys: [{ f: 0, v: 1, i: 'ease' }, { f: 96, v: 1.12, i: 'ease' }] };
+  d.camera.ch.x = { keys: [{ f: 0, v: -40, i: 'ease' }, { f: 96, v: 40, i: 'ease' }] };
+  d.markers = [{ id: uid('m'), f: 40, name: 'Jump', color: '#4dabf7' }, { id: uid('m'), f: 58, name: 'Land', color: '#ff8a3d' }];
+  S.frame = saveF;
+  return d;
+}
+
+/* ===================== Popai Animator — commands, menus, shortcuts, home screen, bootstrap ===================== */
+
+const CMDS = [];
+const cmd = (id, menu, label, run, o = {}) => CMDS.push({ id, menu, label, run, ...o });
+const needLayer = () => (selLayer() ? false : 'Select a layer first');
+const needVector = () => { const L = selLayer(); return L && L.type === 'vector' ? false : 'Select a vector layer'; };
+const needPts = () => needVector() || (S.selPts.size ? false : 'Select points with the Points tool');
+const needShape = () => needVector() || (S.selShape ? false : 'Select a shape');
+const needBoneLayer = () => (activeBoneLayer() ? false : 'Select a bone layer (or a layer inside one)');
+const needSwitch = () => (switchTarget() ? false : 'Select a switch layer');
+function runCmd(id) {
+  const c = CMDS.find((x) => x.id === id); if (!c) return console.warn('no cmd', id);
+  const why = c.en && c.en(); if (why) return toast(why, 'err');
+  c.run();
+}
+
+// File
+cmd('file.home', 'File', 'Project home…', () => showHome());
+cmd('file.new', 'File', 'New project…', () => newProjectDialog(), { k: 'Ctrl+N', keys: 'ctrl+n' });
+cmd('file.open', 'File', 'Open project…', () => pickFile('.json,.popai', importFile), { k: 'Ctrl+O', keys: 'ctrl+o' });
+cmd('file.save', 'File', 'Save project (download)', saveProject, { k: 'Ctrl+S', keys: 'ctrl+s', kw: 'package export project' });
+cmd('file.recover', 'File', 'Recover autosave', () => recoverAutosave(), { en: () => (lsGet('popai.autosave') ? false : 'No autosave found') });
+cmd('file.import', 'File', 'Import image / audio / .dat / palette…', () => pickFile('image/*,audio/*,.wav,.mp3,.dat,.gpl,.json', importFile, true), { k: 'Ctrl+I', keys: 'ctrl+i', kw: 'relink media wav mp3 png jpg' });
+cmd('file.export', 'File', 'Export / render…', exportDialog, { k: 'Ctrl+E', keys: 'ctrl+e', kw: 'render png video webm sequence zip' });
+cmd('file.exportpng', 'File', 'Export current frame as PNG', async () => download(await canvasBlob(renderFrameCanvas(S.frame)), `${S.doc.name}_${S.frame}.png`));
+cmd('file.settings', 'File', 'Project settings…', () => projectSettings(), { kw: 'resolution fps size background' });
+// Edit
+cmd('edit.undo', 'Edit', 'Undo', undo, { k: 'Ctrl+Z', keys: 'ctrl+z' });
+cmd('edit.redo', 'Edit', 'Redo', redo, { k: 'Ctrl+Shift+Z', keys: 'ctrl+shift+z|ctrl+y' });
+cmd('edit.copy', 'Edit', 'Copy keys / layer', () => { if (!copyKeys()) { const L = selLayer(); if (L) { TL.layerClip = clone(L); toast('Copied layer'); } } }, { k: 'Ctrl+C', keys: 'ctrl+c' });
+cmd('edit.paste', 'Edit', 'Paste keys / layer', () => { if (!pasteKeys() && TL.layerClip) edit('Paste layer', () => { const c = cloneLayer(TL.layerClip); c.name += ' copy'; insertLayer(c); }); }, { k: 'Ctrl+V', keys: 'ctrl+v' });
+cmd('edit.delete', 'Edit', 'Delete selection', () => deleteSelection(), { k: 'Del', keys: 'delete|backspace' });
+cmd('edit.selall', 'Edit', 'Select all points', () => { const L = selLayer(); if (L && L.type === 'vector') { S.selPts = new Set(Object.keys(L.pts)); if (!POINT_TOOLS.has(S.tool)) setTool('points'); refreshAll(); } }, { k: 'Ctrl+A', keys: 'ctrl+a', en: needVector });
+cmd('edit.deselect', 'Edit', 'Deselect', () => { if (S.selPts.size || S.selKeys.size || S.selShape || Object.keys(S.swPreview).length) { S.selPts = new Set(); S.selKeys = new Set(); S.selShape = null; S.swPreview = {}; } else { S.selLayers = []; S.camSel = false; S.selBone = null; } refreshAll(); }, { k: 'Esc' });
+cmd('edit.shortcuts', 'Edit', 'Keyboard shortcuts…', () => shortcutsDialog(), { k: '?', kw: 'keys hotkeys' });
+// Layer (in Draw menu)
+cmd('layer.new', 'Draw', 'New layer…', () => { const r = $('#lyAdd').getBoundingClientRect(); showMenu(r.left, r.bottom, newLayerMenu()); }, { kw: 'add create layer' });
+cmd('layer.newswitch', 'Draw', 'New switch layer', () => addLayer('switch'), { kw: 'mouth hands alternate drawings' });
+cmd('layer.newinside', 'Draw', 'New vector layer inside selected group', () => edit('New vector layer', () => { const G = selLayer(), L = mkLayer('vector'); G.children.unshift(L); G.open = true; S.selLayers = [L.id]; }), { en: () => (selLayer() && isContainer(selLayer()) ? false : 'Select a Group, Bone Group or Switch Group') });
+cmd('layer.pivotcenter', 'Draw', 'Centre pivot on artwork', () => { const L = selLayer(), b = contentBox(Object.assign({}, L, { p: { ...L.p, x: 0, y: 0, rot: 0, sx: 1, sy: 1, ox: 0, oy: 0 }, ch: {} })); if (!b) return toast('This layer has no artwork to centre on', 'err'); edit('Centre pivot', () => { L.p.ox = round((b[0] + b[2]) / 2); L.p.oy = round((b[1] + b[3]) / 2); }); }, { en: needLayer, kw: 'origin anchor' });
+cmd('switch.align', 'Audio', 'Align switch alternatives on registration point', () => alignAlternatives(switchTarget()), { en: needSwitch, kw: 'mouth jump register' });
+cmd('switch.setactive', 'Audio', 'Set shown alternative active at playhead', () => swSetActive(switchTarget()), { en: needSwitch });
+cmd('switch.next', 'Audio', 'Preview next alternative', () => swPreviewStep(switchTarget(), 1), { en: needSwitch });
+cmd('switch.prev', 'Audio', 'Preview previous alternative', () => swPreviewStep(switchTarget(), -1), { en: needSwitch });
+cmd('layer.dup', 'Draw', 'Duplicate layer', () => edit('Duplicate layer', () => { const L = selLayer(), c = cloneLayer(L); c.name += ' copy'; const sib = siblingsOf(L.id); sib.splice(sib.indexOf(L), 0, c); S.selLayers = [c.id]; }), { k: 'Ctrl+D', keys: 'ctrl+d', en: needLayer });
+cmd('layer.del', 'Draw', 'Delete layer', () => edit('Delete layer', () => { for (const id of S.selLayers) { const sib = siblingsOf(id), L = findLayer(id); if (L) sib.splice(sib.indexOf(L), 1); } S.selLayers = []; }), { en: needLayer });
+cmd('layer.group', 'Draw', 'Group selected layers', () => edit('Group layers', () => {
+  const ls = S.selLayers.map((id) => findLayer(id)).filter(Boolean); const first = ls[0], sib = siblingsOf(first.id), g = mkLayer('group');
+  sib.splice(sib.indexOf(first), 0, g);
+  for (const L of ls) { const s = siblingsOf(L.id); s.splice(s.indexOf(L), 1); g.children.push(L); }
+  S.selLayers = [g.id];
+}), { k: 'Ctrl+G', keys: 'ctrl+g', en: needLayer });
+cmd('layer.up', 'Draw', 'Raise layer', () => edit('Raise layer', () => { const L = selLayer(), s = siblingsOf(L.id), i = s.indexOf(L); if (i > 0) { s.splice(i, 1); s.splice(i - 1, 0, L); } }), { k: 'Ctrl+↑', keys: 'ctrl+arrowup', en: needLayer });
+cmd('layer.down', 'Draw', 'Lower layer', () => edit('Lower layer', () => { const L = selLayer(), s = siblingsOf(L.id), i = s.indexOf(L); if (i < s.length - 1) { s.splice(i, 1); s.splice(i + 1, 0, L); } }), { k: 'Ctrl+↓', keys: 'ctrl+arrowdown', en: needLayer });
+cmd('pts.del', 'Draw', 'Delete selected points', () => edit('Delete points', () => { deletePoints(selLayer(), [...S.selPts]); S.selPts = new Set(); }), { en: needPts });
+cmd('pts.close', 'Draw', 'Close / open selected path', () => edit('Close path', () => { const L = selLayer(); for (const pa of L.paths) if (pa.pts.some((p) => S.selPts.has(p))) pa.closed = !pa.closed; }), { en: needPts, kw: 'weld join' });
+cmd('pts.smooth', 'Draw', 'Make selected points smooth', () => edit('Smooth points', () => { for (const id of S.selPts) selLayer().pts[id].c = 1; }), { en: needPts, kw: 'curvature' });
+cmd('pts.corner', 'Draw', 'Make selected points sharp corners', () => edit('Corner points', () => { for (const id of S.selPts) selLayer().pts[id].c = 0; }), { en: needPts, kw: 'curvature peak' });
+cmd('pts.flipH', 'Draw', 'Flip points horizontally', () => flipPts(0), { en: needPts, kw: 'mirror' });
+cmd('pts.flipV', 'Draw', 'Flip points vertically', () => flipPts(1), { en: needPts, kw: 'mirror' });
+cmd('shape.create', 'Draw', 'Create shape from selected points', () => edit('Create shape', () => { const L = selLayer(); const pa = L.paths.filter((p) => p.pts.some((i) => S.selPts.has(i))); if (pa.length) S.selShape = addShape(L, pa.map((p) => p.id)).id; }), { en: needPts, kw: 'fill' });
+cmd('shape.del', 'Draw', 'Delete selected shape', () => edit('Delete shape', () => { const L = selLayer(); L.shapes = L.shapes.filter((s) => s.id !== S.selShape); deleteChannelsMatching(L, (k) => k.startsWith('sh:' + S.selShape + ':')); S.selShape = null; }), { en: needShape });
+cmd('shape.up', 'Draw', 'Raise shape', () => edit('Raise shape', () => { const L = selLayer(), i = L.shapes.findIndex((s) => s.id === S.selShape); if (i < L.shapes.length - 1) { const [s] = L.shapes.splice(i, 1); L.shapes.splice(i + 1, 0, s); } }), { en: needShape });
+cmd('shape.down', 'Draw', 'Lower shape', () => edit('Lower shape', () => { const L = selLayer(), i = L.shapes.findIndex((s) => s.id === S.selShape); if (i > 0) { const [s] = L.shapes.splice(i, 1); L.shapes.splice(i - 1, 0, s); } }), { en: needShape });
+cmd('shape.defaults', 'Draw', 'Apply default style to shape', () => edit('Apply style', () => { const L = selLayer(), sh = L.shapes.find((s) => s.id === S.selShape), n = S.newStyle; sh.styleId = null; Object.assign(sh, { fillOn: n.fillOn, strokeOn: n.strokeOn }); for (const k of ['fill', 'stroke', 'width']) setVal(L, 'sh:' + sh.id + ':' + k, n[k]); }), { en: needShape });
+cmd('style.new', 'Draw', 'New shared style', () => edit('New style', () => S.doc.styles.push({ id: uid('st'), name: 'Style ' + (S.doc.styles.length + 1), ...clone(S.newStyle) })), { kw: 'skin jacket outline' });
+cmd('style.fromshape', 'Draw', 'New shared style from shape (and link it)', () => edit('Style from shape', () => { const L = selLayer(), sh = L.shapes.find((s) => s.id === S.selShape), st = shapeStyle(L, sh, S.frame); const s = { id: uid('st'), name: 'Style ' + (S.doc.styles.length + 1), fill: st.fill, stroke: st.stroke, width: st.width, fillOn: st.fillOn, strokeOn: st.strokeOn }; S.doc.styles.push(s); sh.styleId = s.id; }), { en: needShape });
+cmd('pal.add', 'Draw', 'Add fill color to palette', () => edit('Add swatch', () => S.doc.palette.push(S.newStyle.fill)));
+cmd('pal.export', 'Draw', 'Export palette (.gpl)', exportGpl);
+cmd('pal.import', 'Draw', 'Import palette (.gpl)', () => pickFile('.gpl,.txt', importFile));
+cmd('img.native', 'Draw', 'Image: reset to native size', () => edit('Native size', () => { const L = selLayer(); const m = S.media[L.media]; if (m && m.el) { L.iw = m.el.naturalWidth; L.ih = m.el.naturalHeight; } }), { en: () => (selLayer() && selLayer().type === 'image' ? false : 'Select an image layer') });
+// Rig
+cmd('mode.setup', 'Rig', 'Setup mode (rest pose, bones, binding)', () => setMode('setup'), { k: 'Tab', kw: 'rig edit rest' });
+cmd('mode.animate', 'Rig', 'Animate mode (record keys)', () => setMode('animate'), { k: 'Tab' });
+cmd('rig.newbone', 'Rig', 'New bone group', () => addLayer('bone'), { kw: 'skeleton rig layer' });
+cmd('rig.autobind', 'Rig', 'Bind points to bones (weighted)…', () => autoBindDialog(), { en: () => needVector() || (boneLayerFor(selLayer()) ? false : 'The vector layer must be inside a Bone Group'), kw: 'weights skin smart auto' });
+async function autoBindDialog() {
+  const L = selLayer(), B = boneLayerFor(L);
+  const r = await modal('Bind points (weighted)', `<div class="note">Each point gets weights from its nearest bones, so joints bend smoothly. Untick bones that must <b>not</b> pull this artwork — e.g. keep the hand bone away from the torso.</div>
+    <div class="form" style="grid-template-columns:22px 1fr">${B.bones.map((b) => `<input type="checkbox" name="b_${b.id}" checked><span>🦴 ${esc(b.name)}</span>`).join('')}</div>
+    <div class="note">${S.selPts.size ? `Binds the ${S.selPts.size} selected points.` : 'Binds all points of “' + esc(L.name) + '”.'} Happens in Setup mode.</div>`, [{ label: 'Cancel', value: false }, { label: 'Bind', value: true, pri: true }]);
+  if (!r || !r.v) return;
+  const allowed = B.bones.filter((b) => r.data['b_' + b.id]).map((b) => b.id);
+  if (!allowed.length) return toast('Choose at least one bone', 'err');
+  if (S.mode !== 'setup') setMode('setup');
+  let n; edit('Bind points', () => (n = autoBindPoints(L, B, S.selPts.size ? [...S.selPts] : Object.keys(L.pts), allowed)));
+  toast(`Bound ${n} points to ${allowed.length} bone(s) — select a bone to see its weights`, 'ok');
+}
+cmd('rig.bindpts', 'Rig', 'Bind selected points to selected bone', () => { const L = selLayer(), B = boneLayerFor(L); if (!B || !S.selBone || !B.bones.some((b) => b.id === S.selBone)) return toast('Select a bone (Transform bone tool) in the parent bone layer, then the points', 'err'); edit('Bind points', () => { for (const id of S.selPts) L.pts[id].b = [[S.selBone, 1]]; L.bindBone = null; }); }, { en: needPts });
+cmd('rig.unbindpts', 'Rig', 'Unbind points', () => edit('Unbind points', () => { const L = selLayer(); for (const id of S.selPts.size ? S.selPts : Object.keys(L.pts)) delete L.pts[id].b; }), { en: needVector });
+cmd('bone.del', 'Rig', 'Delete selected bone', () => edit('Delete bone', () => {
+  const B = activeBoneLayer(), b = B.bones.find((x) => x.id === S.selBone); if (!b) return;
+  for (const c of B.bones) if (c.parent === b.id) c.parent = b.parent;
+  B.bones = B.bones.filter((x) => x !== b); deleteChannelsMatching(B, (k) => k.startsWith('bone:' + b.id + ':'));
+  walk(B.children, (L) => { if (L.bindBone === b.id) L.bindBone = null; if (Array.isArray(L.flexiBones)) L.flexiBones = L.flexiBones.filter((id) => id !== b.id); if (L.pts) for (const p of Object.values(L.pts)) if (p.b && p.b.length) { p.b = p.b.filter(([id]) => id !== b.id); if (!p.b.length) delete p.b; } });
+  S.selBone = null;
+}), { en: () => needBoneLayer() || (S.selBone ? false : 'Select a bone') });
+cmd('rig.test', 'Rig', 'Rig test: preview pose suite', () => rigTest(), { en: needBoneLayer, kw: 'check repair stretching' });
+cmd('pose.save', 'Animate', 'Save bone pose…', async () => { const B = activeBoneLayer(); const n = await askText('Save pose', 'Pose name', 'Pose ' + ((B.poses || []).length + 1)); if (!n) return; edit('Save pose', () => { B.poses = B.poses || []; B.poses.push({ id: uid('po'), name: n, data: Object.fromEntries(B.bones.map((b) => [b.id, { a: val(B, 'bone:' + b.id + ':a', S.frame), p: val(B, 'bone:' + b.id + ':p', S.frame) }])) }); }); }, { en: needBoneLayer, kw: 'library' });
+cmd('pose.apply', 'Animate', 'Apply saved pose…', () => { const B = activeBoneLayer(); if (!(B.poses || []).length) return toast('No saved poses on this rig yet', 'err'); const r = $('#btnCmd').getBoundingClientRect(); showMenu(r.left, r.bottom, B.poses.map((p) => ({ label: p.name, run: () => edit('Apply pose ' + p.name, () => { for (const id in p.data) if (B.bones.some((b) => b.id === id)) { setVal(B, 'bone:' + id + ':a', p.data[id].a); setVal(B, 'bone:' + id + ':p', p.data[id].p); } }) }))); }, { en: needBoneLayer });
+// Animate
+cmd('anim.play', 'Animate', 'Play / pause', togglePlay, { k: 'Space' });
+cmd('anim.next', 'Animate', 'Next frame', () => setFrame(S.frame + 1), { k: '.', keys: '.|arrowright' });
+cmd('anim.prev', 'Animate', 'Previous frame', () => setFrame(Math.max(0, S.frame - 1)), { k: ',', keys: ',|arrowleft' });
+cmd('anim.first', 'Animate', 'First frame', () => setFrame(0), { k: 'Shift+Home', keys: 'shift+home' });
+cmd('anim.last', 'Animate', 'Last frame', () => setFrame(timelineEnd()), { k: 'End', keys: 'end' });
+cmd('anim.nextkey', 'Animate', 'Next keyframe (selected layer)', () => jumpKey(1), { k: 'Shift+.', keys: 'shift+>|shift+.' });
+cmd('anim.prevkey', 'Animate', 'Previous keyframe (selected layer)', () => jumpKey(-1), { k: 'Shift+,', keys: 'shift+<|shift+,' });
+cmd('key.settings', 'Animate', 'Keyframe settings… (interpolation, cycle, hold, interval, stagger, label)', () => keyframePanel(), { k: 'Ctrl+Alt+E', keys: 'ctrl+alt+e', kw: 'keyframe window interpolation cycle hold interval stagger label' });
+cmd('anim.keyall', 'Animate', 'Key pose in current editing context', keyCurrentTimelinePose, { en: () => S.camSel ? false : needLayer(), kw: 'freeze bone point pose' });
+cmd('anim.delkeys', 'Animate', 'Delete selected keys', deleteSelectedKeys, { en: () => (S.selKeys.size ? false : 'Select keys in the timeline') });
+cmd('anim.clear', 'Animate', 'Clear all animation on selected layer', () => edit('Clear animation', () => { const L = selLayer(); if(actActive()&&!actOwnsLayer(L))throw Error('Select a layer inside the active Action'); for (const p of Object.keys(L.ch)) { if(!actActive())baseSet(L, p, val(L, p, 0)); delete L.ch[p]; } }), { en: needLayer, kw: 'reset' });
+for (const [k, n] of INTERPS) cmd('interp.' + k, 'Animate', 'Interpolation: ' + n, () => setInterpSelected(k), { en: () => (S.selKeys.size ? false : 'Select keys in the timeline'), kw: 'curve ease tween' });
+cmd('anim.retime', 'Animate', 'Scale timing of selected keys…', async () => { const t = await askText('Retime keys', 'Scale factor around the earliest key (e.g. 0.5 = twice as fast)', '1.5'); const k = +t; if (!k || k <= 0) return; const items = [...S.selKeys].map(parseKid).filter((x) => x.o); const f0 = Math.min(...items.map((x) => x.f)); edit('Retime keys', () => { const ns = new Set(); const moves = items.map((x) => ({ ...x, key: clone(keyAt(x.o, x.path, x.f)) })); for (const m of moves) m.o.ch[m.path].keys = m.o.ch[m.path].keys.filter((q) => q.f !== m.f); for (const m of moves) { const nf = Math.round(f0 + (m.f - f0) * k); setKey(m.o.ch[m.path], nf, m.key.v, m.key.i); ns.add(kid(m.o, m.path, nf)); } S.selKeys = ns; }); }, { en: () => (S.selKeys.size > 1 ? false : 'Select 2+ keys'), kw: 'speed faster slower stretch' });
+cmd('anim.onion', 'Animate', 'Toggle onion skins', () => { S.onion = !S.onion; renderTLBar(); requestDraw(); }, { k: 'Shift+O', keys: 'shift+o' });
+cmd('anim.marker', 'Animate', 'Add marker at playhead…', async () => { const n = await askText('Add marker', 'Name', 'Beat'); if (n) edit('Add marker', () => S.doc.markers.push({ id: uid('m'), f: S.frame, name: n, color: '#5ccf8a' })); }, { kw: 'beat cue' });
+// Effects
+for (const [k, d] of Object.entries(FX)) cmd('fx.add.' + k, 'Effects', 'Add effect: ' + d.label, () => addEffect(selLayer(), k), { en: needLayer });
+cmd('fx.particles', 'Effects', 'Particle emitter tool', () => setTool('emitter'), { kw: 'dust fire smoke sparks snow rain' });
+cmd('fx.savepreset', 'Effects', 'Save effect stack as preset…', async () => { const L = selLayer(); const n = await askText('Effect preset', 'Name', L.name + ' look'); if (n) edit('Save preset', () => { S.doc.fxPresets = S.doc.fxPresets || []; S.doc.fxPresets.push({ name: n, fx: L.fx.map((e) => ({ type: e.type, on: e.on, p: fxParamsAt(L, e, S.frame) })) }); }); }, { en: () => (selLayer() && selLayer().fx.length ? false : 'Select a layer with effects') });
+cmd('fx.applypreset', 'Effects', 'Apply effect preset…', () => { const r = $('#btnCmd').getBoundingClientRect(); showMenu(r.left, r.bottom, (S.doc.fxPresets || []).map((p) => ({ label: p.name, run: () => edit('Apply preset', () => { const L = selLayer(); for (const e of p.fx) L.fx.push({ id: uid('fx'), type: e.type, on: e.on, p: clone(e.p) }); }) }))); }, { en: () => needLayer() || ((S.doc.fxPresets || []).length ? false : 'No presets saved yet') });
+cmd('fx.mask', 'Effects', 'Make group masked by its bottom layer', () => edit('Mask group', () => (selLayer().mask = 'bottom')), { en: () => (selLayer() && selLayer().type === 'group' ? false : 'Select a group layer'), kw: 'matte clip' });
+// AI
+cmd('ai.panel', 'AI', 'Open AI assistant', () => { setTab('ai'); setTimeout(() => $('#aiText') && $('#aiText').focus(), 30); }, { k: 'Ctrl+J', keys: 'ctrl+j', kw: 'prompt chat natural language' });
+cmd('ai.lipsync', 'AI', 'Auto lip sync…', openLipSync, { k: 'Ctrl+L', keys: 'ctrl+l', kw: 'mouth viseme phoneme dialogue shona' });
+cmd('ai.jobs', 'AI', 'Job history', () => setTab('jobs'));
+cmd('ai.settings', 'AI', 'AI engine settings…', aiSettings, { kw: 'llm openrouter endpoint model' });
+cmd('switch.mouthkit', 'AI', 'Create starter mouth set (switch layer)', () => edit('Mouth set', () => { const SW = mouthKit(); const L = selLayer(); if (L && (L.type === 'bone' || L.type === 'group')) { L.children.unshift(SW); L.open = true; } else S.doc.layers.unshift(SW); S.selLayers = [SW.id]; setTimeout(() => setTab('switch'), 20); }), { kw: 'viseme preston blair' });
+cmd('switch.addchild', 'Audio', 'Add drawing to switch layer', () => edit('Add drawing', () => { const SW = switchTarget(), L = mkLayer('vector', 'Drawing ' + (SW.children.length + 1)); SW.children.unshift(L); S.selLayers = [L.id]; }), { en: needSwitch });
+cmd('switch.exportdat', 'Audio', 'Export switch keys as Moho .dat', exportDat, { en: needSwitch, kw: 'papagayo mohoswitch' });
+cmd('switch.importdat', 'Audio', 'Import Moho .dat into switch', () => pickFile('.dat,.txt', importFile), { en: needSwitch, kw: 'papagayo' });
+// Camera
+cmd('cam.tool', 'Camera', 'Camera tool', () => setTool('camera'), { kw: 'track dolly zoom roll' });
+cmd('cam.select', 'Camera', 'Select camera (properties & keys)', () => { S.camSel = true; S.selLayers = []; setTab('props'); refreshAll(); });
+cmd('cam.reset', 'Camera', 'Remove all camera animation', () => edit('Reset camera', () => { const c = S.doc.camera; c.ch = {}; Object.assign(c.p, { x: 0, y: 0, zoom: 1, roll: 0, shake: 0 }); }));
+cmd('cam.shake', 'Camera', 'Camera shake at playhead', () => edit('Camera shake', () => applyCmd({ op: 'camshake', start: S.frame, dur: 10, amp: 18 })), { kw: 'impact' });
+// Audio
+cmd('audio.import', 'Audio', 'Import audio…', () => pickFile('audio/*,.wav,.mp3', importFile), { kw: 'wav mp3 dialogue' });
+cmd('audio.fitend', 'Audio', 'Fit timeline to audio', () => { const L = selLayer(), m = S.media[L.media]; if (m && m.buffer) edit('Fit timeline', () => (S.doc.end = L.offset + Math.ceil(m.buffer.duration * S.doc.fps))); }, { en: () => (selLayer() && selLayer().type === 'audio' ? false : 'Select an audio layer') });
+// View
+cmd('view.fit', 'View', 'Reset view (fit frame, no rotation)', fitView, { k: 'Home / Ctrl+0', keys: 'home|ctrl+0' });
+cmd('view.100', 'View', 'Zoom 100%', () => { S.view.zoom = 1; requestDraw(); }, { k: '1', keys: 'ctrl+1' });
+cmd('view.zin', 'View', 'Zoom in', () => zoomAt(Stage.cv.width / 2, Stage.cv.height / 2, 1.25), { k: '+', keys: '=|+' });
+cmd('view.zout', 'View', 'Zoom out', () => zoomAt(Stage.cv.width / 2, Stage.cv.height / 2, 0.8), { k: '-', keys: '-' });
+cmd('view.output', 'View', 'Output only (hide overlays)', () => { S.outputOnly = !S.outputOnly; $('[data-view=output]').classList.toggle('on', S.outputOnly); requestDraw(); }, { k: 'O', keys: 'o' });
+cmd('view.paths', 'View', 'Toggle motion paths', () => { S.showPaths = !S.showPaths; requestDraw(); });
+// Window
+for (const [t, n] of [['props', 'Properties'], ['style', 'Style'], ['switch', 'Switch'], ['ai', 'AI assistant'], ['jobs', 'Jobs']]) cmd('win.' + t, 'Window', n + ' panel', () => setTab(t));
+cmd('win.layout.draw', 'Window', 'Layout: Drawing (big stage)', () => setLayout(150, 300));
+cmd('win.layout.anim', 'Window', 'Layout: Animation (big timeline)', () => setLayout(340, 330));
+cmd('win.layout.default', 'Window', 'Layout: Default', () => setLayout(250, 330));
+// Help
+cmd('help.guide', 'Help', 'Quick guide', () => quickGuide(), { k: 'F1', keys: 'f1' });
+cmd('help.shortcuts', 'Help', 'Keyboard shortcuts', () => shortcutsDialog());
+cmd('help.about', 'Help', 'About Popai Animator', () => modal('About', `<div class="note"><b>Popai Animator</b> — a browser-based 2D animation studio inspired by Moho's workflow: vector layers, bones with IK and smooth binding, switch layers, keyframes with curves, a 2.5D camera, effects, particles, sound-based lip sync and an AI assistant that edits real keyframes.<br><br>Everything runs locally in your browser. Projects save as a single .popai.json file that includes your images and audio.</div>`));
+
+const MENUS = ['File', 'Edit', 'Draw', 'Rig', 'Animate', 'Effects', 'AI', 'Camera', 'Audio', 'View', 'Window', 'Help'];
+function menuItems(m) {
+  const items = []; let lastGroup = null;
+  for (const c of CMDS.filter((x) => x.menu === m)) {
+    const g = c.id.split('.')[0]; if (lastGroup && g !== lastGroup) items.push({ sep: 1 }); lastGroup = g;
+    items.push({ label: c.label, k: c.k, run: () => runCmd(c.id), dis: c.en });
+  }
+  if (m === 'Draw') items.unshift(...TOOL_GROUPS.slice(1, 3).flatMap(([, ids]) => ids).map((id) => ({ label: 'Tool: ' + TOOLS[id].name, k: TOOLS[id].key, run: () => setTool(id) })), { sep: 1 });
+  if (m === 'Rig') items.unshift(...TOOL_GROUPS.find((g) => g[0] === 'Bone')[1].map((id) => ({ label: 'Tool: ' + TOOLS[id].name, k: TOOLS[id].key, run: () => setTool(id), dis: () => toolAvail(id) })), { sep: 1 });
+  return items;
+}
+function initMenus() {
+  const nav = $('#menus');
+  for (const m of MENUS) {
+    const b = document.createElement('button'); b.textContent = m;
+    b.onclick = () => { const r = b.getBoundingClientRect(); if (b.classList.contains('open')) return closeMenus(); showMenu(r.left, r.bottom + 2, menuItems(m), b); };
+    b.onmouseenter = () => { if ($('#menuLayer .dd') && !b.classList.contains('open')) b.click(); };
+    nav.appendChild(b);
+  }
+  $('#btnUndo').onclick = undo; $('#btnRedo').onclick = redo; $('#btnCmd').onclick = commandPalette;
+  $('#docname').onclick = projectSettings;
+}
+
+// ---------- command palette ----------
+function commandPalette() {
+  const all = [...CMDS.map((c) => ({ label: c.label, menu: c.menu, k: c.k, kw: c.kw || '', run: () => runCmd(c.id), en: c.en })),
+    ...Object.values(TOOLS).map((t) => ({ label: 'Tool: ' + t.name, menu: 'Tools', k: t.key, kw: t.hint, run: () => setTool(t.id), en: () => toolAvail(t.id) }))];
+  modal('⌕ Search commands', `<div class="cmdp"><input type="text" id="cpq" placeholder="Type an action — e.g. lip sync, glow, bone, mouth, export…" autocomplete="off"><div class="cmdlist" id="cpl"></div></div>`, []);
+  const q = $('#cpq'), list = $('#cpl'); let idx = 0, shown = [];
+  const draw = () => {
+    const t = q.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    shown = all.filter((c) => t.every((w) => (c.label + ' ' + c.menu + ' ' + c.kw).toLowerCase().includes(w))).slice(0, 60);
+    idx = Math.min(idx, Math.max(0, shown.length - 1));
+    list.innerHTML = shown.map((c, i) => { const why = c.en && c.en(); return `<div class="ci ${i === idx ? 'on' : ''} ${why ? 'dis' : ''}" data-i="${i}"><span class="m">${c.menu}</span><span>${esc(c.label)}</span>${why ? `<span class="why">— ${esc(why)}</span>` : ''}<span class="k">${c.k ? esc(c.k) : ''}</span></div>`; }).join('') || '<div class="note">No matching command.</div>';
+    list.querySelectorAll('.ci').forEach((el) => (el.onclick = () => go(+el.dataset.i)));
+  };
+  const go = (i) => { const c = shown[i]; if (!c) return; closeModal(null); setTimeout(() => (c.en && c.en() ? toast(c.en(), 'err') : c.run()), 10); };
+  q.oninput = () => { idx = 0; draw(); };
+  q.onkeydown = (e) => { if (e.key === 'ArrowDown') { idx = Math.min(shown.length - 1, idx + 1); draw(); e.preventDefault(); } if (e.key === 'ArrowUp') { idx = Math.max(0, idx - 1); draw(); e.preventDefault(); } if (e.key === 'Enter') { e.preventDefault(); go(idx); } };
+  draw(); setTimeout(() => q.focus(), 20);
+}
+
+// ---------- misc actions ----------
+function deleteSelection() {
+  if (S.selKeys.size && deleteSelectedKeys()) return;
+  const L = selLayer();
+  if (L && L.type === 'vector' && S.selPts.size && POINT_TOOLS.has(S.tool)) return runCmd('pts.del');
+  if (S.selBone && BONE_TOOLS.has(S.tool)) return runCmd('bone.del');
+  if (L) runCmd('layer.del');
+}
+function flipPts(axis) {
+  const L = selLayer(), ids = [...S.selPts], vs = ids.map((id) => val(L, 'pt:' + id, S.frame)), c = vs.reduce((s, v) => s + v[axis], 0) / vs.length;
+  edit('Flip points', () => ids.forEach((id, i) => { const v = vs[i].slice(); v[axis] = round(2 * c - v[axis]); setVal(L, 'pt:' + id, v); }));
+}
+function jumpKey(dir) {
+  const L = S.camSel ? S.doc.camera : selLayer(); if (!L) return;
+  if(actActive()&&!actOwnsLayer(L))return;
+  const fs = [...new Set(Object.values(L.ch).flatMap((c) => c.keys.map((k) => k.f)))].sort((a, b) => a - b);
+  const n = dir > 0 ? fs.find((f) => f > S.frame) : fs.reverse().find((f) => f < S.frame);
+  if (n !== undefined) setFrame(n);
+}
+function rigTest() {
+  const B = activeBoneLayer(); if (!B.bones.length) return toast('This rig has no bones', 'err');
+  // non-destructive: preview a sequence of poses then restore the exact document
+  const snap = snapshot(); let i = 0;
+  const poses = [['Rest', 0], ['Bend +45°', 45], ['Bend −45°', -45], ['Extreme +90°', 90], ['Extreme −90°', -90]];
+  toast('Rig test: previewing pose suite (document is restored afterwards)');
+  const step = () => {
+    restore(snap);
+    if (i >= poses.length) { refreshAll(); toast('Rig test finished — check for tearing or stray points', 'ok'); return; }
+    const Bc = findLayer(B.id), [name, d] = poses[i++];
+    for (const b of Bc.bones) if (b.parent) baseSet(Bc, 'bone:' + b.id + ':a', b.a + d * 0.6), delete Bc.ch['bone:' + b.id + ':a'];
+    toast('Pose: ' + name); renderStage(); setTimeout(step, 700);
+  };
+  step();
+}
+function setLayout(tlh, rw) { document.documentElement.style.setProperty('--tlh', tlh + 'px'); document.documentElement.style.setProperty('--rw', rw + 'px'); requestDraw(); }
+function updateTitle() { $('#docname').textContent = S.doc.name + ` · ${S.doc.w}×${S.doc.h} · ${S.doc.fps} fps`; document.title = S.doc.name + ' — Popai Animator'; }
+async function projectSettings() {
+  const d = S.doc;
+  const r = await modal('Project settings', `<div class="form"><label>Name</label><input type="text" name="name" value="${esc(d.name)}">
+    <label>Width</label><input type="number" name="w" value="${d.w}"><label>Height</label><input type="number" name="h" value="${d.h}">
+    <label>Frame rate</label><input type="number" name="fps" value="${d.fps}"><label>End frame</label><input type="number" name="end" value="${d.end}">
+    <label>Background</label><input type="color" name="bg" value="${d.bg}"></div>`, [{ label: 'Cancel', value: false }, { label: 'Apply', value: true, pri: true }]);
+  if (!r || !r.v) return;
+  edit('Project settings', () => { const o = r.data; d.name = o.name || d.name; d.w = Math.max(16, o.w | 0); d.h = Math.max(16, o.h | 0); d.fps = clamp(+o.fps, 1, 120); d.end = Math.max(1, o.end | 0); d.bg = o.bg; });
+  updateTitle(); renderTLBar(); fitView();
+}
+const PRESETS = [['HD 1280×720', 1280, 720], ['Full HD 1920×1080', 1920, 1080], ['Square 1080×1080', 1080, 1080], ['Vertical 1080×1920', 1080, 1920], ['4K 3840×2160', 3840, 2160]];
+async function newProjectDialog() {
+  const r = await modal('New project', `<div class="form"><label>Name</label><input type="text" name="name" value="Untitled">
+    <label>Format</label><select name="preset">${PRESETS.map((p, i) => `<option value="${i}">${p[0]}</option>`).join('')}</select>
+    <label>Frame rate</label><select name="fps"><option>12</option><option selected>24</option><option>25</option><option>30</option><option>60</option></select>
+    <label>Length (frames)</label><input type="number" name="end" value="120"></div>`, [{ label: 'Cancel', value: false }, { label: 'Create', value: true, pri: true }]);
+  if (!r || !r.v) return false;
+  const p = PRESETS[+r.data.preset];
+  startDoc(newDoc({ name: r.data.name, w: p[1], h: p[2], fps: +r.data.fps, end: Math.max(1, r.data.end | 0) }));
+  return true;
+}
+function startDoc(d) {
+  if (S.playing) stopPlay();
+  documentEpoch++; invalidateScene(); S.doc = d; S.dirtyDoc = false; if (!d.media) d.media = {}; S.frame = 0; S.mode = 'setup'; S.swPreview = {}; S.alignOverlay = false; updateModeUI(); S.selLayers = S.selLayers.filter((id) => findLayer(id)); S.selPts = new Set(); S.selKeys = new Set(); S.selBone = null; S.camSel = false;
+  H.undo = []; H.redo = []; H.pending = null; TL.active = null; aiPending = null;
+  updateTitle(); renderTLBar(); fitView(); refreshAll();
+}
+async function recoverAutosave() { const s = lsGet('popai.autosave'); if (!s) return; try { await loadProjectJSON(s); toast('Recovered autosave', 'ok'); } catch (e) { toast('Autosave unreadable', 'err'); } }
+function showHome() {
+  const t = lsGet('popai.autosave.t');
+  modal('', `<div class="homein"><div class="hero">${typeof POPAI_WORDMARK === 'string' && POPAI_WORDMARK ? `<img src="${POPAI_WORDMARK}" alt="Popai Animator" style="height:64px;margin-right:6px">` : '<span style="font-size:42px;color:var(--acc)">◆</span>'}<div><div class="big" ${typeof POPAI_WORDMARK === 'string' && POPAI_WORDMARK ? 'style="display:none"' : ''}>Popai <b>Animator</b></div><div class="note" style="margin:2px 0 0">2D animation studio — vectors, bones, switches, lip sync, effects and an AI assistant. Vector animation, rigging and effects in one workspace.</div></div></div>
+    <div class="grid">
+      <div class="card" data-h="new"><h5>＋ New project</h5><p>Choose resolution and frame rate.</p></div>
+      <div class="card" data-h="demo"><h5>✦ Demo scene</h5><p>A rigged character that talks, waves, jumps — with dust, trail and camera shake. Great to explore.</p></div>
+      <div class="card" data-h="open"><h5>📂 Open project…</h5><p>Load a .popai.json file (media included).</p></div>
+      <div class="card" data-h="blank"><h5>▭ Quick blank (HD, 24 fps)</h5><p>Skip the settings and start drawing.</p></div>
+      <div class="card" data-h="recover" style="${t ? '' : 'opacity:.45;pointer-events:none'}"><h5>⟲ Recover autosave</h5><p>${t ? 'Last autosave: ' + esc(t) : 'No autosave yet'}</p></div>
+      <div class="card" data-h="guide"><h5>? Quick guide</h5><p>How drawing, rigging, keys and lip sync work here.</p></div>
+    </div></div>`, [], 'home');
+  $$('#modal [data-h]').forEach((c) => (c.onclick = async () => {
+    const h = c.dataset.h; closeModal(null);
+    if (h === 'new') { if (!(await newProjectDialog())) showHome(); }
+    if (h === 'blank') startDoc(newDoc({ name: 'Untitled' }));
+    if (h === 'demo') { startDoc(demoProject()); S.selLayers = [allLayers().find((l) => l.type === 'bone').id]; refreshAll(); toast('Demo loaded — press Space to play', 'ok'); }
+    if (h === 'open') pickFile('.json,.popai', importFile);
+    if (h === 'recover') recoverAutosave();
+    if (h === 'guide') quickGuide();
+  }));
+}
+function quickGuide() {
+  modal('Quick guide', `<div class="note" style="max-width:640px">
+  <b>1 · Draw.</b> Enter Setup mode (Tab), then use Pen (P), Freehand (F), Rectangle (R), Ellipse (E) or Polygon (Y). Points live on vector layers; shapes give them fill and stroke. Points tool (A) edits them; Paint bucket (B) fills closed paths.<br><br>
+  <b>2 · Animate.</b> Frame 0 is the setup pose. Go to another frame and change an animatable property — Auto-key creates keys. Right-click keys to change interpolation; switch to Curves to shape them. Onion skins (Shift+O) show neighbours.<br><br>
+  <b>3 · Rig.</b> Create a Bone Group and press <b>Tab</b> for Setup mode. Draw bones with Add bone (N) — the selected bone becomes the parent. Put artwork inside, then attach whole layers to a bone (L) or bind points with weights (Rig ▸ Bind points). Press Tab again for Animate and pose with Manipulate bones (M); IK pulls the parent chain. The toolbar only enables tools that fit the selected layer and mode — hover a dimmed tool to see why.<br><br>
+  <b>4 · Talk.</b> Import a WAV/MP3, create a mouth set (AI ▸ Create starter mouth set) and run AI ▸ Auto lip sync. It listens to the sound, so Shona and English both work. Fix any frame from the Switch tab; export the result as a Moho .dat.<br><br>
+  <b>5 · Effects & camera.</b> Each layer has an ordered effects stack. Camera tools: Track (4), Zoom (5), Roll (6), Pan/Tilt (7). Alt-drag with Track to dolly. Orbit Workspace (9) inspects depth; Home returns to Camera view. Open Camera properties for lens, focus and shake. Layer Depth Z gives parallax.<br><br>
+  <b>6 · AI.</b> In the AI tab, describe the change. You get a plan of validated commands first; Apply turns it into normal keys/effects that one Undo reverts.<br><br>
+  <b>7 · Save & export.</b> Ctrl+S saves a project file with all media; the desktop app writes directly to disk. File ▸ Export renders PNG, PNG sequences or WebM video with audio.</div>`);
+}
+function shortcutsDialog() {
+  const rows = [...Object.values(TOOLS).map((t) => [t.key, 'Tool: ' + t.name]), ...CMDS.filter((c) => c.k).map((c) => [c.k, c.label]), ['Space (hold)', 'Pan the stage'], ['Wheel / Ctrl+wheel', 'Zoom stage / timeline'], ['Shift+drag', 'Constrain / zoom camera'], ['1–9', 'Pick switch drawing (Switch tab)']];
+  modal('Keyboard shortcuts', `<div class="form" style="grid-template-columns:150px 1fr;max-height:60vh;overflow:auto">${rows.map(([k, n]) => `<kbd>${esc(k)}</kbd><span>${esc(n)}</span>`).join('')}</div>`);
+}
+
+// ---------- keyboard ----------
+function keyName(e) { let k = e.key.toLowerCase(); if (k === ' ') k = 'space'; return (e.ctrlKey || e.metaKey ? 'ctrl+' : '') + (e.shiftKey && (k.length > 1 || /^[a-z0-9<>]$/.test(k)) ? 'shift+' : '') + (e.altKey ? 'alt+' : '') + k; }
+function initKeys() {
+  document.addEventListener('keydown', (e) => {
+    if ($('#modal').classList.contains('show')) return;
+    const tag = document.activeElement.tagName;
+    if (/INPUT|TEXTAREA|SELECT/.test(tag) && !(e.ctrlKey && /^[zsy]$/i.test(e.key))) return;
+    const k = keyName(e);
+    // Moho: Ctrl+K opens the Actions panel; command search moved to Ctrl+Shift+P.
+    if (k === 'ctrl+shift+p') { e.preventDefault(); return commandPalette(); }
+    if (e.key === 'Tab' && !e.ctrlKey && !e.altKey) { e.preventDefault(); return setMode(S.mode === 'setup' ? 'animate' : 'setup'); }
+    if (e.key === ' ') { e.preventDefault(); if (!e.repeat) { Stage.spaceT = performance.now(); Stage.space = true; setCursor(); } return; }
+    if (e.key === 'Escape') { if (Stage.pen) finishPen(false); else runCmd('edit.deselect'); closeMenus(); return; }
+    if (e.key === 'Enter' && Stage.pen) { finishPen(false); return; }
+    if (k === 'shift+o') { e.preventDefault(); return runCmd('anim.onion'); }
+    if (e.shiftKey && (e.key === '>' || e.key === '.')) { e.preventDefault(); return runCmd('anim.nextkey'); }
+    if (e.shiftKey && (e.key === '<' || e.key === ',')) { e.preventDefault(); return runCmd('anim.prevkey'); }
+    if (e.key === '?') return shortcutsDialog();
+    // arrow nudge for selected layer/points with select/points tools
+    if (/^arrow/.test(e.key.toLowerCase()) && !e.ctrlKey && (S.tool === 'select' || S.tool === 'points' || S.tool === 'pointtf') && (S.selLayers.length || S.selPts.size) && (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.altKey)) {
+      e.preventDefault(); const n = e.shiftKey ? 10 : 1, dx = e.key === 'ArrowLeft' ? -n : e.key === 'ArrowRight' ? n : 0, dy = e.key === 'ArrowUp' ? -n : e.key === 'ArrowDown' ? n : 0;
+      const L = selLayer(); if (!L) return;
+      if ((S.tool === 'points' || S.tool === 'pointtf') && S.selPts.size && L.type === 'vector') edit('Nudge points', () => { for (const id of S.selPts) { const v = val(L, 'pt:' + id, S.frame); setVal(L, 'pt:' + id, [v[0] + dx, v[1] + dy]); } });
+      else edit('Nudge layer', () => { for (const id of S.selLayers) { const T = findLayer(id); setVal(T, 'x', val(T, 'x', S.frame) + dx); setVal(T, 'y', val(T, 'y', S.frame) + dy); } });
+      return;
+    }
+    const c = CMDS.find((c) => c.keys && c.keys.split('|').includes(k));
+    if (c) { e.preventDefault(); runCmd(c.id); return; }
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      const t = Object.values(TOOLS).find((t) => t.key && t.key.toLowerCase() === e.key.toLowerCase());
+      if (t) { e.preventDefault(); setTool(t.id); return; }
+      if (e.key.toLowerCase() === 'f' && !t) fitView();
+    }
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === ' ' && Stage.space) {
+      Stage.space = false; setCursor();
+      if (performance.now() - Stage.spaceT < 220 && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !$('#modal').classList.contains('show')) { if (S.tool === 'bindpts') runCmd('rig.bindpts'); else togglePlay(); }
+    }
+  });
+}
+
+// ---------- splitters & drag-drop ----------
+function initSplitters() {
+  const drag = (el, fn) => el.addEventListener('pointerdown', (e) => { el.setPointerCapture(e.pointerId); const mv = (ev) => fn(ev); el.addEventListener('pointermove', mv); el.addEventListener('pointerup', () => el.removeEventListener('pointermove', mv), { once: true }); });
+  drag($('#tsplit'), (e) => { document.documentElement.style.setProperty('--tlh', clamp(innerHeight - e.clientY, 90, innerHeight - 200) + 'px'); requestDraw(); });
+  drag($('#rsplit'), (e) => { const top = $('#right').getBoundingClientRect().top; document.documentElement.style.setProperty('--lyh', clamp(e.clientY - top, 80, 600) + 'px'); });
+  const sw = $('#stagewrap');
+  ['dragenter', 'dragover'].forEach((ev) => sw.addEventListener(ev, (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); sw.classList.add('drag'); } }));
+  ['dragleave', 'drop'].forEach((ev) => sw.addEventListener(ev, () => sw.classList.remove('drag')));
+  sw.addEventListener('drop', (e) => { e.preventDefault(); [...e.dataTransfer.files].forEach(importFile); });
+}
+
+// ---------- boot ----------
+function boot() {
+  S.doc = newDoc();
+  initStage(); initTimeline(); initLayersPanel(); initSide(); initMenus(); initKeys(); initSplitters();
+  UI.panels.push(renderLayers, renderSide, updateUndoButtons, updateToolbar, renderToolOpts);
+  $$('#modeSeg button').forEach((b) => (b.onclick = () => setMode(b.dataset.m))); updateModeUI();
+  setTool('select'); updateTitle(); fitView(); refreshAll();
+  setInterval(autosave, 15000);
+  window.addEventListener('beforeunload', (e) => { if (S.dirtyDoc) { autosave(); e.preventDefault(); e.returnValue = ''; } });
+  showHome();
+}
+function updateUndoButtons() { $('#btnUndo').disabled = !H.undo.length; $('#btnRedo').disabled = !H.redo.length; $('#btnUndo').title = H.undo.length ? 'Undo: ' + H.undo[H.undo.length - 1].label + ' (Ctrl+Z)' : 'Nothing to undo'; $('#btnRedo').title = H.redo.length ? 'Redo: ' + H.redo[H.redo.length - 1].label : 'Nothing to redo'; }
+window.PopaiApp = { boneScreen, simulateBones, boneFrames, setMode, toolAvail, swSetActive, switchState, contentBox, S, H, CMDS, runCmd, edit, setFrame, setTool, findLayer, allLayers, renderScene, parseAI, applyCmd, demoProject, startDoc, val, TL, Stage, loadProjectJSON, serialize, analyzeSpeech, Jobs, openLipSync };
+// Boot is invoked by the bundle after reliability guards are installed.
+
+/* Document reliability and bounded command execution. Installed before boot. */
+let documentEpoch = 0;
+function invalidateScene() { REV++; _simCache.clear(); }
+function writeReason(o) {
+  if (!o) return 'The target no longer exists';
+  if (o.id === 'CAM') return null;
+  const locked = [o, ...ancestors(o.id)].find(x => x.lock);
+  return locked ? `“${locked.name}” is locked` : null;
+}
+function assertWritable(o) { const why = writeReason(o); if (why) throw new Error(why); }
+function sceneSignature() { const d = {...S.doc}; delete d.ai; return JSON.stringify(d); }
+function nameMentioned(text,name){const escaped=name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');return new RegExp('(^|[^\\p{L}\\p{N}_])'+escaped+'(?=$|[^\\p{L}\\p{N}_])','iu').test(text);}
+function flattenDocument(d) { const m = new Map(); walk(d.layers, l => m.set(l.id,l)); return m; }
+function lockedDifference(before) {
+  const old = JSON.parse(before), now = flattenDocument(S.doc);
+  const clean = x => { const c = clone(x); const visit = l => { delete l.open; delete l.lock; delete l.vis; (l.children||[]).forEach(visit); }; visit(c); return JSON.stringify(c); };
+  for (const l of flattenDocument(old).values()) if (l.lock && (!now.has(l.id) || clean(l) !== clean(now.get(l.id)))) return `“${l.name}” is locked`;
+  const structure=l=>l.paths.map(p=>({id:p.id,pts:p.pts,closed:p.closed}));
+  if(S.mode!=='setup')for(const l of flattenDocument(old).values()) {const n=now.get(l.id);if(l.type==='vector'&&n&&(JSON.stringify(Object.keys(l.pts))!==JSON.stringify(Object.keys(n.pts))||JSON.stringify(structure(l))!==JSON.stringify(structure(n))||l.shapes.length!==n.shapes.length))return 'Change drawing topology in Setup mode; Animate mode moves existing points';}
+  return null;
+}
+const rawEdit = edit;
+edit = function(label, fn) {
+  const before = snapshot();
+  return rawEdit(label, () => { const r=fn(); const why=lockedDifference(before); if(why) throw new Error(why); return r; });
+};
+const rawCommitEdit = commitEdit;
+commitEdit = function() {
+  if (H.pending) { const why=lockedDifference(H.pending.s); if(why) { cancelEdit(); toast(why,'err'); return false; } }
+  const r=rawCommitEdit(); invalidateScene(); return r;
+};
+
+// Force-key and visibility channels have explicit setup values.
+const rawMkLayer = mkLayer;
+mkLayer = function(type,name) { const l=rawMkLayer(type,name); l.p.visible=true; return l; };
+
+// Every model-generated command is checked for type, scope and bounded work.
+const COMMAND_FIELDS = {
+  jump:['target','start','dur','height'], bounce:['target','start','dur','n','height'],
+  camshake:['start','dur','amp'], camzoom:['start','dur','zoom'], campan:['start','dur','dx','dy'], camdolly:['start','dur','distance'], camturn:['start','dur','pan','tilt','roll'],
+  particles:['preset','target','start'], trail:['target','glow','color'], fx:['target','type','params'],
+  fade:['target','start','dur','out'], rotate:['target','start','dur','deg'], scale:['target','start','dur','k'],
+  move:['target','start','dur','dx','dy','abs'], dup:['target','n','spacing'], interp:['interp','targets'],
+  vis:['target','on','start'], rename:['target','name'], clear:['target'], color:['target','color'],
+  lipsync:[], swset:['target','child','start'], ppreset:['target','preset']
+};
+function requestScope(text) {
+  const ids=new Set(S.selLayers);
+  for(const l of allLayers()) if(l.name.length>1 && nameMentioned(text,l.name)) ids.add(l.id);
+  for(const k of S.selKeys) { const q=parseKid(k); if(q.o && q.o.id!=='CAM') ids.add(q.o.id); }
+  return [...ids];
+}
+validateCmd = function(c) {
+  if(!c || typeof c!=='object' || !Object.hasOwn(COMMAND_FIELDS,c.op)) return 'Unknown command';
+  const allowed=new Set([...COMMAND_FIELDS[c.op],'op','desc','_scope','_keys']);
+  if(Object.keys(c).some(k=>!allowed.has(k))) return 'Unsupported command field';
+  const numeric=(k,min,max,required=true,integer=false)=> c[k]===undefined ? (required ? `Missing ${k}` : null) : (typeof c[k]!=='number'||!Number.isFinite(c[k])||c[k]<min||c[k]>max||(integer&&!Number.isInteger(c[k])) ? `Invalid ${k}` : null);
+  for(const [k,min,max,int] of [['start',0,100000,true],['dur',0,100000,true]]) { const e=numeric(k,min,max,false,int); if(e)return e; }
+  if((c.start??S.frame)+(c.dur??0)>100000) return 'Animation exceeds frame limit';
+  const targetless=['camshake','camzoom','campan','camdolly','camturn','interp','lipsync','particles'].includes(c.op);
+  if(!targetless && (typeof c.target!=='string'||!c.target)) return 'A target is required';
+  let targets=[];
+  if(c.target) { const l=findLayer(c.target); if(!l)return 'Target layer no longer exists'; targets.push(l); }
+  if(c.op==='interp') {
+    if(!INTERPS.some(([id])=>id===c.interp)) return 'Unsupported interpolation';
+    if(c.targets!=null && (!Array.isArray(c.targets)||!c.targets.length||c.targets.length>500)) return 'Invalid targets';
+    const ids=c.targets || [...(c._keys||S.selKeys)].map(k=>parseKid(k).o?.id);
+    if(!ids.length) return 'Select keyframes or target layers';
+    for(const id of ids) { const o=getOwner(id); if(!o)return 'Target no longer exists'; targets.push(o); }
+  }
+  if(c.op==='color') { const l=targets[0]; if(l) targets.push(...allLayersIn(l)); }
+  for(const l of targets) {
+    const why=writeReason(l); if(why)return why;
+    if(c._scope && l.id!=='CAM' && !c._scope.some(id=>id===l.id||ancestors(l.id).some(a=>a.id===id))) return 'Target is outside the request scope';
+    const can=AI_CAN[l.type]; if(can&&!can.has(c.op))return `Unsupported command for ${l.type}`;
+  }
+  const ranges={height:[0,10000],amp:[0,1000],zoom:[0.01,100],dx:[-100000,100000],dy:[-100000,100000],deg:[-36000,36000],k:[0.001,100],n:[1,c.op==='dup'?50:100],spacing:[-10000,10000],distance:[-100000,100000],pan:[-36000,36000],tilt:[-178,178],roll:[-36000,36000]};
+  for(const k of ['height','amp','zoom','dx','dy','deg','k','n','spacing','distance','pan','tilt','roll']) if(allowed.has(k)) { const e=numeric(k,...ranges[k],true,k==='n'); if(e)return e; }
+  if(['jump','bounce','camshake','camzoom','campan','camdolly','camturn','fade'].includes(c.op) && (!(c.dur>0))) return 'Duration must be at least one frame';
+  if(c.op==='bounce' && c.dur<c.n*2) return 'Bounces need at least two frames each';
+  if(c.op==='move' && c.abs!=null && (!Array.isArray(c.abs)||c.abs.length!==2||c.abs.some(n=>!Number.isFinite(n)||Math.abs(n)>100000))) return 'Invalid coordinates';
+  if((c.op==='color'||c.op==='trail'&&(c.glow||c.color!==undefined)) && !isColor(c.color))return 'Invalid color';
+  if(c.op==='dup'&&JSON.stringify(targets[0]).length*c.n>16*1024*1024)return 'Duplication exceeds edit memory budget';
+  if(c.op==='color'&&!['vector','text','group','bone','switch'].includes(targets[0]?.type)) return 'Recolor needs vector artwork or text';
+  if(c.op==='vis'&&typeof c.on!=='boolean')return 'Visibility must be boolean';
+  if(c.op==='fade'&&typeof c.out!=='boolean')return 'Fade direction must be boolean';
+  if(c.op==='trail'&&typeof c.glow!=='boolean')return 'Glow must be boolean';
+  if(c.op==='rename'&&(typeof c.name!=='string'||!c.name.trim()||c.name.length>200))return 'Invalid name';
+  if(['particles','ppreset'].includes(c.op)&&!Object.hasOwn(PARTICLE_PRESETS,c.preset))return 'Unknown particle preset';
+  if(c.op==='ppreset'&&targets[0]?.type!=='particle')return 'Select a particle layer';
+  if(c.op==='swset'&&(targets[0]?.type!=='switch'||!targets[0].children.some(l=>l.id===c.child)))return 'Select a valid switch alternative';
+  if(c.op==='fx') {
+    if(!Object.hasOwn(FX,c.type))return 'Unknown effect';
+    if(!c.params||typeof c.params!=='object'||Array.isArray(c.params))return 'Invalid effect parameters';
+    for(const [k,v] of Object.entries(c.params)) {
+      const d=FX[c.type].params[k]; if(!d)return 'Unknown effect parameter';
+      if(typeof d[0]==='number' && (typeof v!=='number'||!Number.isFinite(v)||v<d[1]||v>d[2]))return 'Effect parameter out of range';
+      if(typeof d[0]==='string'&&!isColor(v))return 'Invalid effect color';
+      if(typeof d[0]==='boolean'&&typeof v!=='boolean')return 'Invalid effect toggle';
+    }
+  }
+  return null;
+};
+const rawApplyCmd=applyCmd;
+applyCmd=function(c) { const e=validateCmd(c); if(e)throw new Error(e);const selected=S.selKeys;if(c.op==='interp'&&c._keys)S.selKeys=new Set(c._keys);try{return rawApplyCmd(c);}finally{S.selKeys=selected;} };
+
+// Untrusted project documents are validated before active state is replaced.
+function validateProject(j) {
+  if(!j||typeof j!=='object'||(j.format!==undefined&&j.format!==1))throw new Error('Unsupported project format');
+  const d=j.doc||j;
+  if(!d||!Array.isArray(d.layers)||!d.camera)throw new Error('Not a Popai project');
+  const finite=(v,a,b)=>typeof v==='number'&&Number.isFinite(v)&&v>=a&&v<=b;
+  const safeId=v=>typeof v==='string'&&/^[a-zA-Z0-9_-]{1,120}$/.test(v);
+  const safeTree=(v,depth=0)=>{if(depth>160)throw new Error('Document nesting limit');if(v&&typeof v==='object')for(const k of Object.keys(v)){if(['__proto__','prototype','constructor'].includes(k))throw new Error('Unsafe document property');safeTree(v[k],depth+1);}};safeTree(d);
+  for(const m of Object.values(d.media||{}))if(!m||!['image','audio'].includes(m.type)||typeof m.url!=='string'||!(m.url.startsWith('data:'+m.type+'/')||m.url.startsWith('data:application/octet-stream;')))throw new Error('Invalid embedded media');
+  if(!Array.isArray(d.styles)||!Array.isArray(d.palette)||!Array.isArray(d.markers))throw new Error('Invalid document collections');
+  for(const s of d.styles)if(!safeId(s.id)||!isColor(s.fill)||!isColor(s.stroke)||!finite(s.width,0,10000))throw new Error('Invalid shared style');
+  for(const s of d.styles)if(s.defines!==undefined&&(typeof s.defines!=='object'||Array.isArray(s.defines)||Object.entries(s.defines).some(([k,v])=>!['fill','stroke','width','fillOn','strokeOn'].includes(k)||typeof v!=='boolean')))throw new Error('Invalid style definition list');
+  const styleIds=new Set(d.styles.map(s=>s.id));
+  if(d.palette.some(c=>!isColor(c)))throw new Error('Invalid palette');
+  if(!finite(d.w,16,8192)||!finite(d.h,16,8192)||!finite(d.fps,1,120)||!finite(d.end,1,100000)||!Number.isInteger(d.end))throw new Error('Invalid project dimensions or timing');
+  if(d.v!==undefined&&d.v!==1)throw new Error('Unsupported document version');
+  let count=0,points=0,keys=0; const ids=new Set(['CAM']);
+  const channels=o=>{
+    if(!o.ch||typeof o.ch!=='object'||Array.isArray(o.ch))throw new Error('Invalid channels');
+    for(const [path,c]of Object.entries(o.ch)) {
+      if(!c||!Array.isArray(c.keys))throw new Error('Invalid key channel');
+      let last=-1;
+      for(const k of c.keys) { if(++keys>1000000||!finite(k.f,0,100000)||!Number.isInteger(k.f)||k.f<=last)throw new Error('Invalid/duplicate key time'); last=k.f;
+        if(k.i&&!INTERPS.some(([id])=>id===k.i))throw new Error('Invalid interpolation');
+        const v=k.v;if(v===undefined||(v===null&&path!=='sw')||(v!==null&&typeof v==='object'&&!Array.isArray(v))||typeof v==='number'&&!Number.isFinite(v)||Array.isArray(v)&&(v.length!==2||v.some(n=>!Number.isFinite(n))))throw new Error('Invalid key value');
+        if(path==='sw'&&v!==null&&!o.children?.some(l=>l.id===v))throw new Error('Switch key references missing drawing');
+        if(typeof v==='number'&&Math.abs(v)>1e7)throw new Error('Key value exceeds range');
+        if(path.startsWith('fx:')){const [,id,p]=path.split(':'),e=o.fx.find(e=>e.id===id),spec=e&&FX[e.type]?.params[p];if(!spec||typeof v!==typeof spec[0]||typeof v==='number'&&(v<spec[1]||v>spec[2]))throw new Error('Invalid animated effect parameter');}
+      }
+    }
+  };
+  const inspect=(ls,depth=0,rig=null)=>{if(depth>64)throw new Error('Layer nesting exceeds limit');
+    for(const l of ls) {
+      if(++count>5000||!l||!safeId(l.id)||ids.has(l.id)||!Object.hasOwn(LAYER_TYPES,l.type))throw new Error('Invalid/duplicate layer');ids.add(l.id);
+      if(typeof l.name!=='string'||l.name.length>1000||!l.p||!Array.isArray(l.fx))throw new Error('Incomplete layer');
+      for(const [k,v]of Object.entries(l.p))if(typeof v==='number'&&!finite(v,-1e9,1e9))throw new Error('Invalid property');
+      l.p.visible??=true;
+      if(l.label&&!isColor(l.label))throw new Error('Invalid label color');
+      for(const p of ['x','y','z','rot','sx','sy','opacity','ox','oy'])if(!finite(l.p[p],-1e7,1e7))throw new Error('Invalid transform');
+      if(l.type==='vector') {
+        if(!l.pts||!Array.isArray(l.paths)||!Array.isArray(l.shapes))throw new Error('Invalid vector');
+        for(const [id,p] of Object.entries(l.pts)){if(++points>500000||!safeId(id)||!finite(p.x,-1e7,1e7)||!finite(p.y,-1e7,1e7))throw new Error('Invalid point');}
+        const paths=new Set(l.paths.map(p=>p.id));
+        for(const p of l.paths)if(!safeId(p.id)||!Array.isArray(p.pts)||p.pts.some(id=>!l.pts[id]))throw new Error('Path references missing point');
+        for(const s of l.shapes)if(!safeId(s.id)||!isColor(s.fill)||!isColor(s.stroke)||!finite(s.width,0,10000)||!Array.isArray(s.paths)||s.paths.some(id=>!paths.has(id)))throw new Error('Invalid shape or path reference');
+      }
+      for(const e of l.fx) {
+        if(!e||!safeId(e.id)||!Object.hasOwn(FX,e.type)||!e.p)throw new Error('Unsupported effect');
+        for(const [k,v]of Object.entries(e.p)){const p=FX[e.type].params[k];if(!p||typeof v!==typeof p[0]||typeof v==='number'&&(!Number.isFinite(v)||v<p[1]||v>p[2]))throw new Error('Invalid effect parameter');}
+        for(const [k,p]of Object.entries(FX[e.type].params))e.p[k]??=p[0];
+      }
+      if(l.type==='bone') {
+        if(!Array.isArray(l.bones)||l.bones.length>2000)throw new Error('Invalid skeleton');
+        const bs=new Map(l.bones.map(b=>[b.id,b]));if(bs.size!==l.bones.length)throw new Error('Duplicate bone');
+        for(const b of l.bones){if(!safeId(b.id)||!finite(b.x,-1e7,1e7)||!finite(b.y,-1e7,1e7)||!finite(b.a,-1e7,1e7)||!finite(b.len,0,1e6))throw new Error('Invalid bone');let q=b,seen=new Set();while(q){if(seen.has(q.id))throw new Error('Bone parenting cycle');seen.add(q.id);if(q.parent&&!bs.has(q.parent))throw new Error('Missing bone parent');q=bs.get(q.parent);}}
+        sortBones(l);rig=l;
+      }
+      if(l.bindBone&&!rig?.bones.some(b=>b.id===l.bindBone))throw new Error('Missing binding bone');
+      if(l.flexi!==undefined&&typeof l.flexi!=='boolean')throw new Error('Invalid flexi-binding setting');
+      for(const k of ['ignoreSelector','hideEdit','flipH','flipV','immuneCam','maskNoStroke','maskExpand','depthSort','trueDistance','nested','autoBind'])if(l[k]!==undefined&&typeof l[k]!=='boolean')throw new Error('Invalid layer setting '+k);
+      for(const k of ['tags','comment'])if(l[k]!==undefined&&(typeof l[k]!=='string'||l[k].length>10000))throw new Error('Invalid layer '+k);
+      if(l.mask!==undefined&&!['none','hide','reveal','bottom','invert'].includes(l.mask))throw new Error('Invalid masking mode');
+      if(l.maskRole!==undefined&&!['mask','nomask','add','addhide','sub','subhide','clear','clearhide'].includes(l.maskRole))throw new Error('Invalid masking role');
+      if(Array.isArray(l.shapes))for(const s of l.shapes){if((s.styleId&&!styleIds.has(s.styleId))||(s.style2Id&&!styleIds.has(s.style2Id)))throw new Error('Shape references a missing style');if(s.over!==undefined&&(typeof s.over!=='object'||Array.isArray(s.over)||Object.entries(s.over).some(([k,v])=>!['fill','stroke','width','fillOn','strokeOn'].includes(k)||typeof v!=='boolean')))throw new Error('Invalid style override');}
+      if(Array.isArray(l.shapes))for(const s of l.shapes)if(s.liquid!==undefined&&!['add','sub','clip'].includes(s.liquid))throw new Error('Invalid liquid shape operation');else if(s.blend!==undefined&&!(typeof s.blend==='number'&&s.blend>=0&&s.blend<=100))throw new Error('Invalid liquid blend');
+      if(l.flexiBones!==undefined&&(!Array.isArray(l.flexiBones)||l.flexiBones.length>2000||l.flexiBones.some(id=>!rig?.bones.some(b=>b.id===id))))throw new Error('Invalid flexi-binding bones');
+      if(l.pts)for(const p of Object.values(l.pts))if(p.b&&(!Array.isArray(p.b)||p.b.some(w=>!Array.isArray(w)||!rig?.bones.some(b=>b.id===w[0])||!finite(w[1],0,1))))throw new Error('Invalid point binding');
+      if(isContainer(l)){if(!Array.isArray(l.children))throw new Error('Missing child layers');inspect(l.children,depth+1,rig);}
+      channels(l);
+    }
+  };
+  inspect(d.layers);channels(d.camera);
+  if(!d.camera.p||d.camera.id!=='CAM')throw new Error('Invalid camera');
+  for(const v of Object.values(d.camera.p))if(!finite(v,-1e7,1e7))throw new Error('Invalid camera value');
+  d.ai={log:[]}; // Saved display HTML is never trusted or executed on import.
+  return d;
+}
+
+// Preserve world placement for supported static 2D reparenting; reject ambiguous animated moves.
+function reparentLayerSafe(l,target,where) {
+  assertWritable(l);assertWritable(target);
+  const dest=where==='in'?target:parentOf(target.id),oldRig=boneLayerFor(l);
+  const chain=[l,...ancestors(l.id),...(dest?[dest,...ancestors(dest.id)]:[])];
+  if(chain.some(x=>Object.keys(x.ch).some(k=>['x','y','rot','sx','sy','z'].includes(k))))throw new Error('Reparent animated transforms in Setup before adding animation');
+  if(chain.some(x=>x.bindBone))throw new Error('Release whole-layer bindings before reparenting');
+  const W=evalLC(l,0).world, Z=evalLC(l,0).z, D=dest?evalLC(dest,0):{world:M.I(),z:0};
+  const m=M.mul(M.inv(D.world),W),sx=Math.hypot(m[0],m[1]),sy=(m[0]*m[3]-m[1]*m[2])/sx;
+  if(sx<1e-9||Math.abs(m[0]*m[2]+m[1]*m[3])>1e-6*Math.max(1,sx*Math.abs(sy)))throw new Error('This move requires unsupported shear; normalize group transforms first');
+  const from=siblingsOf(l.id);from.splice(from.indexOf(l),1);
+  if(where==='in'){target.children.unshift(l);target.open=true;}else{const to=siblingsOf(target.id);to.splice(to.indexOf(target)+(where==='below'?1:0),0,l);}
+  const ox=l.p.ox||0,oy=l.p.oy||0;
+  Object.assign(l.p,{x:m[4]-ox+m[0]*ox+m[2]*oy,y:m[5]-oy+m[1]*ox+m[3]*oy,rot:Math.atan2(m[1],m[0])/DEG,sx,sy,z:Z-D.z});
+  const clear=a=>{if(a.type==='bone')return;a.bindBone=null;delete a.flexiBones;if(a.pts)for(const p of Object.values(a.pts))delete p.b;(a.children||[]).forEach(clear);};
+  if(oldRig!==boneLayerFor(l))clear(l);
+}
+
+// Temporary rig poses are evaluation overrides, never destructive document restores.
+let rigPreview=null;
+const rawBoneFrames=boneFrames;
+boneFrames=function(b,f,over,noDyn){return rawBoneFrames(b,f,over||(rigPreview&&rigPreview.doc===S.doc&&rigPreview.id===b.id&&f!==null?rigPreview.angles:null),noDyn);};
+rigTest=function(){const b=activeBoneLayer();if(!b?.bones.length)return toast('Select a rig with bones','err');const epoch=documentEpoch,id=b.id;let i=0;const step=()=>{if(epoch!==documentEpoch||i>=5){rigPreview=null;requestDraw();return;}const current=findLayer(id);if(!current){rigPreview=null;return;}const d=[0,27,-27,54,-54][i++];rigPreview={id,doc:S.doc,angles:Object.fromEntries(current.bones.map(x=>[x.id,val(current,'bone:'+x.id+':a',S.frame)+(x.parent?d:0)]))};requestDraw();setTimeout(step,700);};step();};
+
+// The recovery checkpoint and the last explicit save are different states.
+let recoveryDB=null,recoveryPending=false,recoverySignature='';
+function recoveryStore(text) {
+  if(typeof indexedDB==='undefined')return Promise.reject(new Error('IndexedDB unavailable'));
+  if(!recoveryDB)recoveryDB=new Promise((resolve,reject)=>{const q=indexedDB.open('popai-recovery',1);q.onupgradeneeded=()=>q.result.createObjectStore('snapshots');q.onsuccess=()=>resolve(q.result);q.onerror=()=>{recoveryDB=null;reject(q.error);};});
+  return recoveryDB.then(db=>new Promise((resolve,reject)=>{const tx=db.transaction('snapshots','readwrite');tx.objectStore('snapshots').put(text,'latest');tx.oncomplete=resolve;tx.onerror=tx.onabort=()=>reject(tx.error||new Error('Recovery write failed'));}));
+}
+async function recoveryRead(){try{if(typeof indexedDB!=='undefined'){await recoveryStoreInit();const db=await recoveryDB;const text=await new Promise((resolve,reject)=>{const q=db.transaction('snapshots').objectStore('snapshots').get('latest');q.onsuccess=()=>resolve(q.result);q.onerror=()=>reject(q.error);});if(text)return text;}}catch(e){}return lsGet('popai.autosave');}
+function recoveryStoreInit(){if(!recoveryDB){recoveryDB=new Promise((resolve,reject)=>{const q=indexedDB.open('popai-recovery',1);q.onupgradeneeded=()=>q.result.createObjectStore('snapshots');q.onsuccess=()=>resolve(q.result);q.onerror=()=>{recoveryDB=null;reject(q.error);};});}return recoveryDB;}
+autosave=async function(){if(!S.dirtyDoc||!S.doc||recoveryPending)return;const sig=sceneSignature();if(sig===recoverySignature)return;const text=serialize();recoveryPending=true;try{await recoveryStore(text);recoverySignature=sig;lsSet('popai.autosave.t',new Date().toLocaleString());}catch(e){if(lsSet('popai.autosave',text)){recoverySignature=sig;lsSet('popai.autosave.t',new Date().toLocaleString());}else toast('Recovery storage is full; save a project file now','err');}finally{recoveryPending=false;}};
+recoverAutosave=async function(){const text=await recoveryRead();if(!text)return toast('No recovery checkpoint found','err');if(await loadProjectJSON(text)===false)return false;S.dirtyDoc=true;toast('Recovered checkpoint — save a project file','ok');};
+saveProject=async function(){const doc=S.doc,epoch=documentEpoch,text=serialize(),sig=sceneSignature(),name=(doc.name||'project').replace(/[^\w\- ]+/g,'_')+'.popai.json';try{
+  if(window.showSaveFilePicker){const h=await window.showSaveFilePicker({suggestedName:name,types:[{description:'Popai project',accept:{'application/json':['.json']}}]});const w=await h.createWritable();try{await w.write(text);await w.close();}catch(e){try{await w.abort();}catch(_){}throw e;}if(documentEpoch===epoch&&sceneSignature()===sig)S.dirtyDoc=false;toast('Project file saved','ok');}
+  else{const outcome=await download(new Blob([text],{type:'application/json'}),name);if(outcome?.confirmed&&documentEpoch===epoch&&sceneSignature()===sig)S.dirtyDoc=false;toast(outcome?.confirmed?'Project saved':'Download started — confirm the file is in Downloads. Unsaved warning stays active.','ok');}
+}catch(e){if(e.name!=='AbortError')toast('Project was not saved: '+e.message,'err');return false;}};
+
+// Register the replaced functions (the command table retains original references).
+CMDS.find(c=>c.id==='file.save').run=()=>saveProject();
+CMDS.find(c=>c.id==='file.recover').en=()=>lsGet('popai.autosave.t')||lsGet('popai.autosave')?false:'No recovery checkpoint';
+const rawStartDoc=startDoc;
+startDoc=function(d){if(S.dirtyDoc&&!window.confirm('Replace the current unsaved project? Save it first if needed.'))return false;rigPreview=null;return rawStartDoc(d);};
+window.addEventListener('popai-document-change',()=>{rigPreview=null;});
+
+// Isolated synchronous evaluation of an immutable render input.
+function captureScene(){return {doc:clone(S.doc),media:{...S.media}};}
+function withScene(scene,fn){const d=S.doc,m=S.media;S.doc=scene.doc;S.media=scene.media;try{return fn();}finally{S.doc=d;S.media=m;}}
+const rawDemoProject=demoProject;
+demoProject=function(){const selection=S.selLayers,frame=S.frame;try{return withScene({doc:newDoc(),media:{}},()=>rawDemoProject());}finally{S.selLayers=selection;S.frame=frame;}};
+function snapshotFrame(scene,f,scale,alpha){return withScene(scene,()=>renderFrameCanvas(f,scale,alpha));}
+function audioVisible(l,f){let child=l;for(const a of [l,...ancestors(l.id)]){if(!a.vis||val(a,'visible',f)===false)return false;if(a!==l&&a.type==='switch'&&switchState(a,f).cur!==child.id)return false;child=a;}return true;}
+function scheduleGain(g,l,fromF,now){const fps=S.doc.fps,end=Math.min(S.doc.end,Math.ceil((S.media[l.media]?.buffer.duration||0)*fps)+l.offset);for(let f=fromF;f<=end;f++)g.setValueAtTime(audioVisible(l,f)?Math.max(0,val(l,'gain',f)||0):0,now+(f-fromF)/fps);}
+function createAudioRun(fromF,dest){const ac=audioCtx(),now=ac.currentTime+0.03,nodes=[];for(const l of audioLayers()){const buf=S.media[l.media].buffer,off=(fromF-l.offset)/S.doc.fps;if(off>=buf.duration)continue;const src=ac.createBufferSource(),gain=ac.createGain();src.buffer=buf;src.connect(gain);gain.connect(dest||ac.destination);scheduleGain(gain.gain,l,fromF,now);if(off>=0)src.start(now,off);else src.start(now-off,0);nodes.push(src);}return{now,nodes,stop(){for(const n of nodes)try{n.stop();n.disconnect();}catch(e){}}};}
+startAudio=function(fromF,dest){const run=createAudioRun(fromF,dest);Play.nodes.push(...run.nodes);return run.now;};
+
+const oldRunJob=runJob;
+runJob=function(name,kind,fn){return oldRunJob(name,kind,async(job,tick)=>{persistJobs();try{return await fn(job,(p,msg)=>{tick(p,msg);persistJobs();});}finally{setTimeout(persistJobs,0);}});};
+function persistJobs(){lsSet('popai.jobs',JSON.stringify(Jobs.list.slice(0,30).map(({id,name,kind,status,progress,msg,t0,t1})=>({id,name,kind,status,progress,msg,t0,t1}))));}
+try{Jobs.list=JSON.parse(lsGet('popai.jobs')||'[]').filter(j=>j&&typeof j.name==='string').map(j=>({...j,status:j.status==='running'?'interrupted':j.status,msg:j.status==='running'?'Interrupted by reload; rerun the operation':j.msg}));}catch(e){Jobs.list=[];}
+
+exportDialog=async function(){
+  const exportForm=modal('Export',`<div class="form"><label>Format</label><select name="fmt"><option value="png">PNG current frame</option><option value="seq">PNG sequence (bounded ZIP parts)</option><option value="webm" selected>Video (.webm)</option><option value="dat">Moho switch data</option><option value="project">Project file</option></select><label>From frame</label><input type="number" name="from" min="0" value="1"><label>To frame</label><input type="number" name="to" value="${S.doc.end}"><label data-video-quality>Video quality</label><select name="quality" data-video-quality><option value="draft">Draft · 2 Mbps</option><option value="standard">Standard · 5 Mbps</option><option value="high" selected>High · 8 Mbps</option><option value="ultra">Ultra · 16 Mbps</option></select><label>Render size</label><select name="scale"><option value="0.5">50% · ${Math.round(S.doc.w*0.5)} × ${Math.round(S.doc.h*0.5)}</option><option selected value="1">100% · ${S.doc.w} × ${S.doc.h}</option><option value="2">200% · ${S.doc.w*2} × ${S.doc.h*2}</option></select><label>Transparency</label><input type="checkbox" name="alpha"></div><p class="note">The scene is captured when you start. PNG sequences are frame-accurate and split into ZIP parts near 64 MiB. WebM requires real-time rendering; missed deadlines stop the job. Use PNG for heavy scenes.</p>`,[{label:'Cancel',value:false},{label:'Export',value:true,pri:true}]);
+  const format=$('#modal [name="fmt"]');
+  if(format){const update=()=>{document.querySelectorAll('#modal [data-video-quality]').forEach(el=>{el.hidden=format.value!=='webm';if(el.tagName==='SELECT')el.disabled=format.value!=='webm';});};format.onchange=update;update();}
+  const result=await exportForm;
+  if(!result?.v)return;const o=result.data;
+  const qualityRates={draft:2e6,standard:5e6,high:8e6,ultra:16e6};
+  const videoBitrate=qualityRates[o.quality||'high'];
+  if(o.fmt==='webm'&&!videoBitrate)return toast('Choose a valid video quality','err');
+  if(o.fmt==='dat')return exportDat();if(o.fmt==='project')return saveProject();
+  const sc=+o.scale,from=+o.from,to=+o.to;
+  if(![0.5,1,2].includes(sc)||!Number.isInteger(from)||!Number.isInteger(to)||from<0||to<from||to>100000)return toast('Invalid export range','err');
+  const scene=captureScene(),d=scene.doc,base=(d.name||'render').replace(/[^\w\- ]+/g,'_');
+  if(d.w*sc*d.h*sc>33554432)return toast('Export exceeds 32 megapixel limit; reduce scale','err');
+  const blobAt=async f=>{const b=await canvasBlob(snapshotFrame(scene,f,sc,o.alpha));if(!b)throw new Error('Frame encoding failed');return b;};
+  if(o.fmt==='png'){try{await download(await blobAt(S.frame),`${base}_${S.frame}.png`);}catch(e){toast(e.message,'err');}return;}
+  setTab('jobs');
+  if(o.fmt==='seq')return runJob(`PNG ${from}–${to}`,'snapshot render',async(job,tick)=>{
+    let files=[],bytes=0,part=0;const budget=64*1024*1024;
+    const flush=async()=>{if(!files.length)return;await download(makeZip(files),`${base}_part${String(++part).padStart(3,'0')}.zip`);files=[];bytes=0;};
+    for(let f=from;f<=to;f++){if(job.cancel)return{msg:`Cancelled; ${part} completed ZIP parts may already be downloaded`};const b=await blobAt(f);if(job.cancel)return;if(b.size>budget)throw new Error('A frame exceeds ZIP part budget; reduce scale');if(bytes+b.size>budget)await flush();files.push({name:`${base}_${String(f).padStart(6,'0')}.png`,data:new Uint8Array(await b.arrayBuffer())});bytes+=b.size;tick((f-from+1)/(to-from+1),`Frame ${f}`);await sleep(0);}
+    if(job.cancel)return;await flush();return{msg:`${to-from+1} frames; ${part} ZIP download(s) initiated`};
+  });
+  if(o.fmt==='webm')return runJob(`WebM ${from}–${to}`,'video render · '+(o.quality||'high')+' · '+videoBitrate/1e6+' Mbps',async(job,tick)=>{
+    if(!window.MediaRecorder)throw new Error('MediaRecorder unavailable; export PNG');
+    const c=document.createElement('canvas');c.width=Math.round(d.w*sc);c.height=Math.round(d.h*sc);
+    const stream=c.captureStream(0),track=stream.getVideoTracks()[0],ac=audioCtx(),dest=ac.createMediaStreamDestination();let audio=null,rec=null;
+    try{
+      if(!track.requestFrame)throw new Error('Manual frame capture unsupported; export PNG');
+      const has=withScene(scene,()=>audioLayers().length)>0;if(has)dest.stream.getAudioTracks().forEach(t=>stream.addTrack(t));
+      const mime=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));if(!mime)throw new Error('No supported WebM codec');
+      const chunks=[];let size=0;rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:videoBitrate});
+      let recordingError=null;const done=new Promise(resolve=>{rec.onstop=resolve;rec.onerror=e=>{recordingError=new Error(e.error?.message||'Recorder failed');resolve();};});
+      rec.ondataavailable=e=>{if(e.data.size){size+=e.data.size;chunks.push(e.data);if(size>128*1024*1024)recordingError=new Error('Recording exceeds 128 MiB budget; shorten range or export PNG');}};
+      const draw=f=>{const x=c.getContext('2d');x.setTransform(1,0,0,1,0,0);x.fillStyle=d.bg;x.fillRect(0,0,c.width,c.height);withScene(scene,()=>renderScene(x,f,M.chain(M.t(c.width/2,c.height/2),M.s(sc)),{export:true}));track.requestFrame();};
+      draw(from);rec.start(1000);audio=has?withScene(scene,()=>createAudioRun(from,dest)):null;
+      const clock=()=>has?ac.currentTime:performance.now()/1000,t0=audio?audio.now:clock();
+      for(let f=from;f<=to;f++){if(job.cancel)break;const target=(f-from)/d.fps;while(clock()-t0<target){if(job.cancel)break;await sleep(2);}if(job.cancel)break;if(recordingError)throw recordingError;if(clock()-t0-target>Math.max(0.05,1/d.fps))throw new Error('Real-time deadline missed; use PNG sequence for exact frames');draw(f);tick((f-from+1)/(to-from+1),`Frame ${f}`);}
+      await sleep(1000/d.fps);audio?.stop();rec.stop();await done;if(recordingError)throw recordingError;if(job.cancel)return;
+      const result=await download(new Blob(chunks,{type:mime}),`${base}.webm`);if(result?.canceled){job.cancel=true;return{msg:'Video save cancelled'};}return{msg:result?.confirmed?'Video saved: '+(result.name||base+'.webm'):'Video download started (.webm)'};
+    }finally{audio?.stop();if(rec&&rec.state!=='inactive')rec.stop();for(const t of stream.getTracks())t.stop();for(const t of dest.stream.getTracks())t.stop();}
+  });
+};
+CMDS.find(c=>c.id==='file.export').run=()=>exportDialog();
+Object.assign(window.PopaiApp,{applyCmd,runJob,validateCmd,saveProject,autosave,rigTest});
+
+// Retained offscreen buffers have a pixel-memory budget rather than only a count.
+Pool.put=function(...canvases){let bytes=this.list.reduce((n,c)=>n+c.width*c.height*4,0);for(const c of canvases){const size=c&&c.width*c.height*4;if(c&&bytes+size<=64*1024*1024&&!this.list.includes(c)){this.list.push(c);bytes+=size;}}};
+const unboundedSimulation=simulateBones;
+simulateBones=function(b){if((S.doc.end+1)*b.bones.filter(x=>x.dyn?.on).length>2000000)throw new Error('Dynamics exceeds simulation budget; shorten the project or reduce dynamic bones');return unboundedSimulation(b);};
+Object.assign(window.PopaiApp,{demoProject,startDoc,simulateBones,boneFrames,exportDialog});
+
+/* Vector editing: geometry, appearance and animation are independent.
+   pv:<point>:<property> and curve:<path>:<property> belong to the vector layer. */
+const VEC = {
+  lasso:false,group:'',groupName:'',simplify:80,autoWeld:true,sharp:false,handles:false,fixed:false,
+  shape:'rectangle',horizontal:4,vertical:4,radius:70,strength:0.6,spacing:24,scatter:25,
+  smoothing:2,reduction:1.5,weldEnds:true,multiFill:false,pressureWidth:true,pressureAlpha:false,
+  taper:0,colorDrift:0,pointColor:'#ff8050',colorStrength:0.7,colorRadius:80,profile:'',repeats:1,offset:0,lwMagnet:false,lwRadius:80,
+};
+const VECTOR_DRAW = ['points','pointtf','pen','curvature','freehand','drawshape','deleteedge','magnet','blob','eraser','reduce','scatter','perspective','shear','bend','noise'];
+const VECTOR_FILL = ['shapeselect','createshape','fill','deleteshape','linewidth','hideedge','exposure','profile','colorpoints'];
+const VECTOR_TOPOLOGY = new Set(['pen','freehand','drawshape','rect','ellipse','polygon','deleteedge','blob','eraser','reduce','scatter','createshape','deleteshape']);
+for(const id of [...VECTOR_DRAW,...VECTOR_FILL])POINT_TOOLS.add(id);
+for(const id of ['drawshape','blob','scatter'])TOOLS_DRAW.add(id);
+TOOL_GROUPS[0][1]=['select','text'];
+TOOL_GROUPS[1]=['Draw',VECTOR_DRAW]; TOOL_GROUPS[2]=['Fill',VECTOR_FILL];
+const vectorOldAvail=toolAvail;
+toolAvail=function(id){
+  if(!VECTOR_DRAW.includes(id)&&!VECTOR_FILL.includes(id))return vectorOldAvail(id);
+  const L=selLayer();
+  if(!L&&TOOLS_DRAW.has(id))return S.mode==='setup'?null:'Create geometry in Setup mode';
+  if(!L||L.type!=='vector')return L?.type==='switch'?'Select a drawing inside this Switch Group':'Select a vector drawing to use this tool';
+  return writeReason(L)||(VECTOR_TOPOLOGY.has(id)&&S.mode!=='setup'?'Change drawing topology in Setup mode':null);
+};
+function vectorAction(label,fn,topology=false){
+  const L=selLayer(); if(!L||L.type!=='vector')return toast('Select a vector drawing','err');
+  const why=writeReason(L)||(topology&&S.mode!=='setup'?'Change drawing topology in Setup mode':null);
+  if(why)return toast(why,'err'); return edit(label,()=>fn(L));
+}
+function vectorIDs(L){return [...S.selPts].filter(id=>L.pts[id]);}
+function vectorCenter(L,ids=vectorIDs(L),f=S.frame){
+  if(!ids.length)return [0,0]; const P=ids.map(id=>val(L,'pt:'+id,f));
+  return [(Math.min(...P.map(p=>p[0]))+Math.max(...P.map(p=>p[0])))/2,(Math.min(...P.map(p=>p[1]))+Math.max(...P.map(p=>p[1])))/2];
+}
+function vectorTransform(L,fn,ids=vectorIDs(L)){
+  for(const id of ids)setVal(L,'pt:'+id,fn(val(L,'pt:'+id,S.frame),id));
+}
+function vectorCleanup(L){
+  const used=new Set(L.paths.flatMap(p=>p.pts));
+  for(const id of Object.keys(L.pts))if(!used.has(id))delete L.pts[id];
+  const pathIDs=new Set(L.paths.map(p=>p.id)),shapeIDs=new Set(L.shapes.map(s=>s.id));
+  for(const p of L.paths){if(p.profile&&!pathIDs.has(p.profile))p.profile=null;for(const k of Object.keys(p))if(k.startsWith('hide_')&&!p.pts.includes(k.slice(5)))delete p[k];}
+  for(const s of L.shapes)s.paths=s.paths.filter(id=>pathIDs.has(id));
+  L.shapes=L.shapes.filter(s=>s.paths.length);
+  for(const k of Object.keys(L.ch)){const [kind,id,prop]=k.split(':');if((['pv','pt'].includes(kind)&&!L.pts[id])||(kind==='curve'&&(!pathIDs.has(id)||prop.startsWith('hide_')&&!L.paths.find(p=>p.id===id).pts.includes(prop.slice(5))))||(kind==='sh'&&(!shapeIDs.has(id)||!L.shapes.some(s=>s.id===id))))delete L.ch[k];}
+  for(const g of L.pointGroups||[])g.points=g.points.filter(id=>L.pts[id]);
+  S.selPts=new Set(vectorIDs(L)); if(!L.shapes.some(s=>s.id===S.selShape))S.selShape=null;
+}
+const vectorOldDeletePoints=deletePoints;
+deletePoints=function(L,ids){vectorOldDeletePoints(L,ids);vectorCleanup(L);};
+function vectorPathPoints(L,f=0){return Object.fromEntries(Object.keys(L.pts).map(id=>[id,val(L,'pt:'+id,f)]));}
+function vectorOffset(L,id,v,lc){
+  const B=lc?.B;if(!B||lc.bound)return v;
+  const p=L.pts[id],weights=pointBoneWeights(L,p,B,lc.relPts,layerFlexSegs(L,B))||[];
+  if(!weights.length)return v;
+  const q=M.apv(lc.relPts,v[0],v[1]);let x=0,y=0,w=0;
+  for(const [bid,n]of weights){if(!B.D[bid])continue;const a=M.apv(B.D[bid],q[0],q[1]);x+=a[0]*n;y+=a[1]*n;w+=n;}
+  return w?M.apv(M.inv(lc.relPts),x/w,y/w):v;
+}
+function vectorCubic(L,path,i,P,f=S.frame,lc=null){
+  const ids=path.pts,n=ids.length,ix=j=>path.closed?(j+n)%n:clamp(j,0,n-1),id=ids[ix(i)],next=ids[ix(i+1)];
+  const a=P[ids[ix(i-1)]],b=P[id],c=P[next],d=P[ids[ix(i+2)]];
+  const k1=val(L,'pv:'+id+':c',f)/6,k2=val(L,'pv:'+next+':c',f)/6;
+  let h1=[(c[0]-a[0])*k1,(c[1]-a[1])*k1],h2=[-(d[0]-b[0])*k2,-(d[1]-b[1])*k2];
+  if(L.pts[id].hout||L.ch['pv:'+id+':hout'])h1=vectorOffset(L,id,val(L,'pv:'+id+':hout',f),lc);
+  if(L.pts[next].hin||L.ch['pv:'+next+':hin'])h2=vectorOffset(L,next,val(L,'pv:'+next+':hin',f),lc);
+  return [b,[b[0]+h1[0],b[1]+h1[1]],[c[0]+h2[0],c[1]+h2[1]],c];
+}
+function vectorBezier(q,t){const u=1-t;return [0,1].map(k=>u*u*u*q[0][k]+3*u*u*t*q[1][k]+3*u*t*t*q[2][k]+t*t*t*q[3][k]);}
+function vectorSplitCubic(q,t){const a=mixVal(q[0],q[1],t),b=mixVal(q[1],q[2],t),c=mixVal(q[2],q[3],t),d=mixVal(a,b,t),e=mixVal(b,c,t),p=mixVal(d,e,t);return [[q[0],a,d,p],[p,e,c,q[3]]];}
+function vectorSub(a,b){return [a[0]-b[0],a[1]-b[1]];}
+tracePath=function(ctx,L,path,P,f=S.frame,lc=null){
+  if(path.pts.length<2)return;const p=P[path.pts[0]];if(!p)return;ctx.moveTo(...p);
+  const n=path.pts.length-(path.closed?0:1);
+  for(let i=0;i<n;i++){const q=vectorCubic(L,path,i,P,f,lc);ctx.bezierCurveTo(...q[1],...q[2],...q[3]);}
+  if(path.closed)ctx.closePath();
+};
+function vectorSamples(L,path,P,f=S.frame,lc=null){
+  const out=[];let length=0,previous=null;
+  for(let i=0;i<path.pts.length-(path.closed?0:1);i++){
+    const q=vectorCubic(L,path,i,P,f,lc),estimate=q.slice(1).reduce((s,p,j)=>s+Math.hypot(...vectorSub(p,q[j])),0);
+    const steps=clamp(Math.ceil(estimate/5),8,128);
+    for(let j=i?1:0;j<=steps;j++){
+      const t=j/steps,p=vectorBezier(q,t);if(previous)length+=Math.hypot(...vectorSub(p,previous));
+      out.push({p,i,t,length});previous=p;
+    }
+  }
+  for(const a of out)a.u=length?a.length/length:0;return out;
+}
+hitSegment=function(L,sx,sy){
+  const lc=lcOf(L);let best=null,dist=9*Stage.dpr;
+  for(const path of L.paths){const s=vectorSamples(L,path,lc.P,S.frame,lc);for(let j=1;j<s.length;j++){
+    const a=M.ap(lc.full,...s[j-1].p),b=M.ap(lc.full,...s[j].p),d=distToSeg(sx,sy,a,b);
+    if(d<dist){const dx=b[0]-a[0],dy=b[1]-a[1],t=clamp(((sx-a[0])*dx+(sy-a[1])*dy)/(dx*dx+dy*dy||1),0,1),v=s[j];
+      best={path,index:v.i,t:lerp(s[j-1].i===v.i?s[j-1].t:0,v.t,t)};dist=d;}
+  }}return best;
+};
+function vectorInsert(L,path,index,t=0.5){
+  const first=path.pts[index],last=path.pts[(index+1)%path.pts.length],frames=new Set([0]);
+  for(const [key,c]of Object.entries(L.ch)){const [kind,id,prop]=key.split(':');if(path.pts.includes(id)&&(kind==='pt'||kind==='pv'&&['c','hin','hout'].includes(prop)))for(const k of c.keys)frames.add(k.f);}
+  const poses=[...frames].sort((a,b)=>a-b).map(f=>({f,split:vectorSplitCubic(vectorCubic(L,path,index,vectorPathPoints(L,f),f),t),hin:vectorAutoHandle(L,first,'hin',f),hout:vectorAutoHandle(L,last,'hout',f)}));
+  const [a,b]=poses[0].split;
+  const id=addPoint(L,...a[3],1);
+  if(!L.pts[first].hin&&!L.ch['pv:'+first+':hin'])L.pts[first].hin=poses[0].hin;
+  if(!L.pts[last].hout&&!L.ch['pv:'+last+':hout'])L.pts[last].hout=poses[0].hout;
+  L.pts[first].hout=vectorSub(a[1],a[0]);L.pts[last].hin=vectorSub(b[2],b[3]);
+  L.pts[id].hin=vectorSub(a[2],a[3]);L.pts[id].hout=vectorSub(b[1],b[0]);
+  for(const k of ['width','alpha','strength'])L.pts[id][k]=lerp(baseGet(L,'pv:'+first+':'+k),baseGet(L,'pv:'+last+':'+k),t);
+  if(L.pts[first].b)L.pts[id].b=clone(L.pts[first].b);
+  path.pts.splice(index+1,0,id);
+  for(const pose of poses.slice(1)){const [a,b]=pose.split,f=pose.f;setVal(L,'pt:'+id,a[3],f,true);
+    for(const [pid,side,v]of [[first,'hin',pose.hin],[first,'hout',vectorSub(a[1],a[0])],[last,'hin',vectorSub(b[2],b[3])],[last,'hout',pose.hout],[id,'hin',vectorSub(a[2],a[3])],[id,'hout',vectorSub(b[1],b[0])]])setVal(L,'pv:'+pid+':'+side,v,f,true);
+  }return id;
+}
+function vectorSplitSelected(L){
+  const selected=new Set(vectorIDs(L)),added=[];
+  for(const p of L.paths)for(let i=p.pts.length-(p.closed?1:2);i>=0;i--)if(selected.has(p.pts[i])&&selected.has(p.pts[(i+1)%p.pts.length]))added.push(vectorInsert(L,p,i));
+  S.selPts=new Set([...selected,...added]);return added;
+}
+function vectorWeld(L,remove,keep){
+  if(remove===keep)return;
+  if(S.selPts.has(remove))S.selPts.add(keep);
+  for(const p of L.paths){p.pts=p.pts.map(id=>id===remove?keep:id).filter((id,i,a)=>!i||a[i-1]!==id);if(p.pts.length>2&&p.pts[0]===p.pts.at(-1)){p.pts.pop();p.closed=true;}}
+  for(const g of L.pointGroups||[])g.points=[...new Set(g.points.map(id=>id===remove?keep:id))];
+  delete L.pts[remove];L.paths=L.paths.filter(p=>p.pts.length>=2);vectorCleanup(L);
+}
+function vectorCross(a,b,c,d){const r=vectorSub(b,a),s=vectorSub(d,c),den=r[0]*s[1]-r[1]*s[0];if(Math.abs(den)<1e-8)return null;const q=vectorSub(c,a),t=(q[0]*s[1]-q[1]*s[0])/den,u=(q[0]*r[1]-q[1]*r[0])/den;return t>=-1e-7&&t<=1+1e-7&&u>=-1e-7&&u<=1+1e-7?[clamp(t,0,1),clamp(u,0,1)]:null;}
+function vectorWeldCrossings(L){
+  // Find intersections on adaptively sampled cubic segments; insert with De Casteljau.
+  const P=vectorPathPoints(L),segments=[];
+  for(const p of L.paths)for(let i=0;i<p.pts.length-(p.closed?0:1);i++)if(!S.selPts.size||S.selPts.has(p.pts[i])||S.selPts.has(p.pts[(i+1)%p.pts.length]))segments.push({p,i,q:vectorCubic(L,p,i,P,0)});
+  if(segments.length>400)throw Error('Select fewer than 400 segments to weld crossings');
+  const events=[];
+  for(let a=0;a<segments.length;a++)for(let b=a+1;b<segments.length;b++){
+    const A=segments[a],B=segments[b];if(A.p===B.p&&(Math.abs(A.i-B.i)<=1||(A.p.closed&&Math.abs(A.i-B.i)===A.p.pts.length-1)))continue;
+    for(let i=0;i<16;i++)for(let j=0;j<16;j++){
+      const x=vectorCross(vectorBezier(A.q,i/16),vectorBezier(A.q,(i+1)/16),vectorBezier(B.q,j/16),vectorBezier(B.q,(j+1)/16));
+      if(x){const ta=(i+x[0])/16,tb=(j+x[1])/16;if(ta<1e-5||ta>1-1e-5||tb<1e-5||tb>1-1e-5||events.some(e=>e.A===A&&e.B===B&&Math.abs(e.ta-ta)<1e-4&&Math.abs(e.tb-tb)<1e-4))continue;events.push({A,ta,B,tb});if(events.length>300)throw Error('Too many crossings; select a smaller area');}
+    }
+  }
+  const insertions=new Map();for(const e of events)for(const [s,t,k]of [[e.A,e.ta,'a'],[e.B,e.tb,'b']]){if(!insertions.has(s))insertions.set(s,[]);insertions.get(s).push({t,e,k});}
+  for(const s of [...insertions.keys()].sort((a,b)=>b.i-a.i)){let upper=1,previous=-1,last=null;for(const a of insertions.get(s).sort((a,b)=>b.t-a.t)){if(Math.abs(a.t-previous)<1e-4){a.e[a.k]=last;continue;}last=a.e[a.k]=vectorInsert(L,s.p,s.i,a.t/upper);upper=a.t;previous=a.t;}}
+  const aliases=new Map(),root=id=>{while(aliases.has(id))id=aliases.get(id);return id;};
+  for(const e of events){const a=root(e.a),b=root(e.b);if(a!==b&&L.pts[a]&&L.pts[b]){vectorWeld(L,b,a);aliases.set(b,a);}}return events.length;
+}
+function vectorSimplify(L,amount=VEC.simplify){
+  const eps=Math.max(0.01,(100-clamp(amount,0,100))*0.12),counts={};for(const p of L.paths)for(const id of p.pts)counts[id]=(counts[id]||0)+1;
+  for(const p of L.paths){if(p.pts.length<4)continue;
+    const raw=p.pts.map(id=>[L.pts[id].x,L.pts[id].y,id]),run=p.closed?raw.concat([raw[0]]):raw,kept=new Set(rdp(run,eps).map(a=>a[2]));
+    p.pts=p.pts.filter(id=>kept.has(id)||counts[id]>1||(S.selPts.size&&!S.selPts.has(id)));
+    if(p.closed&&p.pts.length<3)p.pts=raw.slice(0,3).map(p=>p[2]);
+    for(const id of p.pts){delete L.pts[id].hin;delete L.pts[id].hout;}
+  }vectorCleanup(L);
+}
+function vectorProfileSampler(L,path,f){
+  const profile=L.paths.find(p=>p.id===path.profile);if(!profile||profile===path||profile.closed||profile.pts.length<2)return 1;
+  const samples=vectorSamples(L,profile,vectorPathPoints(L,f),f),xs=samples.map(a=>a.p[0]),ys=samples.map(a=>a.p[1]);
+  const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys),repeats=clamp(val(L,'curve:'+path.id+':repeats',f),1,64),off=val(L,'curve:'+path.id+':offset',f);
+  if(x1-x0<1e-9||y1-y0<1e-9)return ()=>1;
+  return u=>{let t=u*repeats+off;t=t===repeats?1:((t%1)+1)%1;const x=lerp(x0,x1,t);
+  for(let i=1;i<samples.length;i++){const a=samples[i-1].p,b=samples[i].p;if(x>=Math.min(a[0],b[0])&&x<=Math.max(a[0],b[0]))return 0.05+1.95*(lerp(a[1],b[1],(x-a[0])/(b[0]-a[0]||1))-y0)/(y1-y0||1);}
+  return 1;};
+}
+function vectorProfileWidth(L,path,u,f){const sample=vectorProfileSampler(L,path,f);return typeof sample==='function'?sample(u):1;}
+function vectorStrokePieces(L,path,P,f=S.frame,lc=null){
+  const s=vectorSamples(L,path,P,f,lc),start=clamp(val(L,'curve:'+path.id+':start',f),0,1),end=clamp(val(L,'curve:'+path.id+':end',f),0,1),out=[],profile=vectorProfileSampler(L,path,f);
+  for(let j=1;j<s.length;j++){
+    let a=s[j-1],b=s[j];if(end<=start||b.u<=start||a.u>=end)continue;
+    const i=b.i,id=path.pts[i],next=path.pts[(i+1)%path.pts.length];if(val(L,'curve:'+path.id+':hide_'+id,f))continue;
+    const low=Math.max(a.u,start),high=Math.min(b.u,end),span=b.u-a.u||1;
+    const aa=mixVal(a.p,b.p,(low-a.u)/span),bb=mixVal(a.p,b.p,(high-a.u)/span),t=(a.i===i?a.t:0)+(b.t-(a.i===i?a.t:0))*((low+high)/2-a.u)/span;
+    const attr=k=>mixVal(val(L,'pv:'+id+':'+k,f),val(L,'pv:'+next+':'+k,f),t);
+    out.push({a:aa,b:bb,width:clamp(attr('width'),0,100)*(typeof profile==='function'?profile((low+high)/2):1),alpha:clamp(attr('alpha'),0,1),color:attr('color'),strength:clamp(attr('strength'),0,1)});
+  }return out;
+}
+function drawVectorContent(ctx,L,R,lc){
+  const f=R.f,P=(lc.P=deformedPts(L,f,lc));M.set(ctx,lc.full);ctx.lineJoin='round';ctx.lineCap='round';
+  for(const sh of L.shapes){
+    const st=shapeStyle(L,sh,f),paths=sh.paths.map(id=>L.paths.find(p=>p.id===id)).filter(Boolean);
+    const trace=()=>{ctx.beginPath();for(const p of paths)tracePath(ctx,L,p,P,f,lc);};
+    if(st.fillOn){trace();ctx.fillStyle=st.fill;ctx.fill('evenodd');
+      const colored=[...new Set(paths.flatMap(p=>p.pts))].filter(id=>val(L,'pv:'+id+':strength',f)>0);
+      if(colored.length){ctx.save();trace();ctx.clip('evenodd');for(const id of colored){const q=P[id],r=L.pts[id].colorRadius||VEC.colorRadius,col=val(L,'pv:'+id+':color',f),s=clamp(val(L,'pv:'+id+':strength',f),0,1),g=ctx.createRadialGradient(...q,0,...q,r);g.addColorStop(0,col);g.addColorStop(1,col+'00');ctx.save();ctx.globalAlpha*=s;ctx.fillStyle=g;ctx.fillRect(q[0]-r,q[1]-r,2*r,2*r);ctx.restore();}ctx.restore();}
+    }
+    if(st.strokeOn&&st.width>0)for(const p of paths){
+      const special=p.profile||['start','end'].some(k=>L.ch['curve:'+p.id+':'+k])||p.start||p.end!==undefined&&p.end!==1||Object.keys(p).some(k=>k.startsWith('hide_')&&p[k])||Object.keys(L.ch).some(k=>k.startsWith('curve:'+p.id+':hide_'))||p.pts.some(id=>['width','alpha','strength'].some(k=>(L.pts[id][k]!==undefined&&L.pts[id][k]!==({width:1,alpha:1,strength:0}[k]))||L.ch['pv:'+id+':'+k]));
+      if(!special){ctx.beginPath();tracePath(ctx,L,p,P,f,lc);ctx.lineWidth=st.width;ctx.strokeStyle=st.stroke;ctx.stroke();continue;}
+      const pieces=vectorStrokePieces(L,p,P,f,lc);ctx.save();
+      // A clipped collection of short rounded strokes supports variable width, color and exposure.
+      const opacity=ctx.globalAlpha;for(const v of pieces){if(v.width<=0||v.alpha<=0)continue;ctx.globalAlpha=opacity*v.alpha;ctx.lineWidth=Math.min(10000,st.width*v.width);ctx.strokeStyle=v.strength?mixColor(st.stroke,v.color,v.strength):st.stroke;ctx.beginPath();ctx.moveTo(...v.a);ctx.lineTo(...v.b);ctx.stroke();}ctx.restore();
+    }
+  }
+}
+const vectorOldDrawContent=drawContent;
+drawContent=function(ctx,L,R,lc){if(L.type==='vector')drawVectorContent(ctx,L,R,lc);else vectorOldDrawContent(ctx,L,R,lc);};
+
+// ---------- selection, transforms and editable Bézier handles ----------
+function vectorInside(p,polygon){let inside=false;for(let i=0,j=polygon.length-1;i<polygon.length;j=i++){const a=polygon[i],b=polygon[j];if((a[1]>p[1])!==(b[1]>p[1])&&p[0]<(b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0])inside=!inside;}return inside;}
+function vectorAutoHandle(L,id,side,f=0){
+  const p=L.paths.find(p=>p.pts.includes(id));if(!p)return [0,0];const i=p.pts.indexOf(id),P=vectorPathPoints(L,f);
+  if(side==='hout'&&(p.closed||i<p.pts.length-1)){const q=vectorCubic(L,p,i,P,f);return vectorSub(q[1],q[0]);}
+  if(side==='hin'&&(p.closed||i>0)){const q=vectorCubic(L,p,(i-1+p.pts.length)%p.pts.length,P,f);return vectorSub(q[2],q[3]);}
+  return [0,0];
+}
+function vectorHandles(L){
+  const lc=lcOf(L),out=[];
+  for(const id of vectorIDs(L))for(const side of ['hin','hout']){
+    const manual=L.pts[id][side]||L.ch['pv:'+id+':'+side],v=manual?val(L,'pv:'+id+':'+side,S.frame):vectorAutoHandle(L,id,side,S.frame),q=vectorOffset(L,id,v,lc),p=lc.P[id];
+    out.push({id,side,p:M.ap(lc.full,p[0]+q[0],p[1]+q[1]),origin:M.ap(lc.full,...p)});
+  }return out;
+}
+const vectorOldOverlays=drawOverlays;
+drawOverlays=function(ctx){vectorOldOverlays(ctx);const L=selLayer();
+  if(L?.type==='vector'&&VEC.handles&&['points','pointtf','pen','curvature'].includes(S.tool)){
+    ctx.setTransform(1,0,0,1,0,0);ctx.strokeStyle='#75dccb';ctx.fillStyle='#193e3a';ctx.lineWidth=Stage.dpr;
+    for(const h of vectorHandles(L)){ctx.beginPath();ctx.moveTo(...h.origin);ctx.lineTo(...h.p);ctx.stroke();ctx.beginPath();ctx.arc(...h.p,3.5*Stage.dpr,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  }
+  if(Stage.vectorLasso){ctx.strokeStyle='#a9d5ff';ctx.lineWidth=Stage.dpr;ctx.beginPath();Stage.vectorLasso.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.stroke();}
+  if(L?.type==='vector'&&['magnet','eraser','blob','noise'].includes(S.tool)){ctx.setTransform(1,0,0,1,0,0);ctx.strokeStyle='#ffffff80';ctx.lineWidth=Stage.dpr;ctx.beginPath();ctx.arc(...Stage.mouse,VEC.radius*S.view.zoom*Stage.dpr,0,Math.PI*2);ctx.stroke();}
+};
+const vectorOverlaysBeforeMoho=drawOverlays;
+drawOverlays=function(ctx){vectorOverlaysBeforeMoho(ctx);const L=selLayer(),dpr=Stage.dpr||1;if(S.outputOnly||L?.type!=='vector')return;ctx.setTransform(1,0,0,1,0,0);
+  if(S.tool==='pen'){const d=Stage.drag,skip=d?.mode==='penpt'?new Set([d.id]):new Set(),t=(!d||d.mode==='penpt'&&(d.moved||!d.clickOnly))&&(!d||VEC.autoWeld)?vectorPenTarget(L,...Stage.mouse,Stage.mods?.alt,skip):null;
+    if(t){ctx.lineWidth=2*dpr;ctx.strokeStyle=t.kind==='point'?'#3ddc6b':'#ff4b4b';ctx.beginPath();ctx.arc(...t.at,(t.kind==='point'?7:5)*dpr,0,Math.PI*2);ctx.stroke();}}
+  if(S.tool==='linewidth'&&VEC.lwMagnet){ctx.strokeStyle='#ffffff80';ctx.lineWidth=dpr;ctx.setLineDash([4*dpr,3*dpr]);ctx.beginPath();ctx.arc(...Stage.mouse,VEC.lwRadius*S.view.zoom*dpr,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);}
+};
+const vectorPointTF={...TOOLS.points};
+defTool('pointtf',{...vectorPointTF,icon:svgI('<path d="M12 2v20M2 12h20m-7-7-3-3-3 3m6 14-3 3-3-3M5 9l-3 3 3 3m14-6 3 3-3 3"/>'),name:'Transform points',key:'G',hint:'Move points · bounding handles scale / rotate · optional editable Bézier handles',
+  down(e,sx,sy){
+    const L=selLayer();if(!L||L.type!=='vector')return;
+    const h=VEC.handles&&vectorHandles(L).find(h=>Math.hypot(h.p[0]-sx,h.p[1]-sy)<7*Stage.dpr);
+    if(h){beginEdit('Bézier handle');for(const side of ['hin','hout'])if(!L.pts[h.id][side]&&!L.ch['pv:'+h.id+':'+side])L.pts[h.id][side]=vectorAutoHandle(L,h.id,side,0);
+      const a=vectorOffset(L,h.id,[1,0],lcOf(L)),b=vectorOffset(L,h.id,[0,1],lcOf(L)),deform=M.inv([a[0],a[1],b[0],b[1],0,0]);
+      startDrag(e,{mode:'handle',L,h,inv:M.inv(lcOf(L).full),deform,origin:lcOf(L).P[h.id],opposite:val(L,'pv:'+h.id+':'+(h.side==='hin'?'hout':'hin'),S.frame)});return;
+    }vectorPointTF.down.call(this,e,sx,sy);
+    const d=Stage.drag;if(d?.start){d.oldHandles={};for(const id in d.start)for(const side of ['hin','hout'])if(L.pts[id][side]||L.ch['pv:'+id+':'+side])d.oldHandles[id+':'+side]=val(L,'pv:'+id+':'+side,S.frame);}
+  },
+  move(e,sx,sy){const d=Stage.drag;if(!d)return;
+    if(d.mode==='handle'){const p=M.ap(d.inv,sx,sy),v=M.apv(d.deform,p[0]-d.origin[0],p[1]-d.origin[1]);setVal(d.L,'pv:'+d.h.id+':'+d.h.side,v);
+      if(VEC.fixed&&!e.altKey){const len=Math.hypot(...d.opposite),n=Math.hypot(...v)||1;setVal(d.L,'pv:'+d.h.id+':'+(d.h.side==='hin'?'hout':'hin'),[-v[0]*len/n,-v[1]*len/n]);}requestDraw();return;}
+    vectorPointTF.move.call(this,e,sx,sy);
+    if(d.mode==='rot'||d.mode==='scale'){const a=d.mode==='rot'?Math.atan2(sy-d.cs[1],sx-d.cs[0])-Math.atan2(d.sy-d.cs[1],d.sx-d.cs[0]):0,k=d.mode==='scale'?Math.hypot(sx-d.cs[0],sy-d.cs[1])/(Math.hypot(d.sx-d.cs[0],d.sy-d.cs[1])||1):1;
+      for(const [key,v]of Object.entries(d.oldHandles||{}))setVal(d.L,'pv:'+key,M.apv(M.chain(M.r(a),M.s(k)),...v));}
+  },
+  up(){const d=Stage.drag;if(d?.L&&d.mode==='move'&&VEC.autoWeld&&S.mode==='setup'){
+      for(const id of [...S.selPts]){const p=d.L.pts[id];if(!p)continue;const other=Object.keys(d.L.pts).find(k=>!S.selPts.has(k)&&Math.hypot(p.x-d.L.pts[k].x,p.y-d.L.pts[k].y)<7/(S.view.zoom||1));if(other)vectorWeld(d.L,id,other);}
+    }vectorPointTF.up.call(this);},
+});
+// ---------- Select Points (Moho-style) ----------
+// Selecting changes S.selPts only: it never edits geometry or creates keys.
+// Click priority is point, then curve, then filled shape. No modifier replaces the selection,
+// Shift adds, Alt removes, and Ctrl/Cmd swaps box and lasso for the current drag.
+function vectorSelectionOp(e){return e.altKey?'remove':e.shiftKey?'add':'replace';}
+function vectorCombineSelection(base,ids,op){const s=op==='replace'?new Set():new Set(base);for(const id of ids)op==='remove'?s.delete(id):s.add(id);return s;}
+function vectorPathPointIDs(L,pathIDs){const ids=new Set();for(const pid of pathIDs){const p=L.paths.find(q=>q.id===pid);if(p)for(const id of p.pts)if(L.pts[id])ids.add(id);}return [...ids];}
+function vectorHitSelectable(L,sx,sy){
+  const id=hitPoint(L,sx,sy);if(id)return {kind:'point',ids:[id]};
+  const seg=hitSegment(L,sx,sy);if(seg)return {kind:'curve',path:seg.path,ids:vectorPathPointIDs(L,[seg.path.id])};
+  const hit=hitLayerEntry(lcOf(L),sx,sy);if(hit?.shape)return {kind:'shape',shape:hit.shape,ids:vectorPathPointIDs(L,hit.shape.paths)};
+  return null;
+}
+function vectorPointsInArea(L,test){const lc=lcOf(L),ids=[];for(const [id,p]of Object.entries(lc.P||{}))if(L.pts[id]&&test(M.ap(lc.full,...p)))ids.push(id);return ids;}
+TOOLS.points.name='Select points';
+TOOLS.points.hint='Click a point, curve or fill · drag a box (Ctrl/Cmd: lasso) · Shift adds · Alt removes · click empty space to clear';
+TOOLS.points.down=function(e,sx,sy){const L=selLayer();if(!L||L.type!=='vector')return toast('Activate a vector drawing in Layers to select its points');
+  const lasso=VEC.lasso!==!!(e.ctrlKey||e.metaKey);
+  startDrag(e,{mode:'select',L,op:vectorSelectionOp(e),lasso,base:new Set(vectorIDs(L)),hit:vectorHitSelectable(L,sx,sy),area:false,downX:sx,downY:sy});};
+TOOLS.points.move=function(e,sx,sy){const d=Stage.drag;if(!d||d.mode!=='select')return;
+  if(!d.area){if(Math.hypot(sx-d.downX,sy-d.downY)<3*(Stage.dpr||1))return;d.area=true;if(d.lasso)Stage.vectorLasso=[[d.downX,d.downY]];}
+  let ids;
+  if(d.lasso){Stage.vectorLasso.push([sx,sy]);ids=Stage.vectorLasso.length>2?vectorPointsInArea(d.L,p=>vectorInside(p,Stage.vectorLasso)):[];}
+  else{const r=[Math.min(d.downX,sx),Math.min(d.downY,sy),Math.max(d.downX,sx),Math.max(d.downY,sy)];Stage.preview={type:'marquee',r};ids=vectorPointsInArea(d.L,p=>p[0]>=r[0]&&p[0]<=r[2]&&p[1]>=r[1]&&p[1]<=r[3]);}
+  S.selPts=vectorCombineSelection(d.base,ids,d.op);requestDraw();};
+TOOLS.points.up=function(){const d=Stage.drag;
+  if(d?.mode==='select'&&!d.area){
+    if(d.hit)S.selPts=vectorCombineSelection(d.base,d.hit.ids,d.op);
+    else if(d.op==='replace')S.selPts=new Set();
+  }
+  if(d?.mode==='select'&&d.op==='replace')S.selShape=null;
+  Stage.vectorLasso=null;Stage.preview=null;refreshAll();};
+
+// Curvature is a point property with its own timeline channels (Moho: drag left/right).
+TOOLS.curvature.hint='Select points, then drag left/right · with fewer than two selected, drags the nearest point · Ctrl/Cmd selects points · Alt keeps peaked points peaked · double-click toggles peak/smooth';
+TOOLS.curvature.down=function(e,sx,sy){const L=selLayer();if(!L||L.type!=='vector')return;
+  let ids=vectorIDs(L);
+  if(ids.length<2){const id=hitPoint(L,sx,sy,16);if(!id)return;ids=[id];S.selPts=new Set([id]);}
+  beginEdit('Curvature');const start={},peaked={};
+  for(const id of ids){start[id]=val(L,'pv:'+id+':c',S.frame);if(e.altKey&&Math.abs(start[id])<0.05){const fr=vectorPeakFrame(L,id);if(fr)peaked[id]=fr;}}
+  startDrag(e,{mode:'curvature',L,start,peaked});refreshAll();};
+TOOLS.curvature.move=function(e,sx,sy){const d=Stage.drag;if(d?.mode!=='curvature')return;const amount=(sx-d.sx)/(80*(Stage.dpr||1));
+  for(const [id,c]of Object.entries(d.start)){if(d.peaked[id]){vectorBendPeak(d.L,id,d.peaked[id],amount);continue;}setVal(d.L,'pv:'+id+':c',clamp(c+amount,-3,3));vectorClearHandles(d.L,id);}
+  requestDraw();};
+TOOLS.curvature.up=function(){commitEdit();refreshAll();};
+// Alt on a peaked point bows both neighbouring segments while the point itself stays a corner.
+function vectorPeakFrame(L,id){const p=L.paths.find(p=>p.pts.includes(id));if(!p)return null;const n=p.pts.length,i=p.pts.indexOf(id),P=vectorPathPoints(L,S.frame);
+  const near=j=>{const k=p.closed?(j+n)%n:j;return k>=0&&k<n&&k!==i?P[p.pts[k]]:null;};return {o:P[id],a:near(i-1),b:near(i+1)};}
+function vectorBendPeak(L,id,fr,amount){const theta=clamp(amount,-1.3,1.3),unit=v=>{const l=Math.hypot(...v)||1;return [v[0]/l,v[1]/l];};
+  const da=fr.a&&unit(vectorSub(fr.a,fr.o)),db=fr.b&&unit(vectorSub(fr.b,fr.o)),bis=da&&db?unit([da[0]+db[0],da[1]+db[1]]):null;
+  for(const [side,q,dir]of [['hin',fr.a,da],['hout',fr.b,db]]){if(!q)continue;const len=Math.hypot(...vectorSub(q,fr.o))/3,s=bis&&(dir[0]*bis[1]-dir[1]*bis[0])>0?1:-1,a=s*theta,c=Math.cos(a),n=Math.sin(a);
+    setVal(L,'pv:'+id+':'+side,[(dir[0]*c-dir[1]*n)*len,(dir[0]*n+dir[1]*c)*len]);}
+  setVal(L,'pv:'+id+':c',0);}
+TOOLS.curvature.dbl=function(e,sx,sy){const L=selLayer(),id=L&&hitPoint(L,sx,sy);if(id)vectorAction('Toggle corner',()=>{setVal(L,'pv:'+id+':c',Math.abs(val(L,'pv:'+id+':c',S.frame))<0.05?1:0);vectorClearHandles(L,id);});};
+function vectorClearHandles(L,id){for(const side of ['hin','hout'])if(L.pts[id][side]||L.ch['pv:'+id+':'+side]){const v=vectorAutoCurvatureHandle(L,id,side,S.frame);setVal(L,'pv:'+id+':'+side,v);}}
+function vectorAutoCurvatureHandle(L,id,side,f){const p=L.paths.find(p=>p.pts.includes(id));if(!p)return [0,0];const n=p.pts.length,i=p.pts.indexOf(id),ix=j=>p.closed?(j+n)%n:clamp(j,0,n-1),P=vectorPathPoints(L,f),a=P[p.pts[ix(i-1)]],b=P[p.pts[ix(i+1)]],k=val(L,'pv:'+id+':c',f)/6;return [(b[0]-a[0])*k*(side==='hin'?-1:1),(b[1]-a[1])*k*(side==='hin'?-1:1)];}
+function vectorCurvature(value){return vectorAction('Set curvature',L=>{for(const id of vectorIDs(L)){setVal(L,'pv:'+id+':c',typeof value==='function'?value(L,id):value);vectorClearHandles(L,id);}});}
+
+// ---------- path creation ----------
+const vectorOldFinishPen=finishPen;
+finishPen=function(closeIt){const P=Stage.pen,L=P&&findLayer(P.layer),pa=L?.paths.find(p=>p.id===P.path);if(!pa)return vectorOldFinishPen(closeIt);
+  Stage.pen=null;edit(closeIt?'Close curve':'Finish curve',()=>{if(pa.pts.length<2){L.paths=L.paths.filter(p=>p!==pa);vectorCleanup(L);return;}if(closeIt)pa.closed=true;
+    if(!L.shapes.some(s=>s.paths.includes(pa.id))&&(S.newStyle.fillOn&&pa.closed||S.newStyle.strokeOn))S.selShape=addShape(L,[pa.id],S.newStyle,{fillOn:!!(pa.closed&&S.newStyle.fillOn)}).id;});};
+// ---------- Add Point (Moho-style construction) ----------
+// Empty space starts a curve, an endpoint extends it, a curve segment receives an inserted point.
+// Click-to-add: each click places a point and the dashed preview follows the cursor; click the last point
+// (or Enter/Esc) to finish, the first point to close. Click-and-drag positions the new endpoint and welds on release.
+// Alt avoids picking/welding existing geometry, Ctrl/Cmd flips Sharp corners, Shift constrains to an axis.
+function vectorPickRadius(){return 8*(Stage.dpr||1);}
+function vectorPenTarget(L,sx,sy,alt,skip=new Set()){
+  if(!L||L.type!=='vector'||alt)return null;const lc=lcOf(L);let best=null,dist=vectorPickRadius();
+  for(const [id,p]of Object.entries(lc.P||{})){if(skip.has(id)||!L.pts[id])continue;const q=M.ap(lc.full,...p),d=Math.hypot(q[0]-sx,q[1]-sy);if(d<dist){dist=d;best={kind:'point',id,at:q};}}
+  if(best)return best;
+  const seg=hitSegment(L,sx,sy);if(!seg)return null;const a=seg.path.pts[seg.index],b=seg.path.pts[(seg.index+1)%seg.path.pts.length];
+  if(skip.has(a)||skip.has(b))return null;return {kind:'curve',seg,at:[sx,sy]};
+}
+function vectorPenConstrain(e,L,prev,loc){if(!e.shiftKey||!prev||!L.pts[prev])return loc;const p=L.pts[prev],dx=loc[0]-p.x,dy=loc[1]-p.y;return Math.abs(dx)>=Math.abs(dy)?[loc[0],p.y]:[p.x,loc[1]];}
+function vectorPenInsert(L,seg){return vectorInsert(L,seg.path,seg.index,clamp(seg.t,0.02,0.98));}
+TOOLS.pen.name='Add point';
+TOOLS.pen.hint='Click empty space to start a curve, then click or drag each new point · click an endpoint to extend · click a curve to insert · click the start to close, the last point or Enter to finish · Alt: no welding · Ctrl/Cmd: flip Sharp corners · Shift: constrain';
+TOOLS.pen.down=function(e,sx,sy){
+  const L=ensureVectorLayer();if(L.lock)return toast('Layer is locked');beginEdit('Add point');
+  const loc=toLocal(L,sx,sy),c=(VEC.sharp!==!!(e.ctrlKey||e.metaKey))?0:1,inv=M.inv(lcOf(L).full),t=vectorPenTarget(L,sx,sy,e.altKey);
+  let path=Stage.pen?.layer===L.id?L.paths.find(p=>p.id===Stage.pen.path):null;if(Stage.pen&&!path)Stage.pen=null;
+  if(path){
+    const last=path.pts.at(-1);
+    if(t?.kind==='point'&&t.id===path.pts[0]&&path.pts.length>2){commitEdit();return finishPen(true);}
+    if(t?.kind==='point'&&t.id===last){commitEdit();return finishPen(false);}
+    if(VEC.autoWeld&&t?.kind==='point'){if(path.pts.includes(t.id))return commitEdit();path.pts.push(t.id);S.selPts=new Set([t.id]);commitEdit();return finishPen(false);}
+    if(VEC.autoWeld&&t?.kind==='curve'){const id=vectorPenInsert(L,t.seg);path.pts.push(id);S.selPts=new Set([id]);commitEdit();return finishPen(false);}
+    const id=addPoint(L,...vectorPenConstrain(e,L,last,loc),c);path.pts.push(id);S.selPts=new Set([id]);
+    startDrag(e,{mode:'penpt',L,id,path,inv,prev:last});return requestDraw();
+  }
+  if(t?.kind==='point'){
+    const open=L.paths.find(p=>!p.closed&&(p.pts[0]===t.id||p.pts.at(-1)===t.id));
+    if(open){if(open.pts[0]===t.id)open.pts.reverse();path=open;}else{path={id:uid('a'),pts:[t.id],closed:false};L.paths.push(path);}
+    Stage.pen={layer:L.id,path:path.id};const id=addPoint(L,...loc,c);path.pts.push(id);S.selPts=new Set([id]);
+    startDrag(e,{mode:'penpt',L,id,path,inv,prev:t.id,clickOnly:true});return requestDraw();
+  }
+  if(t?.kind==='curve'){const id=vectorPenInsert(L,t.seg);S.selPts=new Set([id]);startDrag(e,{mode:'penmove',L,id,inv,start:[L.pts[id].x,L.pts[id].y]});return requestDraw();}
+  path={id:uid('a'),pts:[],closed:false};L.paths.push(path);Stage.pen={layer:L.id,path:path.id};
+  const a=addPoint(L,...loc,c),b=addPoint(L,...loc,c);path.pts.push(a,b);S.selPts=new Set([b]);
+  startDrag(e,{mode:'penpt',L,id:b,path,inv,prev:a,clickOnly:true});requestDraw();
+};
+TOOLS.pen.move=function(e,sx,sy){const d=Stage.drag;if(!d)return requestDraw();
+  if(d.mode==='penpt'){const p=vectorPenConstrain(e,d.L,d.prev,M.ap(d.inv,sx,sy));d.L.pts[d.id].x=round(p[0]);d.L.pts[d.id].y=round(p[1]);}
+  else if(d.mode==='penmove'){const v=cameraDragDelta(d.inv,sx,sy,d.sx,d.sy);d.L.pts[d.id].x=round(d.start[0]+v[0]);d.L.pts[d.id].y=round(d.start[1]+v[1]);}
+  requestDraw();};
+TOOLS.pen.up=function(e){const d=Stage.drag;if(!d)return;
+  if(d.mode==='penmove')return commitEdit();
+  if(d.mode!=='penpt')return commitEdit();
+  const {L,id,path}=d;
+  if(!d.moved){if(d.clickOnly){path.pts.pop();delete L.pts[id];S.selPts=new Set([path.pts.at(-1)]);}return commitEdit();}
+  const t=VEC.autoWeld?vectorPenTarget(L,...Stage.mouse,e?.altKey,new Set([id])):null;
+  if(t?.kind==='point'){
+    if(t.id===path.pts[0]&&path.pts.length>2){path.pts.pop();delete L.pts[id];commitEdit();return finishPen(true);}
+    if(t.id===d.prev){path.pts.pop();delete L.pts[id];return commitEdit();}
+    vectorWeld(L,id,t.id);S.selPts=new Set([t.id]);commitEdit();return finishPen(false);
+  }
+  if(t?.kind==='curve'){const k=vectorPenInsert(L,t.seg);vectorWeld(L,id,k);S.selPts=new Set([k]);commitEdit();return finishPen(false);}
+  commitEdit();
+};
+function vectorAddPath(L,points,closed,style=S.newStyle){const ids=points.map(p=>addPoint(L,p[0],p[1],p[2]??0)),path={id:uid('a'),pts:ids,closed};L.paths.push(path);
+  if(style.fillOn&&closed||style.strokeOn)S.selShape=addShape(L,[path.id],style,{fillOn:!!(closed&&style.fillOn)}).id;S.selPts=new Set(ids);return path;}
+function vectorCreationCommit(label,fn){if(H.pending){fn();return commitEdit();}return edit(label,fn);}
+function vectorPrimitive(kind,x,y,w,h,cols=4,rows=4){
+  const result=[],cx=x+w/2,cy=y+h/2;
+  if(kind==='grid'){for(let i=0;i<=cols;i++)result.push({points:[[x+w*i/cols,y],[x+w*i/cols,y+h]],closed:false});for(let j=0;j<=rows;j++)result.push({points:[[x,y+h*j/rows],[x+w,y+h*j/rows]],closed:false});return result;}
+  let p=[],closed=true;
+  if(kind==='rectangle')p=[[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
+  if(kind==='ellipse')for(let i=0;i<8;i++){const a=i*Math.PI/4;p.push([cx+Math.cos(a)*w/2,cy+Math.sin(a)*h/2,1.105]);}
+  if(kind==='triangle')p=[[cx,y],[x+w,y+h],[x,y+h]];
+  if(kind==='star')for(let i=0;i<10;i++){const a=i*Math.PI/5-Math.PI/2,r=i%2?0.43:1;p.push([cx+Math.cos(a)*w*r/2,cy+Math.sin(a)*h*r/2]);}
+  if(kind==='arrow')p=[[x,cy-h*.15],[x+w*.6,cy-h*.15],[x+w*.6,y],[x+w,cy],[x+w*.6,y+h],[x+w*.6,cy+h*.15],[x,cy+h*.15]];
+  if(kind==='spiral'){closed=false;for(let i=0;i<=48;i++){const t=i/48,a=t*Math.PI*6;p.push([cx+Math.cos(a)*w*t/2,cy+Math.sin(a)*h*t/2,1]);}}
+  return [{points:p,closed}];
+}
+defTool('drawshape',{icon:svgI('<rect x="3" y="10" width="11" height="11"/><circle cx="16" cy="7" r="5"/>'),name:'Draw shape',key:'',cursor:'crosshair',hint:'Drag a primitive · Shift constrains proportions · Alt draws from center · Grid uses horizontal / vertical subdivisions',
+  down(e,sx,sy){beginEdit('Draw '+VEC.shape);const L=ensureVectorLayer();startDrag(e,{L,a:toLocal(L,sx,sy),inv:M.inv(lcOf(L).full)});Stage.preview={type:'marquee',r:[sx,sy,sx,sy]};},
+  move(e,sx,sy){if(Stage.drag)Stage.preview={type:'marquee',r:[Stage.drag.sx,Stage.drag.sy,sx,sy]};requestDraw();},
+  up(e){const d=Stage.drag;if(!d?.moved){Stage.preview=null;cancelEdit();return;}const b=M.ap(d.inv,...Stage.mouse);let [x,y]=d.a,w=b[0]-x,h=b[1]-y;
+    if(e.shiftKey){const n=Math.max(Math.abs(w),Math.abs(h));w=Math.sign(w||1)*n;h=Math.sign(h||1)*n;}if(e.altKey){x-=w;y-=h;w*=2;h*=2;}
+    vectorCreationCommit('Draw '+VEC.shape,()=>{for(const p of vectorPrimitive(VEC.shape,x,y,w,h,VEC.horizontal,VEC.vertical))vectorAddPath(d.L,p.points,p.closed);});Stage.preview=null;},
+});
+TOOLS.freehand.down=function(e,sx,sy){beginEdit('Freehand curve');const L=ensureVectorLayer();startDrag(e,{L,samples:[[sx,sy,e.pointerType==='pen'?clamp(e.pressure||0.01,0.01,1):1]]});Stage.preview={type:'poly',pts:[[sx,sy]]};};
+TOOLS.freehand.move=function(e,sx,sy){const d=Stage.drag;if(!d)return;const last=d.samples.at(-1);if(Math.hypot(sx-last[0],sy-last[1])>2*Stage.dpr&&d.samples.length<10000){d.samples.push([sx,sy,e.pointerType==='pen'?clamp(e.pressure||0.01,0.01,1):1]);Stage.preview.pts.push([sx,sy]);}requestDraw();};
+TOOLS.freehand.up=function(){const d=Stage.drag;Stage.preview=null;if(!d||d.samples.length<2){cancelEdit();return;}
+  const inv=M.inv(lcOf(d.L).full);let raw=d.samples.map(p=>p.slice());for(let n=0;n<VEC.smoothing;n++)raw=raw.map((p,i)=>!i||i===raw.length-1?p:[(raw[i-1][0]+2*p[0]+raw[i+1][0])/4,(raw[i-1][1]+2*p[1]+raw[i+1][1])/4,p[2]]);
+  const samples=rdp(raw,Math.max(.1,VEC.reduction)*Stage.dpr),near=Math.hypot(raw[0][0]-raw.at(-1)[0],raw[0][1]-raw.at(-1)[1])<14*Stage.dpr,closed=VEC.weldEnds&&near&&samples.length>3;
+  if(closed)samples.pop();vectorCreationCommit('Freehand curve',()=>{
+    const p=vectorAddPath(d.L,samples.map(a=>[...M.ap(inv,a[0],a[1]),1]),closed);
+    p.pts.forEach((id,i)=>{const pressure=samples[i][2],t=i/(p.pts.length-1||1),taper=VEC.taper?Math.min(1,t/VEC.taper,(1-t)/VEC.taper):1;
+      d.L.pts[id].width=Math.max(.01,(VEC.pressureWidth?pressure:1)*taper);d.L.pts[id].alpha=VEC.pressureAlpha?pressure:1;
+      if(VEC.colorDrift){d.L.pts[id].color=mixColor(S.newStyle.stroke,S.newStyle.fill,t);d.L.pts[id].strength=VEC.colorDrift;}});
+    if(VEC.weldEnds&&!closed)for(const index of [0,p.pts.length-1]){const id=p.pts[index],a=d.L.pts[id],other=Object.keys(d.L.pts).find(k=>!p.pts.includes(k)&&Math.hypot(a.x-d.L.pts[k].x,a.y-d.L.pts[k].y)<14/(S.view.zoom||1));if(other)vectorWeld(d.L,id,other);}
+    if(VEC.multiFill)vectorMultiStrokeFill(d.L,p);
+  });
+};
+function vectorMultiStrokeFill(L,latest){
+  let state=Stage.multiStroke;if(state?.layer!==L.id||state.doc!==S.doc)state=Stage.multiStroke={layer:L.id,doc:S.doc,paths:[]};
+  state.paths=state.paths.filter(id=>L.paths.some(p=>p.id===id));state.paths.push(latest.id);
+  if(latest.closed){for(const s of L.shapes)if(s.paths.includes(latest.id))s.fillOn=S.newStyle.fillOn;return;}
+  const pool=L.paths.filter(p=>!p.closed&&state.paths.includes(p.id)),start=latest.pts[0],end=latest.pts.at(-1);
+  let remaining=20000;
+  const visit=(at,used,points)=>{if(--remaining<0)return null;if(at===start&&used.length>1)return {used,points};if(used.length>64)return null;
+    for(const p of pool){if(used.includes(p))continue;const direction=p.pts[0]===at?p.pts:p.pts.at(-1)===at?[...p.pts].reverse():null;if(!direction)continue;const result=visit(direction.at(-1),used.concat(p),points.concat(direction.slice(1)));if(result)return result;}return null;};
+  const result=visit(end,[latest],[...latest.pts]);if(!result)return;
+  const ids=result.points.slice(0,-1),used=new Set(result.used.map(p=>p.id));latest.pts=ids;latest.closed=true;
+  L.paths=L.paths.filter(p=>p===latest||!used.has(p.id));for(const sh of L.shapes)sh.paths=sh.paths.filter(id=>!used.has(id));L.shapes=L.shapes.filter(s=>s.paths.length);
+  if(S.newStyle.fillOn||S.newStyle.strokeOn)S.selShape=addShape(L,[latest.id]).id;vectorCleanup(L);state.paths=state.paths.filter(id=>!used.has(id));
+}
+
+// ---------- topology and deformation brushes ----------
+function vectorDeleteEdge(L,path,index){
+  const ids=path.pts,n=ids.length,owner=L.shapes.filter(s=>s.paths.includes(path.id));
+  if(path.closed){path.pts=ids.slice(index+1).concat(ids.slice(0,index+1));path.closed=false;}
+  else {const tail=ids.slice(index+1);path.pts=ids.slice(0,index+1);if(tail.length>1){const p={...clone(path),id:uid('a'),pts:tail};L.paths.push(p);for(const s of owner)s.paths.push(p.id);}}
+  if(path.pts.length<2)L.paths=L.paths.filter(p=>p!==path);vectorCleanup(L);
+}
+function vectorRemoveEdges(L,path,indices){
+  const ids=path.pts,n=ids.length,runs=[],broken=new Set(indices),start=path.closed?((Math.min(...indices)+1)%n):0,count=path.closed?n:n-1;
+  let run=[ids[start]];
+  for(let j=0;j<count;j++){const i=(start+j)%n,next=ids[(i+1)%n];if(broken.has(i)){if(run.length>1)runs.push(run);run=[next];}else run.push(next);}
+  if(run.length>1)runs.push(run);
+  const index=L.paths.indexOf(path),owners=L.shapes.filter(s=>s.paths.includes(path.id)),fragments=runs.map((pts,i)=>({...clone(path),id:i?uid('a'):path.id,pts,closed:false}));
+  L.paths.splice(index,1,...fragments);for(const sh of owners)for(const f of fragments.slice(1))sh.paths.push(f.id);
+  for(const f of fragments.slice(1))for(const [k,v]of Object.entries(L.ch))if(k.startsWith('curve:'+path.id+':'))L.ch[k.replace('curve:'+path.id+':','curve:'+f.id+':')]=clone(v);
+  vectorCleanup(L);
+}
+defTool('reduce',{icon:svgI('<path d="M2 18 6 5l5 11 5-12 6 14M3 21h18"/><circle cx="11" cy="16" r="2"/>'),name:'Point reduction',key:'',cursor:'crosshair',hint:'Click to simplify selected points (or the whole drawing); retention controls allowed geometric error',
+  down(){vectorAction('Reduce points',L=>vectorSimplify(L),true);},move(){},up(){}});
+function vectorBrushStart(e,sx,sy,mode){const L=selLayer();if(!L||L.type!=='vector')return;const center=toLocal(L,sx,sy),start={},falloff={};
+  for(const id of Object.keys(L.pts)){if(S.selPts.size&&!S.selPts.has(id))continue;const p=val(L,'pt:'+id,S.frame),d=Math.hypot(p[0]-center[0],p[1]-center[1]);if(mode==='magnet'||mode==='noise'){if(d>VEC.radius)continue;falloff[id]=(1-d/VEC.radius)**2;}else falloff[id]=1;start[id]=p;}
+  if(!Object.keys(start).length)return;beginEdit(TOOLS[mode].name);startDrag(e,{L,mode,start,falloff,center,inv:M.inv(lcOf(L).full),seed:Math.floor(performance.now())});
+}
+function vectorHash(id,seed){let h=seed|0;for(let i=0;i<id.length;i++)h=Math.imul(h^id.charCodeAt(i),16777619);return ((h>>>0)%65536)/32768-1;}
+function vectorBrushMove(e,sx,sy){const d=Stage.drag;if(!d?.start)return;const delta=cameraDragDelta(d.inv,sx,sy,d.sx,d.sy),pts=Object.values(d.start),xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]),cx=(Math.min(...xs)+Math.max(...xs))/2,cy=(Math.min(...ys)+Math.max(...ys))/2,w=Math.max(1,Math.max(...xs)-Math.min(...xs)),h=Math.max(1,Math.max(...ys)-Math.min(...ys));
+  for(const [id,p]of Object.entries(d.start)){let q=p.slice(),k=d.falloff[id]*VEC.strength;
+    if(d.mode==='magnet')q=[p[0]+delta[0]*k,p[1]+delta[1]*k];
+    if(d.mode==='noise'){const amp=Math.hypot(...delta)*k;q=[p[0]+vectorHash(id,d.seed)*amp,p[1]+vectorHash(id+'y',d.seed)*amp];}
+    if(d.mode==='shear')q=[p[0]+(p[1]-cy)*delta[0]/h,p[1]+(p[0]-cx)*delta[1]/w];
+    if(d.mode==='perspective'){const factor=clamp(1+(p[1]-cy)*delta[0]/(w*h)*2,0.05,8);q=[cx+(p[0]-cx)*factor,cy+(p[1]-cy)*clamp(1+(p[0]-cx)*delta[1]/(w*h)*2,.05,8)];}
+    if(d.mode==='bend'){const angle=delta[1]/Math.max(w,1)*2;if(Math.abs(angle)>.00001){const r=w/angle,t=(p[0]-cx)/r,ry=r+(p[1]-cy);q=[cx+Math.sin(t)*ry,cy+Math.cos(t)*ry-r];}}
+    setVal(d.L,'pt:'+id,q);
+  }requestDraw();
+}
+for(const [id,name,icon]of [['magnet','Magnet','<path d="M5 4v10a7 7 0 0 0 14 0V4h-5v10a2 2 0 0 1-4 0V4ZM5 8h5m4 0h5"/>'],['perspective','Perspective points','<path d="m4 7 16-4v18L4 17ZM4 7v10m8-12v14"/>'],['shear','Shear points','<path d="m8 4 13 0-6 16H2Z"/>'],['bend','Bend points','<path d="M3 18C3-1 21-1 21 18M3 18h5m8 0h5"/>'],['noise','Noise points','<path d="m2 12 4-8 4 17 4-19 4 14 4-6"/>']])defTool(id,{icon:svgI(icon),name,key:'',cursor:'crosshair',hint:id==='magnet'||id==='noise'?'Drag within the brush radius · selected points restrict the brush · creates point motion keys':'Select points, then drag to deform them · records point motion at the playhead',down(e,sx,sy){vectorBrushStart(e,sx,sy,id);},move:vectorBrushMove,up(){commitEdit();}});
+defTool('blob',{icon:svgI('<path d="M3 15C-1 8 8 0 13 6c11-3 13 10 4 12-5 8-14 5-14-3Z"/>'),name:'Blob brush',key:'',cursor:'crosshair',hint:'Drag to paint a filled vector silhouette · brush radius controls thickness · pen pressure controls width',
+  down(e,sx,sy){TOOLS.freehand.down(e,sx,sy);},move(e,sx,sy){TOOLS.freehand.move(e,sx,sy);},
+  up(){const d=Stage.drag;Stage.preview=null;if(!d)return;const inv=M.inv(lcOf(d.L).full),raw=rdp(d.samples,Math.max(.2,VEC.reduction)*Stage.dpr),pts=raw.map(p=>[...M.ap(inv,p[0],p[1]),p[2]]),left=[],right=[];
+    if(pts.length<2){const p=pts[0];if(p)vectorCreationCommit('Blob dot',()=>vectorAddPath(d.L,vectorPrimitive('ellipse',p[0]-VEC.radius,p[1]-VEC.radius,VEC.radius*2,VEC.radius*2)[0].points,true,{...S.newStyle,fillOn:true,strokeOn:false}));else cancelEdit();return;}
+    for(let i=0;i<pts.length;i++){const a=pts[Math.max(0,i-1)],b=pts[Math.min(pts.length-1,i+1)],dx=b[0]-a[0],dy=b[1]-a[1],n=Math.hypot(dx,dy)||1,r=VEC.radius*(VEC.pressureWidth?pts[i][2]:1);left.push([pts[i][0]-dy/n*r,pts[i][1]+dx/n*r,1]);right.push([pts[i][0]+dy/n*r,pts[i][1]-dx/n*r,1]);}
+    vectorCreationCommit('Blob silhouette',()=>vectorAddPath(d.L,left.concat(right.reverse()),true,{...S.newStyle,fillOn:true,strokeOn:false}));
+  }});
+defTool('eraser',{icon:svgI('<path d="m3 15 10-12 9 8-9 11H9Zm4 4 10-12"/>'),name:'Vector eraser',key:'',cursor:'crosshair',hint:'Drag to erase curve edges within the radius · geometry changes in Setup mode',
+  down(e,sx,sy){const L=selLayer();if(!L)return;beginEdit('Erase vector edges');startDrag(e,{L});this.move(e,sx,sy);},
+  move(e,sx,sy){const d=Stage.drag;if(!d)return;const P=vectorPathPoints(d.L),center=toLocal(d.L,sx,sy),hit=[];
+    for(const p of d.L.paths){const samples=vectorSamples(d.L,p,P,0);const indices=[...new Set(samples.filter(s=>Math.hypot(s.p[0]-center[0],s.p[1]-center[1])<VEC.radius).map(s=>s.i))];if(indices.length)hit.push({p,indices});}
+    for(const {p,indices}of hit)if(d.L.paths.includes(p))vectorRemoveEdges(d.L,p,indices);requestDraw();},up(){commitEdit();}});
+function vectorScatterStamp(L,p,seed){const x=p[0]+vectorHash('x',seed)*VEC.scatter,y=p[1]+vectorHash('y',seed)*VEC.scatter,size=Math.max(2,VEC.radius*.25),kind=VEC.shape==='grid'?'star':VEC.shape;for(const geo of vectorPrimitive(kind,x-size/2,y-size/2,size,size))vectorAddPath(L,geo.points,geo.closed);}
+defTool('scatter',{icon:svgI('<path d="m5 2 2 4 4 1-4 2-2 4-2-4-3-2 3-1Zm12 10 2 3 3 1-3 2-2 4-2-4-3-2 3-1Z"/>'),name:'Scatter brush',key:'',cursor:'crosshair',hint:'Drag to scatter vector primitives · spacing, spread and brush radius control the stamps',
+  down(e,sx,sy){beginEdit('Scatter primitives');const L=ensureVectorLayer();startDrag(e,{L,last:[sx,sy],n:1});vectorScatterStamp(L,toLocal(L,sx,sy),1);requestDraw();},
+  move(e,sx,sy){const d=Stage.drag;if(!d||d.n>=2000)return;const dist=Math.hypot(sx-d.last[0],sy-d.last[1]),spacing=Math.max(3,VEC.spacing*S.view.zoom*Stage.dpr),n=Math.min(200,Math.floor(dist/spacing),2000-d.n);
+    for(let i=1;i<=n;i++){const p=mixVal(d.last,[sx,sy],i*spacing/(dist||1));vectorScatterStamp(d.L,toLocal(d.L,...p),++d.n);if(d.n>=2000)break;}if(n)d.last=mixVal(d.last,[sx,sy],Math.min(1,n*spacing/(dist||1)));requestDraw();},up(){commitEdit();}});
+
+// ---------- appearance tools (do not change path geometry) ----------
+function vectorHitShape(L,sx,sy){const hit=hitLayerEntry(lcOf(L),sx,sy);if(hit?.shape)return hit.shape;const seg=hitSegment(L,sx,sy);return seg&&[...L.shapes].reverse().find(s=>s.paths.includes(seg.path.id));}
+function vectorSelectShape(L,sh){S.selShape=sh?.id||null;S.selPts=new Set();refreshAll();return sh;}
+function vectorSelectedPaths(L){const sh=L.shapes.find(s=>s.id===S.selShape);return sh?L.paths.filter(p=>sh.paths.includes(p.id)):L.paths.filter(p=>p.pts.some(id=>S.selPts.has(id)));}
+defTool('shapeselect',{icon:svgI('<path d="m4 3 5 17 3-7 7-3Z"/><circle cx="17" cy="18" r="4"/>'),name:'Select shape',key:'Q',cursor:'default',hint:'Click visible fill or stroke to select its shape independently of points · Alt picks its style',
+  down(e,sx,sy){const L=selLayer(),sh=L&&vectorHitShape(L,sx,sy);vectorSelectShape(L,sh);if(e.altKey&&sh){const st=shapeStyle(L,sh,S.frame);Object.assign(S.newStyle,{fill:st.fill,stroke:st.stroke,width:st.width,fillOn:st.fillOn,strokeOn:st.strokeOn});refreshAll();}},move(){},up(){}});
+function vectorCreateShape(L){const paths=L.paths.filter(p=>p.pts.length>=2&&p.pts.every(id=>S.selPts.has(id)));if(!paths.length)return toast('Select all points of one or more curves first','err');if(!S.newStyle.fillOn&&!S.newStyle.strokeOn)return toast('Enable Fill or Stroke for the new shape','err');S.selShape=addShape(L,paths.map(p=>p.id)).id;return S.selShape;}
+defTool('createshape',{icon:svgI('<path d="m4 5 8-3 9 10-10 9-9-7Z"/><path d="M12 7v10m-5-5h10"/>'),name:'Create shape',key:'',cursor:'cell',hint:'Select curve points, then click Create shape; fill and stroke reference existing geometry',
+  down(){vectorAction('Create shape',vectorCreateShape,true);},move(){},up(){}});
+defTool('deleteshape',{icon:svgI('<path d="m4 5 8-3 9 10-10 9-9-7Zm4 3 8 8m0-8-8 8"/>'),name:'Delete shape',key:'',cursor:'crosshair',hint:'Click a fill or stroke to delete only its appearance; all points and paths remain editable',
+  down(e,sx,sy){const L=selLayer(),sh=L&&vectorHitShape(L,sx,sy);if(sh)vectorAction('Delete shape',()=>{L.shapes=L.shapes.filter(s=>s!==sh);deleteChannelsMatching(L,k=>k.startsWith('sh:'+sh.id+':'));S.selShape=null;},true);},move(){},up(){}});
+// ---------- Hide Edge (static, like Moho) ----------
+// Toggles a segment's stroke visibility on the drawing itself. Click or drag across segments; each segment
+// toggles at most once per drag. Points, curves and fills are untouched, and no animation key is written.
+function vectorToggleEdge(L,path,index){const k='hide_'+path.pts[index],key='curve:'+path.id+':'+k,hidden=!val(L,key,S.frame);
+  assertWritable(L);REV++;delete L.ch[key];if(hidden)path[k]=true;else delete path[k];return hidden;}
+function vectorAlongDrag(d,sx,sy,fn){const [x0,y0]=d.last||[sx,sy],steps=Math.max(1,Math.ceil(Math.hypot(sx-x0,sy-y0)/(3*(Stage.dpr||1))));
+  for(let i=1;i<=steps;i++)fn(x0+(sx-x0)*i/steps,y0+(sy-y0)*i/steps);d.last=[sx,sy];}
+defTool('hideedge',{icon:svgI('<path d="M2 5h7m6 0h7M2 19h20M10 3l4 4m-4 0 4-4"/>'),name:'Hide edge',key:'',cursor:'crosshair',hint:'Click a segment, or drag across several, to hide / show its stroke · fill and geometry remain · a drawing edit, not an animation key',
+  down(e,sx,sy){const L=selLayer();if(!L||L.type!=='vector')return;beginEdit('Hide / show edge');startDrag(e,{mode:'hideedge',L,done:new Set(),changed:0,last:[sx,sy]});this.visit(sx,sy);},
+  visit(sx,sy){const d=Stage.drag;if(d?.mode!=='hideedge')return;const h=hitSegment(d.L,sx,sy);if(!h)return;const id=h.path.id+':'+h.path.pts[h.index];if(d.done.has(id))return;d.done.add(id);vectorToggleEdge(d.L,h.path,h.index);d.changed++;requestDraw();},
+  move(e,sx,sy){const d=Stage.drag;if(d?.mode==='hideedge')vectorAlongDrag(d,sx,sy,(x,y)=>this.visit(x,y));},
+  up(){const d=Stage.drag;if(d?.mode!=='hideedge')return;if(d.changed)commitEdit();else cancelEdit();refreshAll();}});
+
+// ---------- Delete Edge (topology; Moho smart trimming) ----------
+function vectorDegree(L,id){const n=new Set();for(const p of L.paths){const k=p.pts.length;p.pts.forEach((q,i)=>{if(q!==id)return;if(p.closed||i>0)n.add(p.id+':'+((i-1+k)%k));if(p.closed||i<k-1)n.add(p.id+':'+i);});}return n.size;}
+// Returns the edge indices of the dangling branch containing edge `index`, or null when the edge isn't on one.
+function vectorDanglingBranch(L,path,index){if(path.closed)return null;const ids=path.pts,n=ids.length;
+  let j=index;while(j>0&&vectorDegree(L,ids[j])===2)j--;let k=index+1;while(k<n-1&&vectorDegree(L,ids[k])===2)k++;
+  const freeA=vectorDegree(L,ids[j])===1,freeB=vectorDegree(L,ids[k])===1;if(freeA===freeB)return null;
+  return {edges:Array.from({length:k-j},(_,i)=>j+i),junction:freeA?ids[k]:ids[j],side:freeA?'hout':'hin'};}
+function vectorDeleteEdgeSmart(L,path,index,smart=true){
+  const filled=L.shapes.filter(s=>s.paths.includes(path.id)&&shapeStyle(L,s,S.frame).fillOn).map(s=>s.id);
+  const branch=smart?vectorDanglingBranch(L,path,index):null;
+  if(branch&&branch.edges.length>1){const j=branch.junction,side=branch.side;
+    if(!L.pts[j][side]&&!L.ch['pv:'+j+':'+side])L.pts[j][side]=vectorAutoHandle(L,j,side,S.frame);
+    vectorRemoveEdges(L,path,branch.edges);}
+  else vectorDeleteEdge(L,path,index);
+  // A broken boundary can no longer hold a fill: the shape appearance goes, its geometry stays.
+  if(filled.length){L.shapes=L.shapes.filter(s=>!filled.includes(s.id));deleteChannelsMatching(L,k=>filled.some(id=>k.startsWith('sh:'+id+':')));if(filled.includes(S.selShape))S.selShape=null;}
+  vectorCleanup(L);
+}
+defTool('deleteedge',{icon:svgI('<path d="M3 6h7m4 12h7M10 3l4 6m-4 6 4 6"/>'),name:'Delete edge',key:'',cursor:'crosshair',hint:'Click or drag across segments to delete them · dangling branches trim back to their junction (Alt: literal) · a broken fill boundary removes that fill · Ctrl/Cmd or tablet eraser deletes points',
+  down(e,sx,sy){const L=selLayer();if(!L||L.type!=='vector')return;const points=!!(e.ctrlKey||e.metaKey)||(e.pointerType==='pen'&&(e.button===5||(e.buttons&32)));
+    beginEdit(points?'Delete points':'Delete edge');startDrag(e,{mode:'deleteedge',L,points,smart:!e.altKey,changed:0,last:[sx,sy]});this.visit(sx,sy);},
+  visit(sx,sy){const d=Stage.drag;if(d?.mode!=='deleteedge')return;
+    if(d.points){const id=hitPoint(d.L,sx,sy);if(id){deletePoints(d.L,[id]);d.changed++;requestDraw();}return;}
+    const h=hitSegment(d.L,sx,sy);if(h){vectorDeleteEdgeSmart(d.L,h.path,h.index,d.smart);d.changed++;requestDraw();}},
+  move(e,sx,sy){const d=Stage.drag;if(d?.mode==='deleteedge')vectorAlongDrag(d,sx,sy,(x,y)=>this.visit(x,y));},
+  up(){const d=Stage.drag;if(d?.mode!=='deleteedge')return;if(d.changed)commitEdit();else cancelEdit();refreshAll();}});
+// ---------- Line Width (Moho-style) ----------
+// Drag right/left: width · Shift: opacity · Shift+Alt: colour drift · Ctrl/Cmd: select points.
+// Magnet mode spreads the change to neighbours by distance along the curve; Alt resizes the magnet.
+// Without Magnet, Alt on an open curve's end changes that end and interpolates widths toward the other end.
+function vectorCurveDistances(L,sources,limit=Infinity){const dist=new Map(sources.map(id=>[id,0])),adj=new Map(),P=vectorPathPoints(L,S.frame);
+  const link=(a,b)=>{const w=Math.hypot(...vectorSub(P[a],P[b]));for(const [x,y]of [[a,b],[b,a]]){if(!adj.has(x))adj.set(x,[]);adj.get(x).push([y,w]);}};
+  for(const p of L.paths){const n=p.pts.length;for(let i=0;i<(p.closed?n:n-1);i++)link(p.pts[i],p.pts[(i+1)%n]);}
+  const queue=[...sources];while(queue.length){queue.sort((a,b)=>dist.get(b)-dist.get(a));const at=queue.pop(),base=dist.get(at);
+    for(const [to,w]of adj.get(at)||[]){const nd=base+w;if(nd<=limit&&nd<(dist.get(to)??Infinity)){dist.set(to,nd);queue.push(to);}}}
+  return dist;}
+const VECTOR_LW={width:['width',0,20,60],alpha:['alpha',0,1,200],strength:['strength',0,1,200]};
+defTool('linewidth',{icon:svgI('<path d="M2 8c7 0 9 8 20 8M2 7c7 0 9-7 20-7"/>'),name:'Line width',key:'W',cursor:'ew-resize',hint:'Drag right / left: width · Shift: opacity · Shift+Alt: colour drift · Ctrl/Cmd selects · Magnet spreads along the curve (Alt resizes it) · Alt on a curve end tapers the whole curve',
+  down(e,sx,sy){const L=selLayer();if(!L||L.type!=='vector')return;
+    if(VEC.lwMagnet&&e.altKey&&!e.shiftKey){startDrag(e,{mode:'lwradius',start:VEC.lwRadius});return;}
+    let ids=vectorIDs(L);if(ids.length<2){const id=hitPoint(L,sx,sy,16);if(!id)return;ids=[id];S.selPts=new Set([id]);}
+    const prop=e.shiftKey?(e.altKey?'strength':'alpha'):'width',weights=new Map(ids.map(id=>[id,1]));let taper=null;
+    if(!VEC.lwMagnet&&e.altKey&&!e.shiftKey&&ids.length===1){const p=L.paths.find(p=>!p.closed&&p.pts.length>2&&(p.pts[0]===ids[0]||p.pts.at(-1)===ids[0]));
+      if(p){const order=p.pts[0]===ids[0]?[...p.pts]:[...p.pts].reverse(),d=vectorCurveDistances(L,[order.at(-1)]),total=d.get(order[0])||1;taper={far:order.at(-1)};for(const id of order.slice(0,-1))weights.set(id,clamp((d.get(id)??total)/total,0,1));}}
+    if(VEC.lwMagnet){const r=VEC.lwRadius,d=vectorCurveDistances(L,ids,r);for(const [id,x]of d)if(!weights.has(id)){const u=1-x/r;weights.set(id,u*u*(3-2*u));}}
+    beginEdit(prop==='width'?'Point line width':prop==='alpha'?'Point opacity':'Point colour drift');
+    startDrag(e,{mode:'linewidth',L,prop,weights,taper,start:Object.fromEntries([...weights.keys()].map(id=>[id,val(L,'pv:'+id+':'+prop,S.frame)]))});refreshAll();},
+  move(e,sx,sy){const d=Stage.drag;if(!d)return;
+    if(d.mode==='lwradius'){VEC.lwRadius=clamp(d.start+(sx-d.sx)/(S.view.zoom*(Stage.dpr||1)),1,2000);renderToolOpts();return requestDraw();}
+    if(d.mode!=='linewidth')return;const [key,min,max,scale]=VECTOR_LW[d.prop],delta=(sx-d.sx)/(scale*(Stage.dpr||1));
+    for(const [id,w]of d.weights)setVal(d.L,'pv:'+id+':'+key,round(clamp(d.start[id]+delta*w,min,max),4));requestDraw();},
+  up(){const d=Stage.drag;if(d?.mode==='linewidth')commitEdit();refreshAll();renderToolOpts();}});
+// Ctrl/Cmd temporarily selects points (Select Points behaviour) inside Curvature and Line Width.
+function vectorPlainEvent(e){return {shiftKey:e.shiftKey,altKey:e.altKey,ctrlKey:false,metaKey:false,pointerType:e.pointerType,pressure:e.pressure,button:e.button,buttons:e.buttons};}
+for(const id of ['curvature','linewidth']){const t=TOOLS[id],down=t.down,move=t.move,up=t.up;
+  t.down=function(e,x,y){if(e.ctrlKey||e.metaKey)return TOOLS.points.down(vectorPlainEvent(e),x,y);return down.call(this,e,x,y);};
+  t.move=function(e,x,y){if(Stage.drag?.mode==='select')return TOOLS.points.move(vectorPlainEvent(e),x,y);return move.call(this,e,x,y);};
+  t.up=function(e){if(Stage.drag?.mode==='select')return TOOLS.points.up(e);return up.call(this,e);};}
+defTool('exposure',{icon:svgI('<path d="M2 18c3-18 17-18 20 0M2 20v-5m20 5v-5M7 20v-5m10 5v-5"/>'),name:'Stroke exposure',key:'',cursor:'ew-resize',hint:'Select a shape, then drag to reveal its stroke · Shift adjusts the start · use Start / End percentages for precision',
+  down(e,sx,sy){const L=selLayer();if(!L)return;const sh=vectorHitShape(L,sx,sy);if(sh)vectorSelectShape(L,sh);const paths=vectorSelectedPaths(L);if(!paths.length)return;beginEdit('Stroke exposure');const prop=e.shiftKey?'start':'end';startDrag(e,{L,prop,values:paths.map(p=>[p.id,val(L,'curve:'+p.id+':'+prop,S.frame)])});},
+  move(e,sx,sy){const d=Stage.drag;if(!d)return;for(const [id,n]of d.values)setVal(d.L,'curve:'+id+':'+d.prop,clamp(n+(sx-d.sx)/(200*Stage.dpr),0,1));requestDraw();},up(){commitEdit();}});
+function vectorApplyProfile(L,profile=VEC.profile){const paths=vectorSelectedPaths(L),source=L.paths.find(p=>p.id===profile);if(profile&&(!source||source.closed||source.pts.length<2))throw Error('Choose an open curve as the profile');for(const p of paths){if(p.id===profile)continue;p.profile=profile||null;setVal(L,'curve:'+p.id+':repeats',VEC.repeats);setVal(L,'curve:'+p.id+':offset',VEC.offset);}}
+defTool('profile',{icon:svgI('<path d="M2 19c4-22 7 0 11-12s7-3 9 12M2 22h20"/>'),name:'Curve profile',key:'',cursor:'default',hint:'Select the target shape; choose a separate open curve as its width profile, then Apply · repeats and offset animate',
+  down(e,sx,sy){const L=selLayer();if(L)vectorSelectShape(L,vectorHitShape(L,sx,sy));},move(){},up(){}});
+defTool('colorpoints',{icon:svgI('<path d="M3 20h18M4 17 12 3l8 14Z"/><circle cx="12" cy="12" r="3"/>'),name:'Color points',key:'',cursor:'crosshair',hint:'Click a point to apply localized color and strength to its fill and stroke · select several points to color together',
+  down(e,sx,sy){const L=selLayer(),id=L&&hitPoint(L,sx,sy);if(!id)return;if(!S.selPts.has(id))S.selPts=new Set([id]);vectorAction('Color points',()=>{for(const id of vectorIDs(L)){setVal(L,'pv:'+id+':color',VEC.pointColor);setVal(L,'pv:'+id+':strength',VEC.colorStrength);L.pts[id].colorRadius=VEC.colorRadius;}});},move(){},up(){}});
+
+// ---------- tool-specific option bars ----------
+function vectorNum(key,label,value,min=-1e7,max=1e7,step=.1,extra=''){return `<label>${label}<input type="number" data-vnum="${key}" value="${round(value,4)}" min="${min}" max="${max}" step="${step}" ${extra}></label>`;}
+function vectorCheck(key,label,on){return `<label><input type="checkbox" data-vcheck="${key}" ${on?'checked':''}>${label}</label>`;}
+function vectorButton(key,label,title=''){return `<button class="btn" data-va="${key}" title="${esc(title)}">${label}</button>`;}
+function vectorOptionsHTML(L){
+  const tool=S.tool,ids=L?.type==='vector'?vectorIDs(L):[],first=ids[0],n=S.newStyle;
+  let h='';
+  if(['points','pointtf','pen','curvature'].includes(tool))h+=`<select data-vselect="group" aria-label="Select point group"><option value="">Select group</option>${(L?.pointGroups||[]).map(g=>`<option value="${g.id}" ${VEC.group===g.id?'selected':''}>${esc(g.name)}</option>`).join('')}</select>`;
+  const handles=()=>vectorCheck('handles','Bézier handles',VEC.handles)+vectorCheck('fixed','Fixed handles',VEC.fixed);
+  const auto=()=>vectorCheck('autoWeld','Auto-weld',VEC.autoWeld)+vectorCheck('fillOn','Auto-fill',n.fillOn)+vectorCheck('strokeOn','Auto-stroke',n.strokeOn);
+  const appearance=()=>`<label>Fill <input type="color" data-vstyle="fill" value="${n.fill}"></label><label>Stroke <input type="color" data-vstyle="stroke" value="${n.stroke}"></label>`+vectorNum('styleWidth','Width',n.width,0,10000,.5);
+  if(tool==='points')h+=`<input class="vector-group-name" type="text" data-vtext="groupName" aria-label="Point group name" placeholder="Group name" value="${esc(VEC.groupName)}" maxlength="100">`+
+    vectorButton('groupcreate','Create','Store selected points as a named group')+vectorButton('groupdelete','Delete','Delete the selected group; keep its points')+vectorButton('weld','Weld crossings')+
+    vectorNum('simplify','Retention %',VEC.simplify,0,100,1)+vectorButton('simplify','Simplify')+vectorButton('split','Split','Insert a midpoint in each segment whose endpoints are selected')+vectorCheck('lasso','Lasso mode',VEC.lasso)+vectorButton('flipx','Flip H')+vectorButton('flipy','Flip V');
+  if(tool==='pointtf'){const c=L?.type==='vector'?vectorCenter(L):[0,0];h+=vectorButton('resetpoints','Reset','Restore selected point positions to frame 0 at this frame')+vectorNum('posx','Position X',c[0])+vectorNum('posy','Y',c[1])+vectorNum('scalex','Scale X %',100,-10000,10000,1)+vectorNum('scaley','Y %',100,-10000,10000,1)+vectorNum('angle','Angle °',0,-3600,3600,1)+auto()+handles()+vectorButton('flipx','Flip H')+vectorButton('flipy','Flip V');}
+  if(tool==='pen')h+=auto()+vectorCheck('sharp','Sharp corners',VEC.sharp)+handles()+vectorButton('finish','Finish path')+appearance();
+  if(tool==='curvature')h+=vectorNum('curvature','Curvature',first?val(L,'pv:'+first+':c',S.frame):1,-3,3,.01)+vectorButton('peak','Peak')+vectorButton('smooth','Smooth')+vectorButton('reverse','+/−')+vectorButton('resetcurve','Reset')+handles();
+  if(tool==='freehand')h+=vectorButton('freeoptions','Freehand options')+vectorCheck('weldEnds','Weld ends',VEC.weldEnds)+vectorCheck('fillOn','Auto-fill',n.fillOn)+vectorCheck('strokeOn','Auto-stroke',n.strokeOn)+vectorCheck('multiFill','Multi-stroke fill',VEC.multiFill)+appearance()+
+    (VEC.freeExpanded?vectorNum('smoothing','Smoothing passes',VEC.smoothing,0,8,1)+vectorNum('reduction','Reduction px',VEC.reduction,0,20,.1)+vectorCheck('pressureWidth','Pressure width',VEC.pressureWidth)+vectorCheck('pressureAlpha','Pressure opacity',VEC.pressureAlpha)+vectorNum('taper','End taper',VEC.taper,0,.5,.01)+vectorNum('colorDrift','Color drift',VEC.colorDrift,0,1,.05):'');
+  if(tool==='drawshape'||tool==='scatter')h+=vectorCheck('fillOn','Auto-fill',n.fillOn)+vectorCheck('strokeOn','Auto-stroke',n.strokeOn)+`<select data-vselect="shape" aria-label="Primitive type">${['rectangle','ellipse','triangle','star','arrow','spiral','grid'].map(k=>`<option ${VEC.shape===k?'selected':''}>${k}</option>`).join('')}</select>`+
+    vectorNum('horizontal','Horizontal',VEC.horizontal,1,64,1,VEC.shape!=='grid'?'disabled':'')+vectorNum('vertical','Vertical',VEC.vertical,1,64,1,VEC.shape!=='grid'?'disabled':'')+appearance();
+  if(['magnet','noise','blob','eraser','scatter'].includes(tool))h+=vectorNum('radius','Radius',VEC.radius,1,1000,1);
+  if(['magnet','noise'].includes(tool))h+=vectorNum('strength','Strength',VEC.strength,0,2,.05);
+  if(tool==='blob')h+=`<label>Fill <input type="color" data-vstyle="fill" value="${n.fill}"></label>`+vectorCheck('pressureWidth','Pressure width',VEC.pressureWidth);
+  if(tool==='scatter')h+=vectorNum('spacing','Spacing',VEC.spacing,3,1000,1)+vectorNum('scatter','Spread',VEC.scatter,0,1000,1);
+  if(tool==='reduce')h+=vectorNum('simplify','Retention %',VEC.simplify,0,100,1)+vectorButton('simplify','Reduce selected / all');
+  if(['createshape','fill'].includes(tool))h+=vectorCheck('fillOn','Fill',n.fillOn)+vectorCheck('strokeOn','Stroke',n.strokeOn)+appearance()+(tool==='createshape'?vectorButton('createshape','Create from selected curves'):'');
+  if(tool==='shapeselect'||tool==='deleteshape')h+=`<span class="chip">${S.selShape?'Shape selected · edit in Styles / Properties':'Click a fill or stroke'}</span>`+(S.selShape?vectorButton('deleteshape','Delete shape'):'');
+  if(tool==='linewidth')h+=vectorNum('pointwidth','Width',first?val(L,'pv:'+first+':width',S.frame):1,0,20,.05)+vectorNum('pointalpha','Opacity',first?val(L,'pv:'+first+':alpha',S.frame):1,0,1,.05)+vectorNum('pointdrift','Colour drift',first?val(L,'pv:'+first+':strength',S.frame):0,0,1,.05)+vectorCheck('lwMagnet','Magnet mode',VEC.lwMagnet)+vectorNum('lwRadius','Magnet radius',VEC.lwRadius,1,2000,1)+vectorButton('widthreset','Reset width');
+  if(tool==='exposure'){const p=L?.type==='vector'?vectorSelectedPaths(L)[0]:null;h+=vectorNum('start','Start %',p?100*val(L,'curve:'+p.id+':start',S.frame):0,0,100,1)+vectorNum('end','End %',p?100*val(L,'curve:'+p.id+':end',S.frame):100,0,100,1)+vectorButton('exposurereset','Show full stroke');}
+  if(tool==='profile')h+=`<select data-vselect="profile" aria-label="Profile source"><option value="">No profile</option>${(L?.paths||[]).filter(p=>!p.closed&&p.pts.length>1).map((p,i)=>`<option value="${p.id}" ${VEC.profile===p.id?'selected':''}>Open curve ${i+1} · ${p.id.slice(-4)}</option>`).join('')}</select>`+vectorNum('repeats','Repeats',VEC.repeats,1,64,1)+vectorNum('offset','Offset',VEC.offset,-100,100,.05)+vectorButton('applyprofile','Apply profile','Use the chosen open curve as a width envelope')+vectorButton('clearprofile','Clear');
+  if(tool==='colorpoints')h+=`<label>Point color <input type="color" data-vstyle="pointColor" value="${VEC.pointColor}"></label>`+vectorNum('colorStrength','Strength',VEC.colorStrength,0,1,.05)+vectorNum('colorRadius','Radius',VEC.colorRadius,1,1000,1)+vectorButton('applycolor','Apply selected')+vectorButton('clearcolor','Clear selected');
+  h+=`<span class="chip">${ids.length} points selected · ${S.mode==='setup'?'Setup':('Frame '+S.frame)}</span>`;return h;
+}
+function vectorNumericChange(key,value){
+  if(!Number.isFinite(value))return;
+  const limits={simplify:[0,100],horizontal:[1,64],vertical:[1,64],smoothing:[0,8],reduction:[0,20],radius:[1,1000],strength:[0,2],spacing:[3,1000],scatter:[0,1000],taper:[0,.5],colorDrift:[0,1],colorStrength:[0,1],colorRadius:[1,1000],repeats:[1,64],offset:[-100,100],lwRadius:[1,2000]};
+  if(limits[key]){VEC[key]=clamp(value,...limits[key]);if(['horizontal','vertical','smoothing','repeats'].includes(key))VEC[key]=Math.round(VEC[key]);return;}
+  if(key==='styleWidth'){S.newStyle.width=clamp(value,0,10000);return;}
+  return vectorAction('Vector '+key,L=>{
+    const ids=vectorIDs(L),c=vectorCenter(L),v=clamp(value,-1e7,1e7);
+    if(key==='posx'||key==='posy'){const axis=key==='posx'?0:1;vectorTransform(L,p=>p.map((n,i)=>n+(i===axis?v-c[axis]:0)));}
+    if(['scalex','scaley','angle'].includes(key)){const sx=key==='scalex'?clamp(v/100,-100,100):1,sy=key==='scaley'?clamp(v/100,-100,100):1,a=key==='angle'?clamp(v,-3600,3600)*DEG:0,m=M.chain(M.r(a),M.s(sx,sy));
+      vectorTransform(L,p=>{const q=M.apv(m,p[0]-c[0],p[1]-c[1]);return [c[0]+q[0],c[1]+q[1]];});for(const id of ids)for(const side of ['hin','hout'])if(L.pts[id][side]||L.ch['pv:'+id+':'+side])setVal(L,'pv:'+id+':'+side,M.apv(m,...val(L,'pv:'+id+':'+side,S.frame)));}
+    if(key==='curvature')for(const id of ids){setVal(L,'pv:'+id+':c',clamp(v,-3,3));vectorClearHandles(L,id);}
+    if(key==='pointwidth')for(const id of ids)setVal(L,'pv:'+id+':width',clamp(v,0,20));
+    if(key==='pointalpha')for(const id of ids)setVal(L,'pv:'+id+':alpha',clamp(v,0,1));
+    if(key==='pointdrift')for(const id of ids)setVal(L,'pv:'+id+':strength',clamp(v,0,1));
+    if(key==='start'||key==='end')for(const p of vectorSelectedPaths(L))setVal(L,'curve:'+p.id+':'+key,clamp(v/100,0,1));
+  });
+}
+function vectorRunAction(action){
+  if(action==='finish')return finishPen(false);
+  if(action==='freeoptions'){VEC.freeExpanded=!VEC.freeExpanded;return renderToolOpts();}
+  if(action==='resetcurve')return vectorAction('Reset curvature',L=>{const values=vectorIDs(L).map(id=>({id,c:S.frame?val(L,'pv:'+id+':c',0):1,hin:vectorAutoHandle(L,id,'hin',0),hout:vectorAutoHandle(L,id,'hout',0)}));for(const p of values){setVal(L,'pv:'+p.id+':c',p.c);if(S.frame){for(const side of ['hin','hout'])if(L.pts[p.id][side]||L.ch['pv:'+p.id+':'+side])setVal(L,'pv:'+p.id+':'+side,p[side]);}else vectorClearHandles(L,p.id);}});
+  if(action==='peak'||action==='smooth'||action==='reverse')return vectorCurvature(action==='peak'?0:action==='smooth'?1:(L,id)=>-val(L,'pv:'+id+':c',S.frame));
+  const topology=['split','weld','simplify','createshape','deleteshape'].includes(action);
+  return vectorAction(action,L=>{
+    if(action==='groupcreate'){const name=VEC.groupName.trim();if(!name||!S.selPts.size)return toast('Enter a group name and select its points','err');L.pointGroups=L.pointGroups||[];let g=L.pointGroups.find(g=>g.name===name);if(!g){g={id:uid('pg'),name,points:[]};L.pointGroups.push(g);}g.points=vectorIDs(L);VEC.group=g.id;}
+    if(action==='groupdelete'){L.pointGroups=(L.pointGroups||[]).filter(g=>g.id!==VEC.group);VEC.group='';}
+    if(action==='split')vectorSplitSelected(L);
+    if(action==='weld')vectorWeldCrossings(L);
+    if(action==='simplify')vectorSimplify(L);
+    if(action==='createshape')vectorCreateShape(L);
+    if(action==='deleteshape'){const id=S.selShape;L.shapes=L.shapes.filter(s=>s.id!==id);deleteChannelsMatching(L,k=>k.startsWith('sh:'+id+':'));S.selShape=null;}
+    if(action==='resetpoints'){const values=vectorIDs(L).map(id=>[id,val(L,'pt:'+id,0)]);for(const [id,p]of values)setVal(L,'pt:'+id,p);}
+    if(action==='flipx'||action==='flipy'){const axis=action==='flipx'?0:1,c=vectorCenter(L);vectorTransform(L,p=>p.map((n,i)=>i===axis?2*c[axis]-n:n));for(const id of vectorIDs(L))for(const side of ['hin','hout'])if(L.pts[id][side]||L.ch['pv:'+id+':'+side]){const v=val(L,'pv:'+id+':'+side,S.frame).slice();v[axis]*=-1;setVal(L,'pv:'+id+':'+side,v);}}
+    if(action==='widthreset')for(const id of vectorIDs(L))setVal(L,'pv:'+id+':width',1);
+    if(action==='exposurereset')for(const p of vectorSelectedPaths(L)){setVal(L,'curve:'+p.id+':start',0);setVal(L,'curve:'+p.id+':end',1);}
+    if(action==='applyprofile'||action==='clearprofile')vectorApplyProfile(L,action==='clearprofile'?'':VEC.profile);
+    if(action==='applycolor'||action==='clearcolor')for(const id of vectorIDs(L)){setVal(L,'pv:'+id+':color',VEC.pointColor);setVal(L,'pv:'+id+':strength',action==='clearcolor'?0:VEC.colorStrength);L.pts[id].colorRadius=VEC.colorRadius;}
+  },topology);
+}
+const vectorOldOptions=renderToolOpts;
+renderToolOpts=function(){
+  if(!VECTOR_DRAW.includes(S.tool)&&!VECTOR_FILL.includes(S.tool))return vectorOldOptions();
+  const el=$('#toolopts');if(!el)return;
+  if(document.activeElement&&el.contains(document.activeElement)&&['INPUT','SELECT'].includes(document.activeElement.tagName))return;
+  const t=TOOLS[S.tool],h=`<span class="tname" title="${esc(t.hint)}">${t.icon} ${esc(t.name)}</span><span class="sep"></span>`+vectorOptionsHTML(selLayer())+'<span class="sep"></span>'+contextHTML();
+  if(el._h===h)return;el._h=h;el.innerHTML=h;
+  const refresh=()=>{el._h='';requestDraw();};
+  el.querySelectorAll('[data-va]').forEach(b=>b.onclick=()=>{vectorRunAction(b.dataset.va);refresh();});
+  el.querySelectorAll('[data-vcheck]').forEach(i=>i.onchange=()=>{const k=i.dataset.vcheck;if(k==='fillOn'||k==='strokeOn')S.newStyle[k]=i.checked;else VEC[k]=i.checked;refresh();});
+  el.querySelectorAll('[data-vnum]').forEach(i=>i.onchange=()=>{const n=+i.value;if(i.value!==''&&Number.isFinite(n))vectorNumericChange(i.dataset.vnum,n);i.blur();refresh();renderToolOpts();});
+  el.querySelectorAll('[data-vstyle]').forEach(i=>i.onchange=()=>{if(i.dataset.vstyle==='pointColor')VEC.pointColor=i.value;else S.newStyle[i.dataset.vstyle]=i.value;refresh();});
+  el.querySelectorAll('[data-vtext]').forEach(i=>i.oninput=()=>{VEC[i.dataset.vtext]=i.value;});
+  el.querySelectorAll('[data-vselect]').forEach(i=>i.onchange=()=>{const k=i.dataset.vselect;VEC[k]=i.value;if(k==='group'){const g=selLayer()?.pointGroups?.find(g=>g.id===i.value);if(g){S.selPts=new Set(g.points.filter(id=>selLayer().pts[id]));VEC.groupName=g.name;}}i.blur();refreshAll();refresh();renderToolOpts();});
+  el.querySelectorAll('[data-cmd]').forEach(b=>b.onclick=()=>runCmd(b.dataset.cmd));
+  el.querySelectorAll('[data-tool]').forEach(b=>b.onclick=()=>setTool(b.dataset.tool));
+  el.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
+};
+// ---------- Binding (Moho model) ----------
+// Bind Points assigns each selected point to exactly one bone, only when Bind Points is run (button / Space).
+// Un-bind releases points (no bone moves them); Flexi-bind returns them to automatic influence.
+// Bind Layer attaches a whole layer to one bone and disables Bind Points; point settings are kept underneath.
+function bindArtLayers(){const B=activeBoneLayer();return S.selLayers.map(id=>findLayer(id)).filter(L=>L&&L.type!=='bone'&&L.type!=='audio'&&boneLayerFor(L)===B);}
+function bindTargetBone(L,id){selectBone(id);S.selPts=new Set(Object.keys(L.pts||{}).filter(pid=>(L.pts[pid].b||[]).some(q=>q[0]===id)));refreshAll();const b=boneOf(boneLayerFor(L),id);toast(`${S.selPts.size} point(s) are bound to ${b?b.name:'this bone'}`);}
+function bindPointsCheck(){const L=selLayer(),B=L&&boneLayerFor(L);
+  if(!L||L.type!=='vector'||!B)return 'Select a vector layer inside a Bone Group';
+  if(L.bindBone)return `“${L.name}” is bound as a whole layer — clear that attachment first`;
+  if(S.mode!=='setup')return 'Binding is rig setup — switch to Setup mode (Tab)';
+  if(!S.selPts.size)return 'Select the points to change first';
+  return writeReason(L)||null;}
+const bindSelectPoints={down:TOOLS.points.down,move:TOOLS.points.move,up:TOOLS.points.up};
+defTool('bindpts',{icon:TOOLS.bindpts.icon,name:'Bind points',key:'D',cursor:'crosshair',
+  hint:'Select points (click, drag a box; Ctrl/Cmd: lasso; Shift adds; Alt removes) · Alt-click a bone to target it and select its points · Bind points (or tap Space) assigns them; selecting alone binds nothing',
+  down(e,sx,sy){const L=selLayer(),B=boneLayerFor(L);if(e.altKey&&B){const hb=hitBone(B,sx,sy);if(hb)return bindTargetBone(L,hb.id);}bindSelectPoints.down.call(TOOLS.points,e,sx,sy);},
+  move(e,sx,sy){bindSelectPoints.move.call(TOOLS.points,e,sx,sy);},
+  up(e){bindSelectPoints.up.call(TOOLS.points,e);}});
+function bindRun(label,fn){const why=bindPointsCheck();if(why)return toast(why,'err');const L=selLayer(),n=vectorIDs(L).length;edit(label,()=>{for(const id of vectorIDs(L))fn(L.pts[id]);});return n;}
+CMDS.find(c=>c.id==='rig.bindpts').run=()=>{const L=selLayer(),B=L&&boneLayerFor(L);if(!B||!boneOf(B,S.selBone))return toast('Choose the target bone first (Alt-click it, or pick it in the toolbar)','err');const b=boneOf(B,S.selBone),n=bindRun('Bind points',p=>{p.b=[[b.id,1]];});if(n)toast(`Bound ${n} point(s) to ${b.name}`,'ok');};
+Object.assign(CMDS.find(c=>c.id==='rig.unbindpts'),{label:'Un-bind (release) selected points',en:needPts,run(){const n=bindRun('Release points',p=>{p.b=[];});if(n)toast(`Released ${n} point(s) — no bone moves them now`,'ok');}});
+cmd('rig.flexipts','Rig','Flexi-bind selected points',()=>{const n=bindRun('Flexi-bind points',p=>{delete p.b;});if(n)toast(`${n} point(s) returned to automatic flexi-binding`,'ok');},{en:needPts});
+const bindLayerCmd=(id,label,fn,done,pre)=>cmd(id,'Rig',label,()=>{const Ls=bindArtLayers();if(!Ls.length)return toast('Select artwork layers inside a Bone Group','err');const stop=pre&&pre(Ls);if(stop)return toast(stop,'err');if(S.mode!=='setup')return toast('Binding is rig setup — switch to Setup mode (Tab)','err');const why=Ls.map(writeReason).find(Boolean);if(why)return toast(why,'err');
+  const r=edit(label,()=>Ls.forEach(fn));if(r!==false&&done)toast(done(Ls),'ok');},{en:()=>bindArtLayers().length?false:'Select artwork layers inside a Bone Group'});
+bindLayerCmd('rig.releaselayer','Release layer',L=>{L.bindBone=null;L.flexi=false;},Ls=>`${Ls.length} layer(s) released — the skeleton no longer moves them (point bindings are kept)`);
+bindLayerCmd('rig.flexilayer','Flexi-bind layer',L=>{L.bindBone=null;delete L.flexi;},Ls=>`${Ls.length} layer(s) use automatic flexi-binding`);
+bindLayerCmd('rig.flexiselected','Use selected bones for flexi-binding',L=>{L.flexiBones=selectedBoneIds().filter(id=>boneOf(boneLayerFor(L),id));},Ls=>`Flexi-binding limited to ${Ls[0].flexiBones.length} selected bone(s)`,Ls=>selectedBoneIds().some(id=>boneOf(boneLayerFor(Ls[0]),id))?null:'Select the bones to use first (Select bone tool), then the artwork layer');
+bindLayerCmd('rig.flexiall','Use all bones for flexi-binding',L=>{delete L.flexiBones;},()=>'Flexi-binding uses all bones again');
+// Handle editing uses the same interaction in every tool that offers handles.
+for(const id of ['points','pen','curvature']){const t=TOOLS[id],down=t.down,move=t.move,up=t.up;
+  t.down=function(e,x,y){const L=selLayer();if(VEC.handles&&L?.type==='vector'&&vectorHandles(L).some(h=>Math.hypot(h.p[0]-x,h.p[1]-y)<7*Stage.dpr))return TOOLS.pointtf.down(e,x,y);return down.call(this,e,x,y);};
+  t.move=function(e,x,y){if(Stage.drag?.mode==='handle')return TOOLS.pointtf.move(e,x,y);return move.call(this,e,x,y);};
+  t.up=function(e){if(Stage.drag?.mode==='handle')return TOOLS.pointtf.up(e);return up.call(this,e);};
+}
+const vectorOldDeleteSelection=deleteSelection;
+deleteSelection=function(){if(!S.selKeys.size&&VECTOR_FILL.includes(S.tool)&&S.selShape)return vectorRunAction('deleteshape');return vectorOldDeleteSelection();};
+const vectorOldKeyPose=keyCurrentTimelinePose;
+keyCurrentTimelinePose=function(){const L=selLayer();if(L?.type!=='vector'||!POINT_TOOLS.has(S.tool)||['points','pointtf'].includes(S.tool)){
+    if(S.tool==='pointtf'){const previous=S.tool;S.tool='points';try{return vectorOldKeyPose();}finally{S.tool=previous;}}return vectorOldKeyPose();}
+  if(S.mode==='setup'||S.frame===0)return toast('Move to an animation frame before keying a pose','err');
+  return vectorAction('Key vector pose',()=>{
+    const attrs=S.tool==='curvature'?['c']:S.tool==='linewidth'?['width']:S.tool==='colorpoints'?['color','strength']:null;
+    if(attrs){for(const id of (S.selPts.size?vectorIDs(L):Object.keys(L.pts)))for(const a of attrs){const path='pv:'+id+':'+a;setVal(L,path,val(L,path,S.frame),S.frame,true);}return;}
+    if(S.tool==='exposure'||S.tool==='profile'){for(const p of vectorSelectedPaths(L))for(const a of S.tool==='exposure'?['start','end']:['repeats','offset']){const path='curve:'+p.id+':'+a;setVal(L,path,val(L,path,S.frame),S.frame,true);}return;}
+    for(const id of vectorIDs(L))setVal(L,'pt:'+id,val(L,'pt:'+id,S.frame),S.frame,true);
+  });
+};
+CMDS.find(c=>c.id==='anim.keyall').run=keyCurrentTimelinePose;
+for(const [action,label]of [['split','Split selected segments'],['weld','Weld curve crossings'],['simplify','Simplify curves'],['createshape','Create shape from selected curves']])cmd('vector.'+action,'Draw',label,()=>vectorRunAction(action),{en:()=>toolAvail(action==='createshape'?'createshape':'reduce')});
+Object.assign(window.PopaiApp||{}, {keyCurrentTimelinePose});
+
+// Keep menu actions consistent with the toolbar's channels and safeguards.
+for(const [id,run]of [['pts.smooth',()=>vectorRunAction('smooth')],['pts.corner',()=>vectorRunAction('peak')],['pts.flipH',()=>vectorRunAction('flipx')],['pts.flipV',()=>vectorRunAction('flipy')],['shape.create',()=>vectorRunAction('createshape')],['shape.del',()=>vectorRunAction('deleteshape')]])CMDS.find(c=>c.id===id).run=run;
+for(const id of ['pts.del','pts.close'])CMDS.find(c=>c.id===id).en=()=>toolAvail('deleteedge')||needPts();
+TOOLS.points.icon=svgI('<path stroke-dasharray="2 2" d="M3 3h18v18H3Z"/>');
+TOOLS.curvature.icon=svgI('<path d="M3 20C3-3 21-3 21 20"/>');
+TOOLS.freehand.icon=svgI('<path d="m3 20 3-7L17 2l5 5L11 18Zm3-7 5 5"/>');
+TOOLS.pen.icon=svgI('<path d="M3 20C3 2 21 2 21 20M12 2v6m-3-3h6"/>');
+TOOLS.fill.icon=svgI('<path d="m4 11 8-8 8 8-8 8Zm8-8-3-3m12 14s-4 5-1 7 5-2 1-7"/>');
+const vectorOldValidateProject=validateProject;
+validateProject=function(input){
+  const d=vectorOldValidateProject(input),range=(v,a,b)=>typeof v==='number'&&Number.isFinite(v)&&v>=a&&v<=b;
+  const pointAttr=(key,value)=>{
+    if(['hin','hout'].includes(key))return Array.isArray(value)&&value.length===2&&value.every(v=>range(v,-1e7,1e7));
+    if(key==='color')return isColor(value);
+    const bounds={c:[-3,3],width:[0,100],alpha:[0,1],strength:[0,1],colorRadius:[1,1000]}[key];return bounds&&range(value,...bounds);
+  };
+  walk(d.layers,L=>{if(L.type!=='vector')return;
+    for(const p of Object.values(L.pts))for(const key of ['c','width','alpha','strength','color','hin','hout','colorRadius'])if(p[key]!==undefined&&!pointAttr(key,p[key]))throw Error('Invalid vector point '+key);
+    const paths=new Map(L.paths.map(p=>[p.id,p]));if(paths.size!==L.paths.length)throw Error('Duplicate vector path');
+    for(const p of L.paths){if(p.profile&&(!paths.has(p.profile)||paths.get(p.profile).closed||p.profile===p.id))throw Error('Invalid curve profile');
+      for(const [key,bounds]of Object.entries({start:[0,1],end:[0,1],repeats:[1,64],offset:[-100,100]}))if(p[key]!==undefined&&!range(p[key],...bounds))throw Error('Invalid curve '+key);
+      for(const key of Object.keys(p))if(key.startsWith('hide_')&&(typeof p[key]!=='boolean'||!p.pts.includes(key.slice(5))))throw Error('Invalid hidden edge');
+    }
+    if(L.pointGroups!==undefined){if(!Array.isArray(L.pointGroups)||L.pointGroups.length>5000)throw Error('Invalid point groups');const seen=new Set();for(const g of L.pointGroups){if(!g||typeof g.id!=='string'||!/^[A-Za-z0-9_-]+$/.test(g.id)||seen.has(g.id)||typeof g.name!=='string'||g.name.length>100||!Array.isArray(g.points)||g.points.some(id=>!Object.hasOwn(L.pts,id)))throw Error('Invalid point group');seen.add(g.id);}}
+    for(const [key,ch]of Object.entries(L.ch)){const [kind,id,prop]=key.split(':');if(kind==='pv'){if(!Object.hasOwn(L.pts,id)||ch.keys.some(k=>!pointAttr(prop,k.v)))throw Error('Invalid animated vector property');}
+      if(kind==='curve'){const p=paths.get(id);if(!p)throw Error('Missing animated curve');const bounds={start:[0,1],end:[0,1],repeats:[1,64],offset:[-100,100]}[prop];if(prop.startsWith('hide_')){if(!p.pts.includes(prop.slice(5))||ch.keys.some(k=>typeof k.v!=='boolean'))throw Error('Invalid animated hidden edge');}else if(!bounds||ch.keys.some(k=>!range(k.v,...bounds)))throw Error('Invalid animated curve property');}
+    }
+  });return d;
+};
+Object.assign(window.PopaiApp||{}, {toolAvail,validateProject,keyCurrentTimelinePose});
+
+/* ===================== Popai Animator — Layer Settings, masking and Liquid Shapes (Moho model) =====================
+   Layer Settings: a tabbed window for the selected layer(s) (double-click a layer, the ⚙ button, Window ▸ Layer Settings,
+   Ctrl+Shift+I). Apply commits and stays open, OK commits and closes, Cancel discards uncommitted changes.
+   Masking: a Group or Bone layer chooses No masking / Hide all / Reveal all; each child chooses its role. Children are
+   processed bottom → top, so contributors sit below the artwork they constrain.
+   Liquid Shapes: in Select Shape, filled shapes above a base shape can Add, Subtract or Clip into it, with an animatable
+   Blend. Merge bakes the combined silhouette into ordinary geometry. */
+
+// ---------- masking ----------
+const MASK_MODES = [['none', 'No masking in this group'], ['hide', 'Hide all'], ['reveal', 'Reveal all']];
+const MASK_LEGACY = [['bottom', 'Bottom child masks the rest (older Popai)'], ['invert', 'Bottom child cuts out the rest (older Popai)']];
+const MASK_ROLES = [['mask', 'Mask this layer'], ['nomask', "Don't mask this layer"], ['add', '+ Add to mask'], ['addhide', '+ Add to mask, but keep invisible'],
+  ['sub', '− Subtract from mask'], ['subhide', '− Subtract from mask, but keep invisible'], ['clear', 'Clear the mask, then add this layer'], ['clearhide', 'Clear the mask, then add this layer, but keep invisible']];
+// While a contributor is drawn for “Exclude strokes”, every shape reports its stroke as off.
+let lsNoStroke = false;
+const lsOldShapeStyle = shapeStyle;
+shapeStyle = function (L, sh, f) { const st = lsOldShapeStyle(L, sh, f); return lsNoStroke ? { ...st, strokeOn: false } : st; };
+function maskMode(L) { return isContainer(L) && L.type !== 'switch' ? (L.mask || 'none') : 'none'; }
+function maskRole(L) { return L.maskRole || 'mask'; }
+// Draw a contributor into the mask canvas; "expand by a pixel" stamps it at one-pixel offsets to close antialiasing gaps.
+function maskStamp(mx, src, expand) {
+  if (!expand) return mx.drawImage(src, 0, 0);
+  for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) mx.drawImage(src, dx, dy);
+}
+function drawMaskedChildren(ctx, L, R, cpc) {
+  const W = R.W, H = R.H, kids = L.children, mode = maskMode(L);
+  const maskC = Pool.get(W, H), out = Pool.get(W, H), tmp = Pool.get(W, H), mx = maskC.getContext('2d'), ox = out.getContext('2d'), tx = tmp.getContext('2d');
+  for (const x of [mx, ox, tx]) { x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; x.clearRect(0, 0, W, H); }
+  if (mode === 'reveal') { mx.fillStyle = '#000'; mx.fillRect(0, 0, W, H); }
+  for (let i = kids.length - 1; i >= 0; i--) {
+    const c = kids[i], role = maskRole(c);
+    tx.setTransform(1, 0, 0, 1, 0, 0); tx.globalAlpha = 1; tx.globalCompositeOperation = 'source-over'; tx.clearRect(0, 0, W, H);
+    drawLayer(tx, c, R, cpc);
+    if (!['mask', 'nomask'].includes(role)) {
+      let src = tmp, extra = null;
+      if (c.maskNoStroke) { extra = Pool.get(W, H); const ex = extra.getContext('2d'); ex.setTransform(1, 0, 0, 1, 0, 0); ex.clearRect(0, 0, W, H); lsNoStroke = true; try { drawLayer(ex, c, { ...R, rec: null }, cpc); } finally { lsNoStroke = false; } src = extra; }
+      mx.setTransform(1, 0, 0, 1, 0, 0);
+      if (role.startsWith('clear')) mx.clearRect(0, 0, W, H);
+      mx.globalCompositeOperation = role.startsWith('sub') ? 'destination-out' : 'source-over';
+      maskStamp(mx, src, c.maskExpand); mx.globalCompositeOperation = 'source-over';
+      if (extra) Pool.put(extra);
+      if (role.endsWith('hide')) continue;
+    }
+    if (role === 'mask') { tx.setTransform(1, 0, 0, 1, 0, 0); tx.globalCompositeOperation = 'destination-in'; tx.drawImage(maskC, 0, 0); tx.globalCompositeOperation = 'source-over'; }
+    ox.drawImage(tmp, 0, 0);
+  }
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(out, 0, 0); ctx.restore();
+  Pool.put(maskC, out, tmp);
+}
+
+// ---------- depth sort ----------
+function depthSorted(L, list, f) {
+  if (!L.depthSort || list.length < 2) return list;
+  const cam = S.doc.camera, cx = val(cam, 'x', f), cy = val(cam, 'y', f);
+  const dist = (c) => L.trueDistance ? Math.hypot(val(c, 'x', f) - cx, val(c, 'y', f) - cy, CAM_D - (val(c, 'z', f) || 0)) : CAM_D - (val(c, 'z', f) || 0);
+  // drawList paints from the end of the list to the start, so the farthest layer goes last.
+  return list.map((c, i) => [c, i, dist(c)]).sort((a, b) => a[2] - b[2] || a[1] - b[1]).map((x) => x[0]);
+}
+
+// ---------- extra layer effects ----------
+FX.shading = { label: 'Layer shading (inner)', params: { angle: [-45, -180, 180, 1], offset: [8, 0, 500, 0.5], blur: [8, 0, 200, 0.5], color: ['#000000'], opacity: [0.5, 0, 1, 0.01] },
+  apply(c, p, sc) {
+    const W = c.width, H = c.height, s = Pool.get(W, H), x = s.getContext('2d'), a = p.angle * DEG;
+    x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; x.clearRect(0, 0, W, H);
+    x.fillStyle = p.color; x.fillRect(0, 0, W, H);
+    x.globalCompositeOperation = 'destination-out'; x.drawImage(c, Math.cos(a) * p.offset * sc, Math.sin(a) * p.offset * sc);
+    x.globalCompositeOperation = 'source-over';
+    const b = p.blur > 0 ? blurred(s, p.blur * sc) : s, cx = c.getContext('2d');
+    cx.save(); cx.setTransform(1, 0, 0, 1, 0, 0); cx.globalCompositeOperation = 'source-atop'; cx.globalAlpha = p.opacity; cx.drawImage(b, 0, 0); cx.restore();
+    if (b !== s) Pool.put(b); Pool.put(s);
+  } };
+FX.motionblur = { label: 'Motion blur', params: { frames: [4, 1, 30, 1], skip: [1, 1, 20, 1], start: [0.15, 0, 1, 0.01], end: [0.6, 0, 1, 0.01], radius: [0, 0, 100, 0.5], subframe: [false], percent: [50, 1, 100, 1] },
+  apply(c, p, sc, R, L) {
+    if (R.noTrail || (actActive() && !actHasAnimation(L))) return;
+    const x = c.getContext('2d'), acc = Pool.get(c.width, c.height), ax = acc.getContext('2d'), t = Pool.get(c.width, c.height), n = Math.max(1, Math.round(p.frames));
+    ax.setTransform(1, 0, 0, 1, 0, 0); ax.clearRect(0, 0, acc.width, acc.height);
+    for (let i = n; i >= 1; i--) {
+      // Legacy: separate copies at earlier frames. Sub-frame: samples inside the frame's exposure interval.
+      const ff = p.subframe ? R.f - (i / n) * (p.percent / 100) : R.f - i * Math.round(p.skip);
+      if (ff < 0) continue;
+      const tx = t.getContext('2d'); tx.setTransform(1, 0, 0, 1, 0, 0); tx.clearRect(0, 0, t.width, t.height);
+      renderScene(tx, ff, R.view, { only: L.id, noTrail: true, export: R.export });
+      ax.globalAlpha = n === 1 ? p.end : lerp(p.end, p.start, (i - 1) / (n - 1)); ax.drawImage(t, 0, 0);
+    }
+    ax.globalAlpha = 1;
+    const b = p.radius > 0 ? blurred(acc, p.radius * sc) : acc;
+    x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'destination-over'; x.drawImage(b, 0, 0); x.restore();
+    if (b !== acc) Pool.put(b); Pool.put(acc, t);
+  } };
+
+// ---------- render integration ----------
+function camImmune(L) { return !!(L.immuneCam || ancestors(L.id).some((a) => a.immuneCam)); }
+const lsOldDrawLayer = drawLayer;
+drawLayer = function (ctx, L, R, pc) {
+  if (L.hideEdit && !R.export) return;
+  if (!camImmune(L)) return lsOldDrawLayer(ctx, L, R, pc);
+  const cam = R.cam; R.cam = () => M.I();
+  try { return lsOldDrawLayer(ctx, L, R, pc); } finally { R.cam = cam; }
+};
+const lsOldDrawContent = drawContent;
+drawContent = function (ctx, L, R, lc) {
+  const mode = maskMode(L);
+  if ((L.type === 'group' || L.type === 'bone') && (mode === 'hide' || mode === 'reveal') && L.children.length && !R.only) return lsWithChildList(L, () => lsMaskedContent(ctx, L, R, lc));
+  if ((L.type === 'group' || L.type === 'bone') && L.depthSort) return lsWithChildList(L, () => lsOldDrawContent(ctx, L, R, lc), depthSorted(L, L.children, R.f));
+  return lsOldDrawContent(ctx, L, R, lc);
+};
+// Container children are drawn by drawList through drawContent; swapping drawList for one call routes them here.
+function lsWithChildList(L, fn, order) {
+  if (!order) return fn();
+  const original = L.children; L.children = order;
+  try { return fn(); } finally { L.children = original; }
+}
+function lsMaskedContent(ctx, L, R, lc) {
+  const list = drawList;
+  drawList = (c, kids, R2, cpc) => { drawList = list; drawMaskedChildren(c, { ...L, children: depthSorted(L, kids, R2.f) }, R2, cpc); };
+  try { return lsOldDrawContent(ctx, L, R, lc); } finally { drawList = list; }
+}
+
+// ---------- Layer Settings window ----------
+const LS_COLORS = [['', 'None'], ['#ff5d5d', 'Red'], ['#ff8a3d', 'Orange'], ['#ffd23f', 'Yellow'], ['#5ccf8a', 'Green'], ['#4dabf7', 'Blue'], ['#b26bff', 'Purple'], ['#9aa0a6', 'Gray']];
+const LS_BLENDS = [['source-over', 'Normal'], ['multiply', 'Multiply'], ['screen', 'Screen'], ['overlay', 'Overlay'], ['lighter', 'Add'], ['darken', 'Darken'], ['lighten', 'Lighten'], ['color-dodge', 'Color dodge'], ['difference', 'Difference']];
+function lsFx(L, type) { return L.fx.find((e) => e.type === type) || null; }
+function lsFxGet(L, type, k) { const e = lsFx(L, type); return e ? val(L, 'fx:' + e.id + ':' + k, S.frame) : fxDefaults(type)[k]; }
+function lsFxOn(L, type) { const e = lsFx(L, type); return !!(e && e.on); }
+function lsFxSet(L, type, on, params = {}) {
+  let e = lsFx(L, type);
+  if (!e && !on) return;
+  if (!e) { e = { id: uid('fx'), type, on: true, p: { ...fxDefaults(type) } }; L.fx.push(e); }
+  e.on = !!on;
+  for (const [k, v] of Object.entries(params)) { const spec = FX[type].params[k]; setVal(L, 'fx:' + e.id + ':' + k, typeof spec[0] === 'number' ? clamp(+v, spec[1], spec[2]) : v); }
+}
+const isChildOfContainer = (L) => { const p = parentOf(L.id); return !!(p && (p.type === 'group' || p.type === 'bone')); };
+const anyType = () => true, art = (L) => L.type !== 'audio';
+// Each setting: tab, control, which layers it applies to, how to read and write it. 'anim' marks animatable values.
+const LS_FIELDS = [
+  // General
+  { k: 'name', tab: 'General', label: 'Name', type: 'text', when: anyType, primary: true, get: (L) => L.name, set: (L, v) => { if (String(v).trim()) L.name = String(v).trim().slice(0, 200); } },
+  { k: 'label', tab: 'General', label: 'Layer color (label only)', type: 'select', opts: LS_COLORS, when: anyType, get: (L) => L.label || '', set: (L, v) => { L.label = v; } },
+  { k: 'tags', tab: 'General', label: 'Tags', type: 'text', when: anyType, get: (L) => L.tags || '', set: (L, v) => { L.tags = String(v).slice(0, 1000); } },
+  { k: 'comment', tab: 'General', label: 'Comments', type: 'area', when: anyType, get: (L) => L.comment || '', set: (L, v) => { L.comment = String(v).slice(0, 10000); } },
+  { k: 'ignoreSelector', tab: 'General', label: 'Ignored by layer selector', type: 'check', when: art, get: (L) => !!L.ignoreSelector, set: (L, v) => { L.ignoreSelector = !!v; } },
+  { k: 'hideEdit', tab: 'General', label: 'Hide in editing (still renders)', type: 'check', when: art, get: (L) => !!L.hideEdit, set: (L, v) => { L.hideEdit = !!v; } },
+  { k: 'dontRender', tab: 'General', label: "Don't render (guides and helpers)", type: 'check', when: art, get: (L) => !L.render, set: (L, v) => { L.render = !v; } },
+  { k: 'visible', tab: 'General', label: 'Visible', type: 'check', anim: true, when: art, get: (L) => val(L, 'visible', S.frame) !== false, set: (L, v) => setVal(L, 'visible', !!v) },
+  { k: 'opacity', tab: 'General', label: 'Opacity %', type: 'num', min: 0, max: 100, step: 1, anim: true, when: art, get: (L) => round(val(L, 'opacity', S.frame) * 100, 2), set: (L, v) => setVal(L, 'opacity', clamp(+v, 0, 100) / 100) },
+  { k: 'blend', tab: 'General', label: 'Blending mode', type: 'select', opts: LS_BLENDS, when: art, get: (L) => L.blend || 'source-over', set: (L, v) => { L.blend = v; } },
+  { k: 'blur', tab: 'General', label: 'Blur radius (0 = off)', type: 'num', min: 0, max: 200, step: 0.5, anim: true, when: art, get: (L) => lsFxOn(L, 'blur') ? lsFxGet(L, 'blur', 'radius') : 0, set: (L, v) => lsFxSet(L, 'blur', +v > 0, +v > 0 ? { radius: +v } : {}) },
+  { k: 'noise', tab: 'General', label: 'Noise amount (0 = off)', type: 'num', min: 0, max: 1, step: 0.01, anim: true, when: art, get: (L) => lsFxOn(L, 'noise') ? lsFxGet(L, 'noise', 'amount') : 0, set: (L, v) => lsFxSet(L, 'noise', +v > 0, +v > 0 ? { amount: +v } : {}) },
+  { k: 'pixelate', tab: 'General', label: 'Pixelation (0 = off)', type: 'num', min: 0, max: 200, step: 1, anim: true, when: art, get: (L) => lsFxOn(L, 'pixelate') ? lsFxGet(L, 'pixelate', 'size') : 0, set: (L, v) => lsFxSet(L, 'pixelate', +v > 0, +v > 0 ? { size: Math.max(1, +v) } : {}) },
+  { k: 'outline', tab: 'General', label: 'Layer outline', type: 'check', when: art, get: (L) => lsFxOn(L, 'outline'), set: (L, v) => lsFxSet(L, 'outline', v) },
+  { k: 'outlineWidth', tab: 'General', label: 'Outline width', type: 'num', min: 0, max: 100, step: 0.5, anim: true, when: art, get: (L) => lsFxGet(L, 'outline', 'width'), set: (L, v) => lsFx(L, 'outline') && lsFxSet(L, 'outline', lsFxOn(L, 'outline'), { width: +v }) },
+  { k: 'outlineColor', tab: 'General', label: 'Outline color', type: 'color', when: art, get: (L) => lsFxGet(L, 'outline', 'color'), set: (L, v) => lsFx(L, 'outline') && lsFxSet(L, 'outline', lsFxOn(L, 'outline'), { color: v }) },
+  { k: 'colorize', tab: 'General', label: 'Colorize', type: 'check', when: art, get: (L) => lsFxOn(L, 'tint'), set: (L, v) => lsFxSet(L, 'tint', v) },
+  { k: 'colorizeColor', tab: 'General', label: 'Colorize color', type: 'color', when: art, get: (L) => lsFxGet(L, 'tint', 'color'), set: (L, v) => lsFx(L, 'tint') && lsFxSet(L, 'tint', lsFxOn(L, 'tint'), { color: v }) },
+  { k: 'flipH', tab: 'General', label: 'Flip horizontally', type: 'check', when: art, get: (L) => !!L.flipH, set: (L, v) => { L.flipH = !!v; } },
+  { k: 'flipV', tab: 'General', label: 'Flip vertically', type: 'check', when: art, get: (L) => !!L.flipV, set: (L, v) => { L.flipV = !!v; } },
+  { k: 'immuneCam', tab: 'General', label: 'Immune to camera movements', type: 'check', when: art, get: (L) => !!L.immuneCam, set: (L, v) => { L.immuneCam = !!v; } },
+  // Shadows
+  { k: 'shadow', tab: 'Shadows', label: 'Layer shadow', type: 'check', when: art, get: (L) => lsFxOn(L, 'shadow'), set: (L, v) => lsFxSet(L, 'shadow', v) },
+  ...[['dx', 'Shadow offset X', -500, 500, 0.5], ['dy', 'Shadow offset Y', -500, 500, 0.5], ['softness', 'Shadow blur', 0, 200, 0.5], ['opacity', 'Shadow opacity', 0, 1, 0.01]].map(([p, label, min, max, step]) =>
+    ({ k: 'shadow_' + p, tab: 'Shadows', label, type: 'num', min, max, step, anim: true, when: art, get: (L) => lsFxGet(L, 'shadow', p), set: (L, v) => lsFx(L, 'shadow') && lsFxSet(L, 'shadow', lsFxOn(L, 'shadow'), { [p]: +v }) })),
+  { k: 'shadow_color', tab: 'Shadows', label: 'Shadow color', type: 'color', when: art, get: (L) => lsFxGet(L, 'shadow', 'color'), set: (L, v) => lsFx(L, 'shadow') && lsFxSet(L, 'shadow', lsFxOn(L, 'shadow'), { color: v }) },
+  { k: 'shading', tab: 'Shadows', label: 'Layer shading (inside the artwork)', type: 'check', when: art, get: (L) => lsFxOn(L, 'shading'), set: (L, v) => lsFxSet(L, 'shading', v) },
+  ...[['angle', 'Shading direction °', -180, 180, 1], ['offset', 'Shading offset', 0, 500, 0.5], ['blur', 'Shading blur', 0, 200, 0.5], ['opacity', 'Shading opacity', 0, 1, 0.01]].map(([p, label, min, max, step]) =>
+    ({ k: 'shading_' + p, tab: 'Shadows', label, type: 'num', min, max, step, anim: true, when: art, get: (L) => lsFxGet(L, 'shading', p), set: (L, v) => lsFx(L, 'shading') && lsFxSet(L, 'shading', lsFxOn(L, 'shading'), { [p]: +v }) })),
+  { k: 'shading_color', tab: 'Shadows', label: 'Shading color', type: 'color', when: art, get: (L) => lsFxGet(L, 'shading', 'color'), set: (L, v) => lsFx(L, 'shading') && lsFxSet(L, 'shading', lsFxOn(L, 'shading'), { color: v }) },
+  // Motion Blur
+  { k: 'mb', tab: 'Motion Blur', label: 'Motion blur', type: 'check', when: art, get: (L) => lsFxOn(L, 'motionblur'), set: (L, v) => lsFxSet(L, 'motionblur', v) },
+  ...[['frames', 'Frame count', 1, 30, 1], ['skip', 'Frame skip', 1, 20, 1], ['start', 'Start opacity', 0, 1, 0.01], ['end', 'End opacity', 0, 1, 0.01], ['radius', 'Blur radius', 0, 100, 0.5], ['percent', 'Frame percentage (sub-frame)', 1, 100, 1]].map(([p, label, min, max, step]) =>
+    ({ k: 'mb_' + p, tab: 'Motion Blur', label, type: 'num', min, max, step, anim: true, when: art, get: (L) => lsFxGet(L, 'motionblur', p), set: (L, v) => lsFx(L, 'motionblur') && lsFxSet(L, 'motionblur', lsFxOn(L, 'motionblur'), { [p]: +v }) })),
+  { k: 'mb_subframe', tab: 'Motion Blur', label: 'Sub-frame motion blur', type: 'check', when: art, get: (L) => !!lsFxGet(L, 'motionblur', 'subframe'), set: (L, v) => lsFx(L, 'motionblur') && lsFxSet(L, 'motionblur', lsFxOn(L, 'motionblur'), { subframe: !!v }) },
+  // Masking
+  { k: 'mask', tab: 'Masking', label: 'Group masking', type: 'select', opts: MASK_MODES, when: (L) => L.type === 'group' || L.type === 'bone', optsFor: (L) => MASK_LEGACY.some(([v]) => v === L.mask) ? MASK_MODES.concat(MASK_LEGACY) : MASK_MODES, get: (L) => L.mask || 'none', set: (L, v) => { L.mask = v; } },
+  { k: 'maskRole', tab: 'Masking', label: 'This layer', type: 'select', opts: MASK_ROLES, when: isChildOfContainer, get: (L) => maskRole(L), set: (L, v) => { if (v === 'mask') delete L.maskRole; else L.maskRole = v; } },
+  { k: 'maskNoStroke', tab: 'Masking', label: 'Exclude strokes from its mask contribution', type: 'check', when: (L) => isChildOfContainer(L) && L.type === 'vector', get: (L) => !!L.maskNoStroke, set: (L, v) => { L.maskNoStroke = !!v; } },
+  { k: 'maskExpand', tab: 'Masking', label: 'Expand mask by a pixel', type: 'check', when: isChildOfContainer, get: (L) => !!L.maskExpand, set: (L, v) => { L.maskExpand = !!v; } },
+  // Depth Sort
+  { k: 'depthSort', tab: 'Depth Sort', label: 'Sort layers by depth', type: 'check', when: (L) => L.type === 'group' || L.type === 'bone', get: (L) => !!L.depthSort, set: (L, v) => { L.depthSort = !!v; } },
+  { k: 'trueDistance', tab: 'Depth Sort', label: 'Sort by true distance', type: 'check', when: (L) => L.type === 'group' || L.type === 'bone', get: (L) => !!L.trueDistance, set: (L, v) => { L.trueDistance = !!v; } },
+  // Bones
+  { k: 'autoBind', tab: 'Bones', label: 'Flexible (region) binding from bone strength', type: 'check', when: (L) => L.type === 'bone', get: (L) => L.autoBind !== false, set: (L, v) => { if (v) delete L.autoBind; else L.autoBind = false; } },
+  { k: 'nested', tab: 'Bones', label: 'Allow nested layer control', type: 'check', when: (L) => L.type === 'bone', get: (L) => L.nested !== false, set: (L, v) => { if (v) delete L.nested; else L.nested = false; } },
+  // Layer-type tabs
+  { k: 'swMode', tab: 'Switch', label: 'Interpolation between alternatives', type: 'select', opts: [['discrete', 'Off (instant switch)'], ['crossfade', 'Crossfade']], when: (L) => L.type === 'switch', get: (L) => L.swMode || 'discrete', set: (L, v) => { L.swMode = v; } },
+  { k: 'swFade', tab: 'Switch', label: 'Crossfade frames', type: 'num', min: 1, max: 120, step: 1, when: (L) => L.type === 'switch', get: (L) => L.swFade || 4, set: (L, v) => { L.swFade = clamp(Math.round(+v), 1, 120); } },
+  ...[['rate', 'Emission rate', 0, 10000, 1], ['life', 'Lifetime (s)', 0.05, 60, 0.05], ['speed', 'Velocity', 0, 10000, 1], ['spread', 'Spread °', 0, 360, 1], ['gravity', 'Acceleration (gravity)', -10000, 10000, 1], ['drag', 'Damping', 0, 10, 0.05]].map(([p, label, min, max, step]) =>
+    ({ k: 'pt_' + p, tab: 'Particles', label, type: 'num', min, max, step, anim: true, when: (L) => L.type === 'particle', get: (L) => val(L, p, S.frame), set: (L, v) => setVal(L, p, clamp(+v, min, max)) })),
+  { k: 'gain', tab: 'Audio', label: 'Level', type: 'num', min: 0, max: 4, step: 0.05, anim: true, when: (L) => L.type === 'audio', get: (L) => val(L, 'gain', S.frame), set: (L, v) => setVal(L, 'gain', clamp(+v, 0, 4)) },
+  { k: 'mute', tab: 'Audio', label: 'Mute', type: 'check', when: (L) => L.type === 'audio', get: (L) => !!L.mute, set: (L, v) => { L.mute = !!v; } },
+  { k: 'text', tab: 'Text', label: 'Text', type: 'area', when: (L) => L.type === 'text', get: (L) => L.text, set: (L, v) => { L.text = String(v).slice(0, 10000); } },
+  { k: 'textSize', tab: 'Text', label: 'Size', type: 'num', min: 1, max: 2000, step: 1, when: (L) => L.type === 'text', get: (L) => L.size, set: (L, v) => { L.size = clamp(+v, 1, 2000); } },
+];
+const LS_TAB_ORDER = ['General', 'Shadows', 'Motion Blur', 'Masking', 'Depth Sort', 'Bones', 'Switch', 'Particles', 'Audio', 'Text', 'Info'];
+function lsTargets() { const P = selLayer(); if (!P) return []; return [P, ...S.selLayers.map((id) => findLayer(id)).filter((L) => L && L !== P)]; }
+function lsReadForm(root) {
+  const o = {};
+  root.querySelectorAll('[data-ls]').forEach((i) => { o[i.dataset.ls] = i.type === 'checkbox' ? !!i.checked : i.value; });
+  return o;
+}
+// Pure core of Apply: write each changed field to every target layer it applies to. Returns the number of writes.
+function lsApply(targets, before, now) {
+  const changed = LS_FIELDS.filter((f) => f.k in now && String(now[f.k]) !== String(before[f.k]));
+  if (!changed.length || !targets.length) return 0;
+  const why = targets.map((L) => writeReason(L)).find(Boolean); if (why) { toast(why, 'err'); return 0; }
+  let n = 0;
+  edit(targets.length > 1 ? `Layer settings (${targets.length} layers)` : 'Layer settings', () => {
+    for (const f of changed) for (const L of (f.primary ? targets.slice(0, 1) : targets)) if (f.when(L)) { let v = now[f.k]; if (f.type === 'num') { v = +v; if (!Number.isFinite(v)) continue; } f.set(L, v); n++; }
+  });
+  return n;
+}
+function lsControl(f, L) {
+  const v = f.get(L), id = 'ls_' + f.k, opts = f.optsFor ? f.optsFor(L) : f.opts;
+  const tag = f.anim ? ` <span class="ls-anim" title="Animatable: in Animate mode this writes a key at frame ${S.frame}">◆</span>` : '';
+  if (f.type === 'check') return `<label class="ls-row ls-check"><input type="checkbox" id="${id}" data-ls="${f.k}" ${v ? 'checked' : ''}> ${esc(f.label)}${tag}</label>`;
+  let input;
+  if (f.type === 'select') input = `<select id="${id}" data-ls="${f.k}">${opts.map(([o, n]) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>`;
+  else if (f.type === 'area') input = `<textarea id="${id}" data-ls="${f.k}" rows="3">${esc(v)}</textarea>`;
+  else if (f.type === 'num') input = `<input type="number" id="${id}" data-ls="${f.k}" value="${round(+v, 4)}" min="${f.min}" max="${f.max}" step="${f.step}">`;
+  else if (f.type === 'color') input = `<input type="color" id="${id}" data-ls="${f.k}" value="${esc(v)}">`;
+  else input = `<input type="text" id="${id}" data-ls="${f.k}" value="${esc(v)}">`;
+  return `<label class="ls-row" for="${id}"><span>${esc(f.label)}${tag}</span>${input}</label>`;
+}
+function lsInfo(L) {
+  const kids = () => (L.children || []).length;
+  const lines = { vector: () => `${Object.keys(L.pts || {}).length} points · ${(L.shapes || []).length} shapes. Liquid Shapes (Add / Subtract / Clip / Blend / Merge) are in the Select Shape tool (Q).`,
+    image: () => `Source: ${esc((S.media[L.media] || {}).name || L.media || 'none')} · ${L.iw}×${L.ih}. Replace the image or set bone warping from the Properties panel.`,
+    group: () => `${kids()} child layer(s).`, bone: () => `${(L.bones || []).length} bone(s) · ${kids()} child layer(s).`, switch: () => `${kids()} alternative(s).` }[L.type]?.();
+  return `<div class="note">${lines || 'No extra settings for this layer type.'} Position, scale, rotation and origin are edited with the layer tools.</div>`;
+}
+function openLayerSettings() {
+  const targets = lsTargets(), L = targets[0];
+  if (!L) return toast('Select a layer first', 'err');
+  const fields = LS_FIELDS.filter((f) => f.when(L)), tabs = LS_TAB_ORDER.filter((t) => t === 'Info' || fields.some((f) => f.tab === t));
+  const m = $('#modal');
+  const body = tabs.map((t, i) => `<div class="ls-pane" data-pane="${t}" ${i ? 'hidden' : ''}>${t === 'Info' ? lsInfo(L) : fields.filter((f) => f.tab === t).map((f) => lsControl(f, L)).join('')}${t === 'Masking' ? '<div class="note">Children are processed from the bottom of the stack upward: put mask contributors below the artwork they limit. “Hide all” shows nothing until a child adds to the mask.</div>' : ''}</div>`).join('');
+  const mode = S.mode === 'setup' ? 'Setup' : `Animate · frame ${S.frame}`;
+  m.innerHTML = `<div class="dlg ls-dlg"><h3>Layer Settings — ${esc(L.name)}${targets.length > 1 ? ` <small>(+${targets.length - 1} more selected)</small>` : ''}<span class="x" data-v="__x">✕</span></h3>
+    <div class="ls-tabs">${tabs.map((t, i) => `<button class="btn ${i ? '' : 'pri'}" data-lstab="${t}">${t}</button>`).join('')}</div>
+    <div class="db ls-body">${body}<div class="note">${mode}. ◆ settings are animatable. Changes apply to ${targets.length > 1 ? 'all selected layers where the setting exists (the name only to ' + esc(L.name) + ')' : 'this layer'}.</div></div>
+    <div class="df"><button class="btn" data-lsbtn="cancel">Cancel</button><button class="btn" data-lsbtn="apply">Apply</button><button class="btn pri" data-lsbtn="ok">OK</button></div></div>`;
+  m.classList.add('show');
+  const root = m.querySelector('.ls-body');
+  let before = lsReadForm(root);
+  const close = () => { m.classList.remove('show'); m.innerHTML = ''; refreshAll(); };
+  const apply = () => { const now = lsReadForm(root), n = lsApply(lsTargets(), before, now); before = now; if (n) toast(`Applied ${n} change(s)`, 'ok'); return n; };
+  m.querySelector('[data-v="__x"]').onclick = close;
+  m.querySelectorAll('[data-lstab]').forEach((b) => (b.onclick = () => { m.querySelectorAll('[data-lstab]').forEach((x) => x.classList.toggle('pri', x === b)); m.querySelectorAll('[data-pane]').forEach((p) => { p.hidden = p.dataset.pane !== b.dataset.lstab; }); }));
+  m.querySelectorAll('[data-lsbtn]').forEach((b) => (b.onclick = () => { const a = b.dataset.lsbtn; if (a === 'cancel') return close(); apply(); if (a === 'ok') close(); }));
+  return { root, apply, close };
+}
+cmd('layer.settings', 'Window', 'Layer Settings…', () => openLayerSettings(), { k: 'Ctrl+Shift+I', keys: 'ctrl+shift+i', en: () => (selLayer() ? false : 'Select a layer'), kw: 'properties masking shadow motion blur depth' });
+const lsOldInitLayers = initLayersPanel;
+initLayersPanel = function () {
+  lsOldInitLayers();
+  const del = $('#lyDel');
+  if (del && !$('#lySettings')) { const b = document.createElement('button'); b.className = 'ib sm'; b.id = 'lySettings'; b.title = 'Layer Settings (Ctrl+Shift+I)'; b.textContent = '⚙'; b.onclick = () => runCmd('layer.settings'); del.parentNode.insertBefore(b, del); }
+};
+
+// ---------- Liquid Shapes ----------
+const LIQUID_OPS = ['add', 'sub', 'clip'];
+// Shapes are drawn in array order (first = bottom). A filled shape marked Add / Subtract / Clip joins the nearest
+// ordinary shape below it, forming a live cluster.
+function liquidClusters(L) {
+  const out = []; let cur = null;
+  for (const sh of L.shapes || []) {
+    if (LIQUID_OPS.includes(sh.liquid) && cur) cur.members.push(sh);
+    else { cur = { base: sh, members: [] }; out.push(cur); }
+  }
+  return out;
+}
+function liquidClusterOf(L, sh) { return liquidClusters(L).find((c) => c.base === sh || c.members.includes(sh)) || null; }
+function liquidBlend(L, sh, f) { return clamp(+val(L, 'sh:' + sh.id + ':blend', f) || 0, 0, 100); }
+function liquidPath(L, sh, P, f, lc) { const p = new Path2D(); for (const id of sh.paths) { const path = L.paths.find((q) => q.id === id); if (path) tracePath(p, L, path, P, f, lc); } return p; }
+function liquidScreenBox(L, shapes, P, full, pad) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const sh of shapes) for (const id of sh.paths) { const path = L.paths.find((q) => q.id === id); if (!path) continue; for (const pid of path.pts) { const q = P[pid] && M.ap(full, ...P[pid]); if (!q) continue; x0 = Math.min(x0, q[0]); y0 = Math.min(y0, q[1]); x1 = Math.max(x1, q[0]); y1 = Math.max(y1, q[1]); } }
+  return x0 > x1 ? null : [Math.floor(x0 - pad), Math.floor(y0 - pad), Math.ceil(x1 + pad), Math.ceil(y1 + pad)];
+}
+// Smooth union/difference: blur the silhouette and re-threshold it, keeping the sharp result inside (union) or outside (difference).
+function drawLiquidCluster(ctx, L, R, lc, cl, P) {
+  const f = R.f, sc = M.scaleOf(lc.full) || 1, base = cl.base, bst = shapeStyle(L, base, f), hw = bst.strokeOn ? Math.max(0.5, (bst.width || 0) * sc / 2) : 0;
+  // Everything happens on canvases the size of the cluster's bounding box (Add/Clip never grow past it; Subtract only removes).
+  const grow = [base, ...cl.members.filter((m) => m.liquid === 'add')], raw = liquidScreenBox(L, grow, P, lc.full, 0);
+  if (!raw) return;
+  const span = Math.max(raw[2] - raw[0], raw[3] - raw[1]), pad = Math.ceil(0.08 * span + hw + 4);
+  const bx = Math.max(0, raw[0] - pad), by = Math.max(0, raw[1] - pad), W = Math.min(R.W, raw[2] + pad) - bx, H = Math.min(R.H, raw[3] + pad) - by;
+  if (W <= 0 || H <= 0) return;
+  const full = M.mul(M.t(-bx, -by), lc.full), all = [base, ...cl.members];
+  const sil = Pool.get(W, H), sx = sil.getContext('2d');
+  const reset = (x) => { x.setTransform(1, 0, 0, 1, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = 'source-over'; x.filter = 'none'; };
+  reset(sx); sx.clearRect(0, 0, W, H); M.set(sx, full); sx.fillStyle = '#000'; sx.fill(liquidPath(L, base, P, f, lc), 'evenodd'); reset(sx);
+  for (const m of cl.members) {
+    if (m.liquid === 'clip') continue;
+    const blend = liquidBlend(L, m, f), mp = liquidPath(L, m, P, f, lc);
+    const mb = liquidScreenBox(L, [m], P, lc.full, 0), size = mb ? Math.min(mb[2] - mb[0], mb[3] - mb[1]) : 0, r = blend / 100 * 0.35 * size;
+    M.set(sx, full); sx.globalCompositeOperation = m.liquid === 'sub' ? 'destination-out' : 'source-over'; sx.fillStyle = '#000'; sx.fill(mp, 'evenodd'); reset(sx);
+    if (r >= 0.75 && mb && typeof sx.getImageData === 'function') liquidSmoothCanvas(sx, mp, full, [mb[0] - bx, mb[1] - by, mb[2] - bx, mb[3] - by], W, H, r, m.liquid);
+  }
+  // Colour: the base fill fills the silhouette; Add and Clip members keep their own colours inside it.
+  const out = Pool.get(W, H), ox = out.getContext('2d'); reset(ox); ox.clearRect(0, 0, W, H);
+  if (bst.fillOn) { ox.drawImage(sil, 0, 0); ox.globalCompositeOperation = 'source-in'; ox.fillStyle = bst.fill; ox.fillRect(0, 0, W, H); reset(ox); }
+  for (const m of cl.members) {
+    if (m.liquid === 'sub') continue;
+    const st = shapeStyle(L, m, f); if (!st.fillOn && !st.strokeOn) continue;
+    M.set(ox, full); ox.globalCompositeOperation = 'source-atop'; const mp = liquidPath(L, m, P, f, lc);
+    if (st.fillOn) { ox.fillStyle = st.fill; ox.fill(mp, 'evenodd'); }
+    if (m.liquid === 'clip' && st.strokeOn && st.width > 0) { ox.lineWidth = st.width; ox.strokeStyle = st.stroke; ox.lineJoin = 'round'; ox.stroke(mp); }
+    reset(ox);
+  }
+  if (!bst.fillOn) { ox.globalCompositeOperation = 'destination-in'; ox.drawImage(sil, 0, 0); reset(ox); }
+  // One outline around the combined silhouette, centred on its edge (dilate minus erode by half the width).
+  let band = null;
+  if (hw > 0) {
+    const n = Math.min(16, Math.max(8, Math.ceil(hw * 2))), dirs = Array.from({ length: n }, (_, i) => [Math.cos(i * 2 * Math.PI / n) * hw, Math.sin(i * 2 * Math.PI / n) * hw]);
+    band = Pool.get(W, H); const bx2 = band.getContext('2d'); reset(bx2); bx2.clearRect(0, 0, W, H);
+    for (const [dx, dy] of dirs) bx2.drawImage(sil, dx, dy);
+    const er = Pool.get(W, H), ex = er.getContext('2d'); reset(ex); ex.clearRect(0, 0, W, H); ex.drawImage(sil, 0, 0); ex.globalCompositeOperation = 'destination-in'; for (const [dx, dy] of dirs) ex.drawImage(sil, dx, dy); reset(ex);
+    bx2.globalCompositeOperation = 'destination-out'; bx2.drawImage(er, 0, 0); bx2.globalCompositeOperation = 'source-in'; bx2.fillStyle = bst.stroke; bx2.fillRect(0, 0, W, H); reset(bx2); Pool.put(er);
+  }
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(out, bx, by); if (band) ctx.drawImage(band, bx, by); ctx.restore();
+  Pool.put(sil, out); if (band) Pool.put(band);
+}
+// Blend smoothing on the silhouette canvas, limited to the member's neighbourhood. Large areas are processed at
+// reduced resolution and applied as a correction, so outline pixels the smoothing does not change stay exact.
+function liquidSmoothCanvas(sx, mp, full, mb, W, H, r, op) {
+  const reach = Math.ceil(3 * r + 4), x0 = Math.max(0, Math.floor(mb[0] - reach)), y0 = Math.max(0, Math.floor(mb[1] - reach)), w = Math.min(W, Math.ceil(mb[2] + reach)) - x0, h = Math.min(H, Math.ceil(mb[3] + reach)) - y0;
+  if (w <= 0 || h <= 0) return;
+  const img = sx.getImageData(x0, y0, w, h); if (!img || !img.data) return;
+  const mem = Pool.get(W, H), mx = mem.getContext('2d'); mx.setTransform(1, 0, 0, 1, 0, 0); mx.clearRect(0, 0, W, H); M.set(mx, full); mx.fillStyle = '#000'; mx.fill(mp, 'evenodd'); mx.setTransform(1, 0, 0, 1, 0, 0);
+  const md = mx.getImageData(x0, y0, w, h).data; Pool.put(mem);
+  const k = Math.max(1, Math.sqrt(w * h / 90000)), lw = Math.ceil(w / k), lh = Math.ceil(h / k), pd = Math.ceil(r / k) + 2, pw = lw + 2 * pd, ph = lh + 2 * pd;
+  const a = new Float32Array(pw * ph), mm = new Uint8Array(pw * ph), cnt = new Float32Array(pw * ph), mc = new Float32Array(pw * ph);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const q = (Math.floor(y / k) + pd) * pw + Math.floor(x / k) + pd, i = (y * w + x) * 4; a[q] += img.data[i + 3] / 255; mc[q] += md[i + 3] / 255; cnt[q]++; }
+  for (let q = 0; q < a.length; q++) if (cnt[q]) { a[q] /= cnt[q]; mm[q] = mc[q] / cnt[q] >= 0.5 ? 1 : 0; }
+  const res = liquidSmooth(a, mm, pw, ph, r / k, op), delta = new Float32Array(pw * ph); for (let q = 0; q < delta.length; q++) delta[q] = res[q] - a[q];
+  const at = (arr, fx, fy) => { const gx = clamp(fx / k - 0.5 + pd, 0, pw - 1), gy = clamp(fy / k - 0.5 + pd, 0, ph - 1), ix = Math.min(pw - 2, Math.floor(gx)), iy = Math.min(ph - 2, Math.floor(gy)), tx = gx - ix, ty = gy - iy;
+    return (arr[iy * pw + ix] * (1 - tx) + arr[iy * pw + ix + 1] * tx) * (1 - ty) + (arr[(iy + 1) * pw + ix] * (1 - tx) + arr[(iy + 1) * pw + ix + 1] * tx) * ty; };
+  const snap = (v) => clamp((v - 0.5) * 2.5 + 0.5, 0, 1);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4, d = k === 1 ? delta[(y + pd) * pw + x + pd] : at(delta, x + 0.5, y + 0.5); if (Math.abs(d) < 0.004) continue;
+    const o = img.data[i + 3] / 255; let v;
+    if (k === 1) v = clamp(o + d, 0, 1);
+    else { const sm = snap(at(res, x + 0.5, y + 0.5)), cor = snap(clamp(o + d, 0, 1)); v = op === 'sub' ? Math.min(cor, sm) : Math.max(cor, sm); }
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = 0; img.data[i + 3] = Math.round((op === 'sub' ? Math.min(o, v) : Math.max(o, v)) * 255);
+  }
+  sx.putImageData(img, x0, y0);
+}
+// Exact Euclidean distance transform (Felzenszwalb & Huttenlocher): distance from each cell to the nearest set cell.
+function liquidEDT(set, w, h) {
+  const INF = 1e20, g = new Float64Array(w * h), n = Math.max(w, h), f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  for (let i = 0; i < w * h; i++) g[i] = set[i] ? 0 : INF;
+  const pass = (len) => { let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) { let s2; for (;;) { const p = v[k]; s2 = ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p); if (s2 <= z[k] && k > 0) k--; else break; } if (s2 <= z[k]) { v[0] = q; z[0] = -INF; z[1] = INF; k = 0; continue; } k++; v[k] = q; z[k] = s2; z[k + 1] = INF; }
+    k = 0; for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const p = v[k]; d[q] = (q - p) * (q - p) + f[p]; } };
+  for (let x = 0; x < w; x++) { for (let y = 0; y < h; y++) f[y] = g[y * w + x]; pass(h); for (let y = 0; y < h; y++) g[y * w + x] = d[y]; }
+  for (let y = 0; y < h; y++) { for (let x = 0; x < w; x++) f[x] = g[y * w + x]; pass(w); for (let x = 0; x < w; x++) g[y * w + x] = Math.sqrt(d[x]); }
+  return g;
+}
+// Blend as a radius: Add fills the joint with fillets (morphological closing), Subtract rounds the cut's corners
+// (opening). Both act only within twice the radius of the member, so the rest of the outline stays exact.
+function liquidSmooth(alpha, member, w, h, r, op) {
+  const inside = new Uint8Array(w * h); for (let i = 0; i < inside.length; i++) inside[i] = alpha[i] >= 0.5 ? 1 : 0;
+  const near = liquidEDT(member, w, h), out = Float32Array.from(alpha);
+  if (op === 'sub') {
+    const toOut = liquidEDT(inside.map((v) => 1 - v), w, h), eroded = new Uint8Array(w * h); for (let i = 0; i < eroded.length; i++) eroded[i] = toOut[i] > r ? 1 : 0;
+    const dE = liquidEDT(eroded, w, h); for (let i = 0; i < out.length; i++) if (near[i] <= 2 * r) out[i] = Math.min(out[i], clamp(r + 0.5 - dE[i], 0, 1));
+  } else {
+    const toIn = liquidEDT(inside, w, h), dil = new Uint8Array(w * h); for (let i = 0; i < dil.length; i++) dil[i] = toIn[i] <= r ? 1 : 0;
+    const dOut = liquidEDT(dil.map((v) => 1 - v), w, h); for (let i = 0; i < out.length; i++) if (near[i] <= 2 * r) out[i] = Math.max(out[i], clamp(dOut[i] - r + 0.5, 0, 1));
+  }
+  return out;
+}
+const liquidOldDraw = drawVectorContent;
+drawVectorContent = function (ctx, L, R, lc) {
+  const clusters = liquidClusters(L);
+  if (!clusters.some((c) => c.members.length)) return liquidOldDraw(ctx, L, R, lc);
+  const run = []; const flush = () => { if (run.length) liquidOldDraw(ctx, { ...L, shapes: run.splice(0) }, R, lc); };
+  const P = lc.P = deformedPts(L, R.f, lc);
+  for (const c of clusters) {
+    if (!c.members.length) { run.push(c.base); continue; }
+    flush(); drawLiquidCluster(ctx, L, R, lc, c, P);
+  }
+  flush(); lc.P = P;
+};
+// Merge bakes a cluster: rasterise its silhouette on a grid in drawing coordinates, smooth it like the renderer,
+// trace the contour (marching squares) and replace the base / Add / Subtract shapes with one ordinary shape.
+function liquidPolygons(L, sh, P) { return sh.paths.map((id) => L.paths.find((p) => p.id === id)).filter(Boolean).map((path) => vectorSamples(L, path, P, 0, null).map((s) => s.p)); }
+function liquidRasterFill(grid, gw, gh, polys, x0, y0, cell, op) {
+  for (let j = 0; j < gh; j++) {
+    const y = y0 + (j + 0.5) * cell, xs = [];
+    for (const poly of polys) for (let i = 0, n = poly.length; i < n; i++) { const a = poly[i], b = poly[(i + 1) % n]; if ((a[1] > y) !== (b[1] > y)) xs.push(a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1])); }
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const i0 = Math.max(0, Math.ceil((xs[k] - x0) / cell - 0.5)), i1 = Math.min(gw - 1, Math.floor((xs[k + 1] - x0) / cell - 0.5));
+      for (let i = i0; i <= i1; i++) grid[j * gw + i] = op === 'sub' ? 0 : 1;
+    }
+  }
+}
+function liquidSilhouetteGrid(L, cl, res = 360) {
+  const P = vectorPathPoints(L, 0), shapes = [cl.base, ...cl.members.filter((m) => m.liquid !== 'clip')], polys = new Map(shapes.map((s) => [s, liquidPolygons(L, s, P)]));
+  const pts = [...polys.values()].flat(2); if (!pts.length) return null;
+  let x0 = Math.min(...pts.map((p) => p[0])), y0 = Math.min(...pts.map((p) => p[1])), x1 = Math.max(...pts.map((p) => p[0])), y1 = Math.max(...pts.map((p) => p[1]));
+  const cell = Math.max(x1 - x0, y1 - y0, 1) / res, maxBlend = Math.max(0, ...cl.members.map((m) => liquidBlend(L, m, 0))), pad = cell * 4 + maxBlend / 100 * 0.35 * Math.max(x1 - x0, y1 - y0); x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  const gw = Math.ceil((x1 - x0) / cell), gh = Math.ceil((y1 - y0) / cell);
+  let grid = new Float32Array(gw * gh); liquidRasterFill(grid, gw, gh, polys.get(cl.base), x0, y0, cell, 'add');
+  for (const m of cl.members) {
+    if (m.liquid === 'clip') continue;
+    liquidRasterFill(grid, gw, gh, polys.get(m), x0, y0, cell, m.liquid);
+    const blend = liquidBlend(L, m, 0); if (blend <= 0) continue;
+    const mp = polys.get(m).flat(), size = Math.min(Math.max(...mp.map((p) => p[0])) - Math.min(...mp.map((p) => p[0])), Math.max(...mp.map((p) => p[1])) - Math.min(...mp.map((p) => p[1])));
+    const r = blend / 100 * 0.35 * size / cell; if (r < 0.75) continue;
+    const mem = new Float32Array(grid.length); liquidRasterFill(mem, gw, gh, polys.get(m), x0, y0, cell, 'add');
+    grid = liquidSmooth(grid, Uint8Array.from(mem, (v) => (v >= 0.5 ? 1 : 0)), gw, gh, r, m.liquid);
+  }
+  return { grid, gw, gh, x0, y0, cell };
+}
+// Marching squares on a 0..1 grid (threshold 0.5); returns closed loops in grid coordinates (cell centres).
+function liquidContours(grid, gw, gh) {
+  const v = (i, j) => (i < 0 || j < 0 || i >= gw || j >= gh ? 0 : grid[j * gw + i]);
+  const lerpE = (a, b) => (0.5 - a) / ((b - a) || 1e-9);
+  const pointOf = (key) => { const [t, i, j] = key.split(','), I = +i, J = +j; return t === 'h' ? [I + lerpE(v(I, J), v(I + 1, J)), J] : [I, J + lerpE(v(I, J), v(I, J + 1))]; };
+  const links = new Map(), link = (a, b) => { for (const [x, y] of [[a, b], [b, a]]) { if (!links.has(x)) links.set(x, []); links.get(x).push(y); } };
+  for (let j = -1; j < gh; j++) for (let i = -1; i < gw; i++) {
+    const tl = v(i, j) >= 0.5, tr = v(i + 1, j) >= 0.5, br = v(i + 1, j + 1) >= 0.5, bl = v(i, j + 1) >= 0.5, c = (tl ? 8 : 0) | (tr ? 4 : 0) | (br ? 2 : 0) | (bl ? 1 : 0);
+    if (!c || c === 15) continue;
+    const T = `h,${i},${j}`, B = `h,${i},${j + 1}`, Lf = `v,${i},${j}`, Rt = `v,${i + 1},${j}`;
+    const centre = (v(i, j) + v(i + 1, j) + v(i + 1, j + 1) + v(i, j + 1)) / 4 >= 0.5;
+    const segs = { 1: [[Lf, B]], 2: [[B, Rt]], 3: [[Lf, Rt]], 4: [[T, Rt]], 5: centre ? [[Lf, T], [B, Rt]] : [[Lf, B], [T, Rt]], 6: [[T, B]], 7: [[Lf, T]], 8: [[Lf, T]], 9: [[T, B]], 10: centre ? [[T, Rt], [Lf, B]] : [[Lf, T], [B, Rt]], 11: [[T, Rt]], 12: [[Lf, Rt]], 13: [[B, Rt]], 14: [[Lf, B]] }[c];
+    for (const [a, b] of segs) link(a, b);
+  }
+  const seen = new Set(), loops = [];
+  for (const start of links.keys()) {
+    if (seen.has(start)) continue;
+    const loop = []; let prev = null, at = start;
+    while (at && !seen.has(at)) { seen.add(at); loop.push(pointOf(at)); const next = (links.get(at) || []).find((n) => n !== prev && !seen.has(n)); prev = at; at = next; }
+    if (loop.length > 2) loops.push(loop);
+  }
+  return loops;
+}
+function liquidMerge(L, base) {
+  const cl = liquidClusterOf(L, base); if (!cl || cl.base !== base || !cl.members.some((m) => m.liquid !== 'clip')) throw new Error('Select a Liquid Shape cluster with Add or Subtract members to merge');
+  const g = liquidSilhouetteGrid(L, cl); if (!g) throw new Error('Nothing to merge');
+  const loops = liquidContours(g.grid, g.gw, g.gh).map((loop) => rdp(loop.map((p) => [g.x0 + (p[0] + 0.5) * g.cell, g.y0 + (p[1] + 0.5) * g.cell]), g.cell * 0.6)).filter((l) => l.length >= 3);
+  if (!loops.length) throw new Error('The combined shape is empty');
+  const merged = [base, ...cl.members.filter((m) => m.liquid !== 'clip')], index = L.shapes.indexOf(base), style = clone(base);
+  const pathIds = loops.map((loop) => { const ids = loop.map((p) => addPoint(L, round(p[0], 3), round(p[1], 3), 0.6)); const path = { id: uid('a'), pts: ids, closed: true }; L.paths.push(path); return path.id; });
+  const shape = { ...style, id: uid('s'), paths: pathIds }; delete shape.liquid;
+  for (const k of Object.keys(L.ch)) for (const m of merged) if (k.startsWith('sh:' + m.id + ':') && !k.endsWith(':blend')) L.ch[k.replace('sh:' + m.id + ':', 'sh:' + shape.id + ':')] = clone(L.ch[k]);
+  L.shapes = L.shapes.filter((s) => !merged.includes(s)); L.shapes.splice(Math.min(index, L.shapes.length), 0, shape);
+  deleteChannelsMatching(L, (k) => merged.some((m) => k.startsWith('sh:' + m.id + ':')));
+  const used = new Set(L.shapes.flatMap((s) => s.paths)); L.paths = L.paths.filter((p) => used.has(p.id) || !merged.some((m) => m.paths.includes(p.id)));
+  vectorCleanup(L); S.selShape = shape.id; return shape;
+}
+// Select Shape toolbar and actions
+const liquidOldOptions = vectorOptionsHTML;
+vectorOptionsHTML = function (L) {
+  let h = liquidOldOptions(L);
+  if (S.tool !== 'shapeselect' || L?.type !== 'vector') return h;
+  const sh = L.shapes.find((s) => s.id === S.selShape);
+  if (!sh) return h + '<span class="chip">Liquid Shapes: select a filled shape</span>';
+  if (!sh.fillOn) return h + '<span class="chip">Liquid Shapes work on filled shapes</span>';
+  const cl = liquidClusterOf(L, sh), op = cl && cl.base !== sh ? sh.liquid : 'normal', pos = cl ? [cl.base, ...cl.members].indexOf(sh) + 1 : 1, total = cl ? cl.members.length + 1 : 1;
+  const btn = (k, label) => `<button class="btn ${op === k ? 'pri' : ''}" data-va="liq_${k}">${label}</button>`;
+  return h + '<span class="sep"></span>' + btn('normal', 'Normal') + btn('add', 'Add') + btn('sub', 'Subtract') + btn('clip', 'Clip') +
+    vectorNum('liqblend', 'Blend %', liquidBlend(L, sh, S.frame), 0, 100, 1, ['add', 'sub'].includes(op) ? '' : 'disabled') +
+    vectorButton('liq_bottom', 'Select bottom') + vectorButton('liq_top', 'Select top') + `<span class="chip">Cluster ${pos} / ${total}</span>` + vectorButton('liq_merge', 'Merge', 'Bake the combined silhouette into one ordinary shape');
+};
+const liquidOldRun = vectorRunAction;
+vectorRunAction = function (action) {
+  if (!String(action).startsWith('liq_')) return liquidOldRun(action);
+  const L = selLayer(), sh = L?.type === 'vector' && L.shapes.find((s) => s.id === S.selShape);
+  if (!sh) return toast('Select a filled shape with Select Shape (Q)', 'err');
+  const cl = liquidClusterOf(L, sh), op = action.slice(4);
+  if (op === 'bottom' || op === 'top') { S.selShape = (op === 'bottom' ? cl.base : (cl.members.at(-1) || cl.base)).id; refreshAll(); return renderToolOpts(); }
+  if (op === 'merge') { if (!cl.members.some((m) => m.liquid !== 'clip')) return toast('Merge needs Add or Subtract shapes in the cluster', 'err'); return vectorAction('Merge liquid shapes', () => liquidMerge(L, cl.base), true); }
+  if (!sh.fillOn) return toast('Liquid Shapes work on filled shapes', 'err');
+  if (op !== 'normal' && L.shapes.indexOf(sh) === 0) return toast('Liquid Shapes combine with the shape below — this is the bottom shape', 'err');
+  return vectorAction('Liquid shape: ' + op, () => {
+    if (op === 'normal') { delete sh.liquid; return; }
+    sh.liquid = op; if (sh.blend === undefined) sh.blend = 0;
+  });
+};
+const liquidOldNumeric = vectorNumericChange;
+vectorNumericChange = function (key, value) {
+  if (key !== 'liqblend') return liquidOldNumeric(key, value);
+  const L = selLayer(), sh = L?.type === 'vector' && L.shapes.find((s) => s.id === S.selShape);
+  if (!sh || !['add', 'sub'].includes(sh.liquid)) return toast('Blend applies to Add and Subtract shapes', 'err');
+  return vectorAction('Liquid blend', () => { if (sh.blend === undefined) sh.blend = 0; setVal(L, 'sh:' + sh.id + ':blend', clamp(+value, 0, 100)); });
+};
+
+/* ===================== Popai Animator — Style window (Moho model) =====================
+   Three editing modes: DEFAULTS (new shapes), SHAPE (the selected shape) and STYLE (a named, shared definition).
+   A named style supplies only the properties it defines. A shape can apply two styles (Style 1, Style 2; Style 2 wins
+   where both define a property) and can override any supplied property with its own value. Resolution lives in
+   shapeStyle (render.js). Window ▸ Style or Ctrl+]. The Eyedropper (Fill tools) picks or pushes appearance. */
+
+const STYLE_LABELS = { fill: 'Fill color', stroke: 'Stroke color', width: 'Line width', fillOn: 'Fill on', strokeOn: 'Stroke on' };
+const STY = { mode: '', advanced: false, editing: '', palette: 'basic', clipboard: null };
+// The side panel's section body is a grid; panel content spans all of its columns.
+const fullRow = (h) => `<div style="grid-column:1/-1;min-width:0">${h}</div>`;
+function styleById(id) { return id ? S.doc.styles.find((s) => s.id === id) || null : null; }
+function styleUsers(s) { let n = 0; for (const l of allLayers()) if (l.shapes) for (const x of l.shapes) if (x.styleId === s.id || x.style2Id === s.id) n++; return n; }
+// Which applied style (if any) supplies a property for this shape, ignoring the shape's own override.
+function styleSource(sh, p) { const s2 = styleById(sh.style2Id), s1 = styleById(sh.styleId); return styleDefines(s2, p) ? s2 : styleDefines(s1, p) ? s1 : null; }
+function selectedShape() { const L = selLayer(); const sh = L && L.type === 'vector' && L.shapes.find((s) => s.id === S.selShape); return sh ? { L, sh } : null; }
+// SHAPE mode edits are the shape's own (animatable) values. Changing a property a style supplies turns on its override,
+// as Moho does, so the edit is visible and the rest of the style keeps applying.
+function styleSetShape(L, sh, p, v) {
+  if (styleSource(sh, p)) sh.over = { ...(sh.over || {}), [p]: true };
+  if (p === 'fillOn' || p === 'strokeOn') sh[p] = !!v;
+  else setVal(L, 'sh:' + sh.id + ':' + p, p === 'width' ? clamp(+v, 0, 10000) : v);
+}
+function styleNew(from) {
+  const n = S.doc.styles.length + 1, s = { id: uid('st'), name: 'Style ' + n, fill: S.newStyle.fill, stroke: S.newStyle.stroke, width: S.newStyle.width, fillOn: S.newStyle.fillOn, strokeOn: S.newStyle.strokeOn, defines: { fill: false, stroke: false, width: false, fillOn: false, strokeOn: false } };
+  if (from) { const st = shapeStyle(from.L, from.sh, S.frame); Object.assign(s, { name: 'Style from shape ' + n, fill: st.fill, stroke: st.stroke, width: st.width, fillOn: st.fillOn, strokeOn: st.strokeOn, defines: { fill: true, stroke: true, width: true, fillOn: true, strokeOn: true } }); }
+  S.doc.styles.push(s); STY.editing = s.id; STY.mode = 'style'; return s;
+}
+function styleDelete(s) {
+  // Shapes keep their current look: the style's supplied values become their own.
+  for (const l of allLayers()) if (l.shapes) for (const x of l.shapes) {
+    for (const slot of ['styleId', 'style2Id']) if (x[slot] === s.id) {
+      for (const p of STYLE_PROPS) if (styleDefines(s, p) && !(x.over && x.over[p]) && styleSource(x, p) === s) { if (p === 'fillOn' || p === 'strokeOn') x[p] = s[p]; else baseSet(l, 'sh:' + x.id + ':' + p, s[p]); }
+      x[slot] = null;
+    }
+  }
+  S.doc.styles = S.doc.styles.filter((x) => x !== s); if (STY.editing === s.id) STY.editing = '';
+}
+function styleControls(prefix, get, opts = {}) {
+  const define = p => opts.defines ? `<input type="checkbox" title="${esc(opts.defines.title)}" aria-label="Override ${STYLE_LABELS[p]}" data-${prefix}def="${p}" ${opts.defines.get(p) ? 'checked' : ''}>` : '<span class="sty-define-spacer"></span>';
+  const colorRow = (p,label) => `<div class="sty-color-row"><label><input type="checkbox" data-${prefix}="${p}On" ${get(p+'On') ? 'checked' : ''}>${label}</label><input aria-label="${label} color" type="color" data-${prefix}="${p}" value="${esc(get(p))}"><button class="ib" data-tool="eyedropper" title="Eyedropper: pick appearance from artwork" aria-label="Eyedropper">${TOOLS.eyedropper.icon}</button>${define(p)}${opts.note ? opts.note(p) : ''}</div>`;
+  return colorRow('fill','Fill')+colorRow('stroke','Stroke')+`<div class="sty-color-row sty-width"><label>Width</label><input aria-label="Stroke width" type="number" data-${prefix}="width" value="${round(+get('width'),3)}" min="0" max="10000" step="0.5"><span>px</span>${define('width')}</div>`+(opts.defines ? `<div class="sty-overrides">${define('fillOn')}<span>Fill enabled</span>${define('strokeOn')}<span>Stroke enabled</span></div>` : '');
+}
+function styleBasicColors() {
+  const colors=[];
+  for(let y=0;y<10;y++)for(let x=0;x<16;x++){
+    const hue=x/16,light=y===0?1-x/15:(y<6?0.9-(y-1)*0.14:0.18+(y-6)*0.18),sat=y===0?0:1;
+    const q=light<0.5?light*(1+sat):light+sat-light*sat,p=2*light-q;
+    const component=t=>{t=(t+1)%1;return t<1/6?p+(q-p)*6*t:t<0.5?q:t<2/3?p+(q-p)*(2/3-t)*6:p;};
+    colors.push('#'+[component(hue+1/3),component(hue),component(hue-1/3)].map(c=>Math.round(c*255).toString(16).padStart(2,'0')).join(''));
+  }
+  return colors;
+}
+renderStyle = function () {
+  const el = $('#tabBody'), ns = S.newStyle, picked = selectedShape();
+  if (!STY.mode) STY.mode = picked ? 'shape' : 'defaults';
+  if (STY.mode === 'shape' && !picked && STY._auto) STY.mode = 'defaults';
+  const editing = styleById(STY.editing) || S.doc.styles[0] || null; if (editing) STY.editing = editing.id;
+  let h = '<div class="sty-top"><select data-stymode-select aria-label="Shapes"><option value="defaults" '+(STY.mode==='defaults'?'selected':'')+'>Defaults</option><option value="shape" '+(STY.mode==='shape'?'selected':'')+'>Shapes</option></select><select data-stychoose aria-label="Styles"><option value="">Styles</option>'+S.doc.styles.map(s=>'<option value="'+s.id+'" '+(STY.mode==='style'&&editing?.id===s.id?'selected':'')+'>'+esc(s.name)+'</option>').join('')+'<option value="__new">New style…</option></select></div>';
+  const styleOpts = (cur) => `<option value="">— none —</option>` + S.doc.styles.map((s) => `<option value="${s.id}" ${s.id === cur ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+  if (STY.mode === 'defaults') {
+    h += sec('DEFAULTS — for new shapes', fullRow(styleControls('stdef', (p) => ns[p]) +
+      (true ? `<div class="sty-row"><span></span><span class="sty-label">Style 1</span><select data-stdefslot="styleId">${styleOpts(ns.styleId)}</select></div><div class="sty-row"><span></span><span class="sty-label">Style 2</span><select data-stdefslot="style2Id">${styleOpts(ns.style2Id)}</select></div>` : '') +
+      ''));
+  } else if (STY.mode === 'shape') {
+    if (!picked) h += sec('SHAPE', fullRow('<div class="note">Select a shape with Select Shape (Q) to edit its appearance.</div>'));
+    else {
+      const { L, sh } = picked, st = shapeStyle(L, sh, S.frame);
+      const note = (p) => { const src = styleSource(sh, p); return src && !(sh.over && sh.over[p]) ? ` <span class="sty-from" title="Supplied by this style">· ${esc(src.name)}</span>` : sh.over && sh.over[p] ? ' <span class="sty-from">· own value</span>' : ''; };
+      h += sec('SHAPE — selected shape', fullRow(styleControls('stshape', (p) => st[p], { note, defines: STY.advanced ? { title: 'Override: use this shape\'s own value instead of the applied style', get: (p) => !!(sh.over && sh.over[p]) } : null }) +
+        (true ? `<div class="sty-row"><span></span><span class="sty-label">Style 1</span><select data-stslot="styleId">${styleOpts(sh.styleId)}</select></div><div class="sty-row"><span></span><span class="sty-label">Style 2</span><select data-stslot="style2Id">${styleOpts(sh.style2Id)}</select></div><div class="note">Ticked boxes are local overrides. Style 2 wins where both styles define a property.</div>` : (sh.styleId || sh.style2Id ? `<div class="note">Uses ${esc([styleById(sh.styleId), styleById(sh.style2Id)].filter(Boolean).map((s) => s.name).join(' + '))}. Enable Advanced to change styles or overrides.</div>` : '')) +
+        `<div class="btnrow"><button class="btn" data-cmd="shape.up">Raise</button><button class="btn" data-cmd="shape.down">Lower</button><button class="btn" data-styact="fromshape">New style from shape</button><button class="btn danger" data-cmd="shape.del">Delete shape</button></div>`));
+    }
+  } else {
+    const menu = `<div class="btnrow"><select data-styedit aria-label="Style to edit">${S.doc.styles.map((s) => `<option value="${s.id}" ${editing && s.id === editing.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('') || '<option value="">— no styles yet —</option>'}</select>
+      <button class="btn" data-styact="new">New</button><button class="btn" data-styact="fromshape" ${picked ? '' : 'disabled title="Select a shape first"'}>New from shape</button>${editing ? '<button class="btn" data-styact="rename">Rename</button><button class="btn danger" data-styact="delete">Delete</button>' : ''}</div>`;
+    h += sec('STYLE — named, shared definition', fullRow(menu + (editing ? styleControls('ststyle', (p) => editing[p], { defines: { title: 'This style defines (supplies) the property', get: (p) => styleDefines(editing, p) } }) +
+      `<div class="note">Ticked properties are supplied by <b>${esc(editing.name)}</b>; unticked ones stay under each shape's control. Used by ${styleUsers(editing)} shape(s) on any layer.</div>` +
+      (picked ? `<div class="btnrow"><button class="btn" data-styapply="styleId">Apply as Style 1</button><button class="btn" data-styapply="style2Id">Apply as Style 2</button></div>` : '') : '<div class="note">Create a style with New, or New from shape.</div>')));
+  }
+  const palette = STY.palette === 'document' ? S.doc.palette : styleBasicColors();
+  h += '<div class="sty-palette-label"><label>Swatches</label><select data-stypalette aria-label="Swatches"><option value="basic" '+(STY.palette==='basic'?'selected':'')+'>Basic Colors</option><option value="document" '+(STY.palette==='document'?'selected':'')+'>Document</option></select><button class="ib" data-stypalmenu title="Palette commands" aria-label="Palette commands">⋯</button></div><div class="sty-color-grid">'+palette.map(c=>'<button class="sty-swatch" data-stycolor="'+c+'" style="background:'+c+'" title="'+c+' · Shift: stroke" aria-label="Color '+c+'"></button>').join('')+'</div><div class="sty-clipboard"><button class="btn" data-styclip="copy">Copy</button><button class="btn" data-styclip="paste" '+(STY.clipboard?'':'disabled')+'>Paste</button><button class="btn" data-styclip="reset">Reset</button></div><label class="sty-advanced"><input type="checkbox" data-styadv '+(STY.advanced?'checked':'')+'> Advanced</label>';
+  el.innerHTML = '<div class="style-reference">'+h+'</div>';
+  const modeSelect=el.querySelector('[data-stymode-select]');if(modeSelect)modeSelect.onchange=()=>{STY.mode=modeSelect.value;STY._auto=false;renderStyle();};
+  const styleSelect=el.querySelector('[data-stychoose]');if(styleSelect)styleSelect.onchange=()=>{if(styleSelect.value==='__new'){edit('New style',()=>styleNew(picked));}else if(styleSelect.value){STY.editing=styleSelect.value;STY.mode='style';STY._auto=false;}renderStyle();};
+  const paletteSelect=el.querySelector('[data-stypalette]');if(paletteSelect)paletteSelect.onchange=()=>{STY.palette=paletteSelect.value;renderStyle();};
+  const palMenu=el.querySelector('[data-stypalmenu]');if(palMenu)palMenu.onclick=()=>{const r=palMenu.getBoundingClientRect();showMenu(r.left,r.bottom,[{label:'Add current fill',run:()=>runCmd('pal.add')},{label:'Import palette…',run:()=>runCmd('pal.import')},{label:'Export palette…',run:()=>runCmd('pal.export')}]);};
+  function applyAppearance(values){
+    if(STY.mode==='shape'&&picked)edit('Shape appearance',()=>{for(const p of STYLE_PROPS)if(p in values)styleSetShape(picked.L,picked.sh,p,values[p]);});
+    else if(STY.mode==='style'&&editing)edit('Style appearance',()=>{for(const p of STYLE_PROPS)if(p in values)editing[p]=values[p];});
+    else {Object.assign(ns,values);renderToolOpts();renderStyle();requestDraw();}
+  }
+  el.querySelectorAll('[data-stycolor]').forEach(b=>b.onclick=e=>applyAppearance({[e.shiftKey?'stroke':'fill']:b.dataset.stycolor}));
+  el.querySelectorAll('[data-styclip]').forEach(b=>b.onclick=()=>{
+    if(b.dataset.styclip==='copy'){const source=STY.mode==='shape'&&picked?shapeStyle(picked.L,picked.sh,S.frame):STY.mode==='style'&&editing?editing:ns;STY.clipboard=Object.fromEntries(STYLE_PROPS.map(p=>[p,source[p]]));renderStyle();}
+    else if(b.dataset.styclip==='paste'&&STY.clipboard)applyAppearance(STY.clipboard);
+    else if(b.dataset.styclip==='reset')applyAppearance({fill:'#ffffff',stroke:'#000000',width:3,fillOn:true,strokeOn:true});
+  });
+  const read = (i) => (i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value);
+  el.querySelectorAll('[data-stymode]').forEach((b) => (b.onclick = () => { STY.mode = b.dataset.stymode; STY._auto = false; renderStyle(); }));
+  const adv = el.querySelector('[data-styadv]'); if (adv) adv.onchange = () => { STY.advanced = adv.checked; renderStyle(); };
+  el.querySelectorAll('[data-stdef]').forEach((i) => (i.oninput = () => { ns[i.dataset.stdef] = read(i); renderToolOpts(); }));
+  el.querySelectorAll('[data-stdefslot]').forEach((i) => (i.onchange = () => { ns[i.dataset.stdefslot] = i.value || null; renderStyle(); }));
+  if (picked) {
+    const { L, sh } = picked;
+    el.querySelectorAll('[data-stshape]').forEach((i) => {
+      const p = i.dataset.stshape;
+      if (i.type === 'color') { i.oninput = () => { if (!H.pending) beginEdit('Shape ' + p); styleSetShape(L, sh, p, i.value); requestDraw(); }; i.onchange = () => { commitEdit(); renderStyle(); }; }
+      else i.onchange = () => edit('Shape ' + p, () => styleSetShape(L, sh, p, read(i)));
+    });
+    el.querySelectorAll('[data-stshapedef]').forEach((i) => (i.onchange = () => edit('Shape override', () => { sh.over = { ...(sh.over || {}), [i.dataset.stshapedef]: i.checked }; if (!i.checked) delete sh.over[i.dataset.stshapedef]; })));
+    el.querySelectorAll('[data-stslot]').forEach((i) => (i.onchange = () => edit(i.dataset.stslot === 'styleId' ? 'Style 1' : 'Style 2', () => { sh[i.dataset.stslot] = i.value || null; })));
+    el.querySelectorAll('[data-styapply]').forEach((b) => (b.onclick = () => edit('Apply style', () => { sh[b.dataset.styapply] = editing.id; })));
+  }
+  const se = el.querySelector('[data-styedit]'); if (se) se.onchange = () => { STY.editing = se.value; renderStyle(); };
+  if (editing) {
+    el.querySelectorAll('[data-ststyle]').forEach((i) => {
+      const p = i.dataset.ststyle;
+      if (i.type === 'color') { i.oninput = () => { if (!H.pending) beginEdit('Edit style'); editing[p] = i.value; requestDraw(); }; i.onchange = () => commitEdit(); }
+      else i.onchange = () => edit('Edit style', () => { editing[p] = p === 'width' ? clamp(read(i), 0, 10000) : read(i); });
+    });
+    el.querySelectorAll('[data-ststyledef]').forEach((i) => (i.onchange = () => edit('Style defines ' + i.dataset.ststyledef, () => { editing.defines = { ...(editing.defines || Object.fromEntries(STYLE_PROPS.map((p) => [p, true]))), [i.dataset.ststyledef]: i.checked }; })));
+  }
+  el.querySelectorAll('[data-styact]').forEach((b) => (b.onclick = async () => {
+    const a = b.dataset.styact;
+    if (a === 'new') edit('New style', () => styleNew(null));
+    if (a === 'fromshape' && picked) edit('New style from shape', () => styleNew(picked));
+    if (a === 'rename' && editing) { const n = await askText('Rename style', 'Name', editing.name); if (n && n.trim()) edit('Rename style', () => { editing.name = n.trim().slice(0, 100); }); }
+    if (a === 'delete' && editing) edit('Delete style', () => styleDelete(editing));
+  }));
+  el.querySelectorAll('[data-pal]').forEach((i) => {
+    i.onclick = (e) => { const c = S.doc.palette[+i.dataset.pal], k = e.shiftKey ? 'stroke' : 'fill'; if (STY.mode === 'shape' && picked) edit('Apply palette color', () => styleSetShape(picked.L, picked.sh, k, c)); else if (STY.mode === 'style' && editing) edit('Edit style', () => { editing[k] = c; }); else { ns[k] = c; renderToolOpts(); refreshAll(); } };
+    i.oncontextmenu = (e) => { e.preventDefault(); edit('Remove swatch', () => S.doc.palette.splice(+i.dataset.pal, 1)); };
+  });
+  bindCommon(el);
+};
+// New shapes take the DEFAULTS styles too.
+const styleOldAddShape = addShape;
+addShape = function (L, pathIds, style = S.newStyle, over = {}) {
+  const sh = styleOldAddShape(L, pathIds, style, over);
+  if (style === S.newStyle) { if (S.newStyle.styleId && styleById(S.newStyle.styleId)) sh.styleId = S.newStyle.styleId; if (S.newStyle.style2Id && styleById(S.newStyle.style2Id)) sh.style2Id = S.newStyle.style2Id; }
+  return sh;
+};
+// Selecting a shape switches the window to SHAPE mode (unless the user chose another mode).
+const styleOldSelectShape = vectorSelectShape;
+vectorSelectShape = function (L, sh) { const r = styleOldSelectShape(L, sh); if (sh) { STY.mode = 'shape'; STY._auto = true; } return r; };
+{ const c = CMDS.find((c) => c.id === 'win.style'); if (c) Object.assign(c, { label: 'Style', k: 'Ctrl+]', keys: 'ctrl+]' }); }
+for (const id of ['style.new', 'style.fromshape']) { const c = CMDS.find((c) => c.id === id); if (c) c.run = () => { setTab('style'); const p = selectedShape(); if (id === 'style.fromshape' && !p) return toast('Select a shape first (Select Shape, Q)', 'err'); edit(id === 'style.new' ? 'New style' : 'New style from shape', () => styleNew(id === 'style.new' ? null : p)); }; }
+
+// ---------- Eyedropper (Fill tools) ----------
+// Click: pick the shape's appearance into DEFAULTS · Alt-click: push DEFAULTS onto the shape · Shift-click: pick its fill
+// colour · Shift+Alt-click: pick its stroke colour. Pushing writes the shape's own colour channels at the current frame.
+defTool('eyedropper', { icon: svgI('<path d="m14 4 6 6M5 19l1-4L15 6l3 3-9 9Z"/><path d="m13 5 6 6"/>'), name: 'Eyedropper', key: '', cursor: 'copy',
+  hint: 'Click a shape to pick its appearance into the new-shape defaults · Alt-click pushes the defaults onto it · Shift-click picks its fill colour · Shift+Alt-click picks its stroke colour',
+  down(e, sx, sy) {
+    const L = selLayer(); if (!L || L.type !== 'vector') return;
+    const sh = vectorHitShape(L, sx, sy); if (!sh) return toast('Click a fill or stroke');
+    const st = shapeStyle(L, sh, S.frame), ns = S.newStyle;
+    if (e.shiftKey) { ns[e.altKey ? 'stroke' : 'fill'] = st[e.altKey ? 'stroke' : 'fill']; toast(`Picked ${e.altKey ? 'stroke' : 'fill'} colour ${st[e.altKey ? 'stroke' : 'fill']}`, 'ok'); renderToolOpts(); return refreshAll(); }
+    if (e.altKey) return vectorAction('Push style to shape', () => { for (const p of STYLE_PROPS) styleSetShape(L, sh, p, ns[p]); });
+    Object.assign(ns, { fill: st.fill, stroke: st.stroke, width: st.width, fillOn: st.fillOn, strokeOn: st.strokeOn }); toast('Picked the shape\'s appearance into the defaults', 'ok'); renderToolOpts(); refreshAll();
+  }, move() {}, up() {} });
+VECTOR_FILL.push('eyedropper'); POINT_TOOLS.add('eyedropper');
+
+/* ===================== Popai Animator — Actions, Smart Bones, animated layer order (Moho model) =====================
+   Data:
+   • The owning layer (normally the character's Bone layer) lists its actions: L.actionList = [{ id, name, kind, bone, dur }].
+     kind: 'regular' (reusable motion) or 'smart' (driven by a bone's rotation).
+   • Every layer in the owner's hierarchy stores its keys for an action in L.actions[actionId].ch.
+   • Insert Reference records owner.actionRefs = [{ id, start }].
+   • S.doc.activeAction = { owner, id } while an action is open. Opening swaps each hierarchy layer's channels for the
+     action's (Mainline's are kept in L._mainCh), so the timeline, tools, undo and rendering all work on the action.
+     Files are always written in Mainline form.
+   • On Mainline, Smart Bone actions are added on top of each channel: the driver bone's angle selects the action frame
+     whose driver angle matches, and the action's change from its neutral frame is applied. */
+
+// ---------- structure ----------
+function actSubtree(owner) { const out = [owner]; walk(owner.children || [], (l) => { out.push(l); }); return out; }
+function actOwnerOf(L) { if (!L) return null; const chain = [L, ...ancestors(L.id)]; return chain.find((a) => a.type === 'bone') || chain[chain.length - 1]; }
+function actFind(id) { for (const l of allLayers()) { const a = (l.actionList || []).find((x) => x.id === id); if (a) return { owner: l, action: a }; } return null; }
+function actActive() { const a = S.doc && S.doc.activeAction; return a ? actFind(a.id) : null; }
+function actOwnsLayer(L) { return !!(L && '_mainCh' in L); }
+function actHasAnimation(L) { return !!L && actSubtree(L).some(layer=>actOwnsLayer(layer)&&Object.values(layer.ch).some(ch=>ch.keys?.length)); }
+function actPreviewFrame(L, frame) { return S.doc?.activeAction && !actOwnsLayer(L) ? 0 : frame; }
+function actCameraFrame(frame) { return S.doc?.activeAction ? S.doc.activeAction.cameraFrame ?? 0 : frame; }
+function actProceduralFrame(L, frame) { return S.doc?.activeAction && (!actOwnsLayer(L) || !Object.values(L.ch).some(ch => ch.keys?.length)) ? 0 : frame; }
+function timelineEnd() { return actActive()?.action.dur ?? S.doc.end; }
+function timelineMarkers() { return actActive() ? [] : S.doc.markers; }
+function actSwapIn(owner, id, context = null) {
+  for (const l of actSubtree(owner)) { l._mainCh = l.ch; l.ch = (l.actions && l.actions[id] && l.actions[id].ch) || {}; if (l.actions) { delete l.actions[id]; if (!Object.keys(l.actions).length) delete l.actions; } }
+  S.doc.activeAction = { owner: owner.id, id, mainlineFrame: context?.mainlineFrame ?? S.frame, cameraFrame: context?.cameraFrame ?? S.frame };
+}
+function actSwapOutLayer(l, id) {
+  const ch = l.ch; l.ch = l._mainCh || {}; delete l._mainCh;
+  if (Object.keys(ch).length) { l.actions = l.actions || {}; l.actions[id] = { ch }; }
+}
+function actSwapOut() {
+  const a = S.doc.activeAction; if (!a) return;
+  for (const l of allLayers()) if ('_mainCh' in l) actSwapOutLayer(l, a.id);
+  S.doc.activeAction = null;
+}
+// Same normalisation on a raw document (imports and recovery files written while an action was open).
+function actNormalizeDoc(d) {
+  const a = d && d.activeAction; if (!a) return d;
+  const visit = (list) => { for (const l of list || []) { if (l && '_mainCh' in l) actSwapOutLayer(l, a.id); visit(l && l.children); } };
+  visit(d.layers); d.activeAction = null; return d;
+}
+function actOpen(owner, id) {
+  if (S.playing) stopPlay();
+  const previous = S.doc.activeAction, mainlineFrame = previous?.mainlineFrame ?? S.frame;
+  actSwapOut();
+  if (id) {
+    actSwapIn(owner, id, { mainlineFrame, cameraFrame: previous?.cameraFrame ?? mainlineFrame });
+    S.camSel = false; S.selLayers = S.selLayers.filter(layerId => actOwnsLayer(findLayer(layerId))); if (!S.selLayers.length) S.selLayers = [owner.id];
+    if (S.mode === 'setup') { S.mode = 'animate'; updateModeUI(); }
+  }
+  S.selKeys = new Set(); S.activeChannel = null; TL.active = null; TL.contextKey = ''; TL.scrollY = 0; S.swPreview = {};
+  invalidateScene(); REV++; S.frame = id ? 1 : mainlineFrame; renderTLBar(); refreshAll();
+}
+
+// ---------- editing inside an action ----------
+// Inside an action every change is a key in that action; nothing writes the shared drawing or rig.
+const actOldSetVal = setVal;
+setVal = function (o, path, v, f = S.frame, force = false) {
+  if (!S.doc || !S.doc.activeAction) return actOldSetVal(o, path, v, f, force);
+  if (!actOwnsLayer(o)) throw new Error('Select a layer inside the active Action to edit its animation');
+  assertWritable(o);
+  if (!Number.isFinite(f) || f < 0 || f > 100000) throw new Error('Invalid keyframe time');
+  REV++;
+  const interp = DISCRETE(path) ? 'step' : undefined;
+  let ch = o.ch[path];
+  if (!ch) { ch = o.ch[path] = { keys: [] }; const base = baseGet(o, path); if (f !== 0 && base !== undefined) setKey(ch, 0, clone(base), interp); }
+  setKey(ch, f, v, interp);
+};
+const actOldAvail = toolAvail;
+toolAvail = function (id) {
+  const r = actOldAvail(id); if (r) return r;
+  const a = actActive(); if (!a) return null;
+  if (a.action.kind === 'smart' && id === 'bonemanip') return 'Manipulate Bones is off inside Smart Bone actions — use Transform Bone so only the bones you choose move';
+  if ((typeof VECTOR_TOPOLOGY !== 'undefined' && VECTOR_TOPOLOGY.has(id)) || ['boneadd', 'sketch', 'reparent', 'bind', 'bindpts', 'strength', 'offset'].includes(id)) return 'Structural and rig-setup changes are made on Mainline — double-click Mainline in the Actions panel';
+  return null;
+};
+const actOldSetMode = setMode;
+setMode = function (m) { if (m === 'setup' && actActive()) return toast('Setup changes the shared rig — return to Mainline first (Actions panel)', 'err'); return actOldSetMode(m); };
+
+// ---------- evaluation on Mainline (Smart Bones and references) ----------
+let actIndexCache = { rev: -1, map: new Map() }, actTimeCache = new Map(), actGuard = false;
+function actIndex() {
+  if (actIndexCache.rev === REV) return actIndexCache.map;
+  const map = new Map();
+  for (const owner of allLayers()) for (const a of owner.actionList || []) map.set(a.id, { owner, action: a, driverPath: a.kind === 'smart' && a.bone ? 'bone:' + a.bone + ':a' : null, refs: (owner.actionRefs || []).filter((r) => r.id === a.id), dur: Math.max(1, a.dur || 24) });
+  actIndexCache = { rev: REV, map }; actTimeCache = new Map(); return map;
+}
+// Action frame whose driver angle matches `angle` (piecewise-linear search over the driver's action curve).
+function actTimeForAngle(info, angle) {
+  const dch = info.owner.actions && info.owner.actions[info.action.id] && info.owner.actions[info.action.id].ch[info.driverPath];
+  if (!dch || !dch.keys.length) return null;
+  const dur = info.dur, step = Math.max(1, dur / 400); let prevT = 0, prevA = evalChannel(dch, 0), best = 0, bestD = Math.abs(prevA - angle);
+  for (let t = step; t <= dur + 1e-9; t += step) {
+    const a = evalChannel(dch, Math.min(t, dur));
+    if ((angle - prevA) * (angle - a) <= 0 && a !== prevA) return prevT + (Math.min(t, dur) - prevT) * (angle - prevA) / (a - prevA);
+    const d = Math.abs(a - angle); if (d < bestD) { bestD = d; best = Math.min(t, dur); }
+    prevT = Math.min(t, dur); prevA = a;
+  }
+  return best;
+}
+function actSmartTimes(info, f) {
+  const key = info.action.id + '|' + f; if (actTimeCache.has(key)) return actTimeCache.get(key);
+  actGuard = true; let res = null;
+  try {
+    const now = val(info.owner, info.driverPath, f), rest = baseGet(info.owner, info.driverPath);
+    const t = actTimeForAngle(info, now), t0 = actTimeForAngle(info, rest);
+    res = t === null ? null : [t, t0 === null ? 0 : t0];
+  } finally { actGuard = false; }
+  actTimeCache.set(key, res); return res;
+}
+function actAdd(base, a, a0) {
+  if (typeof base === 'number' && typeof a === 'number' && typeof a0 === 'number') return base + (a - a0);
+  if (Array.isArray(base) && Array.isArray(a) && Array.isArray(a0)) return base.map((v, i) => v + (a[i] - a0[i]));
+  return JSON.stringify(a) === JSON.stringify(a0) ? base : a;
+}
+const actOldVal = val;
+val = function (o, path, f) {
+  if (S.doc?.activeAction && o && !actOwnsLayer(o)) return o.id === 'CAM' ? actOldVal(o, path, actCameraFrame(f)) : baseGet(o, path);
+  const v = actOldVal(o, path, f);
+  if (actGuard || !o || !o.actions || (S.doc && S.doc.activeAction)) return v;
+  let out = v; const idx = actIndex();
+  for (const id in o.actions) {
+    const ch = o.actions[id].ch[path]; if (!ch || !ch.keys.length) continue;
+    const info = idx.get(id); if (!info) continue;
+    if (info.action.kind === 'smart') {
+      if (o === info.owner && path === info.driverPath) continue;
+      const ts = actSmartTimes(info, f); if (!ts) continue;
+      out = actAdd(out, evalChannel(ch, ts[0]), evalChannel(ch, ts[1]));
+    } else for (const r of info.refs) if (f >= r.start && f <= r.start + info.dur) out = evalChannel(ch, f - r.start);
+  }
+  return out;
+};
+// Files, autosave and desktop saves always contain Mainline.
+const actOldSerialize = serialize;
+serialize = function () {
+  const a = S.doc && S.doc.activeAction; if (!a) return actOldSerialize();
+  const found = actFind(a.id); actSwapOut();
+  try { return actOldSerialize(); } finally { if (found) actSwapIn(found.owner, a.id, a); }
+};
+const actOldValidate = validateProject;
+validateProject = function (input) {
+  if (input && input.doc) actNormalizeDoc(input.doc);
+  const d = actOldValidate(input);
+  const flat = []; (function v(list) { for (const l of list) { flat.push(l); if (l.children) v(l.children); } })(d.layers);
+  const ids = new Set();
+  for (const l of flat) {
+    if (l.actionList !== undefined) {
+      if (!Array.isArray(l.actionList) || l.actionList.length > 1000) throw new Error('Invalid action list');
+      for (const a of l.actionList) {
+        if (!a || typeof a.id !== 'string' || !/^[\w-]{1,80}$/.test(a.id) || ids.has(a.id) || typeof a.name !== 'string' || a.name.length > 200 || !['regular', 'smart'].includes(a.kind) || !Number.isInteger(a.dur) || a.dur < 1 || a.dur > 100000) throw new Error('Invalid action');
+        if (a.kind === 'smart' && (l.type !== 'bone' || !l.bones.some((b) => b.id === a.bone))) throw new Error('Smart Bone action references a missing bone');
+        ids.add(a.id);
+      }
+    }
+  }
+  for (const l of flat) {
+    if (l.actions !== undefined) { if (!l.actions || typeof l.actions !== 'object' || Array.isArray(l.actions)) throw new Error('Invalid action data');
+      for (const [id, a] of Object.entries(l.actions)) { if (!ids.has(id) || !a || typeof a.ch !== 'object' || Array.isArray(a.ch)) throw new Error('Action data references a missing action');
+        for (const c of Object.values(a.ch)) if (!c || !Array.isArray(c.keys) || c.keys.some((k) => !Number.isInteger(k.f) || k.f < 0 || k.f > 100000 || k.v === undefined)) throw new Error('Invalid action keys'); } }
+    if (l.actionRefs !== undefined && (!Array.isArray(l.actionRefs) || l.actionRefs.some((r) => !r || !ids.has(r.id) || !Number.isInteger(r.start) || r.start < 0 || r.start > 100000))) throw new Error('Invalid action reference');
+    if (l.animOrder !== undefined && typeof l.animOrder !== 'boolean') throw new Error('Invalid animated layer order setting');
+    if (l.ch.order && l.ch.order.keys.some((k) => typeof k.v !== 'string' || k.v.length > 100000)) throw new Error('Invalid layer order key');
+  }
+  return d;
+};
+
+// ---------- commands ----------
+function actOwner() { const L = selLayer(); return actOwnerOf(L) || null; }
+function actUniqueName(owner, base) { const names = new Set((owner.actionList || []).map((a) => a.name)); let n = base, i = 2; while (names.has(n)) n = base + ' ' + i++; return n; }
+function actCreate(owner, name, kind = 'regular', extra = {}) { const a = { id: uid('ac'), name, kind, dur: Math.max(1, Math.round(S.doc.end || 24)), ...extra }; owner.actionList = [...(owner.actionList || []), a]; return a; }
+function actDelete(id) {
+  const f = actFind(id); if (!f) return;
+  if (S.doc.activeAction && S.doc.activeAction.id === id) actSwapOut();
+  f.owner.actionList = f.owner.actionList.filter((a) => a.id !== id); if (!f.owner.actionList.length) delete f.owner.actionList;
+  for (const l of allLayers()) { if (l.actions) { delete l.actions[id]; if (!Object.keys(l.actions).length) delete l.actions; } if (l.actionRefs) { l.actionRefs = l.actionRefs.filter((r) => r.id !== id); if (!l.actionRefs.length) delete l.actionRefs; } }
+}
+// Insert Copy: the action's keys become independent keys in the current context, starting at the current frame.
+function actInsertCopy(id, at = S.frame) {
+  const f = actFind(id); if (!f) throw new Error('Unknown action');
+  let n = 0;
+  for (const l of actSubtree(f.owner)) {
+    const src = l.actions && l.actions[id] && l.actions[id].ch; if (!src) continue;
+    for (const [path, ch] of Object.entries(src)) for (const k of ch.keys) { setVal(l, path, clone(k.v), at + k.f, true); const key = l.ch[path] && l.ch[path].keys.find((x) => x.f === at + k.f); if (key && k.i) key.i = k.i; n++; }
+  }
+  return n;
+}
+cmd('win.actions', 'Window', 'Actions', () => setTab('actions'), { k: 'Ctrl+K', keys: 'ctrl+k', kw: 'smart bones action mainline' });
+cmd('act.mainline', 'Animate', 'Return to Mainline', () => { if (!actActive()) return toast('Mainline is already active'); actOpen(null, null); toast('Editing Mainline', 'ok'); });
+cmd('bone.smartdial', 'Rig', 'Make Smart Bone Dial…', () => smartDialDialog(), { en: () => (activeBoneLayer() ? false : 'Select a Bone layer (or artwork inside it)'), kw: 'smart bone action dial control' });
+
+// Make Smart Bone Dial: prepare the control bone and its action(s); the visual response is authored inside them.
+async function smartDialDialog() {
+  const B = activeBoneLayer(); if (!B) return toast('Select a Bone layer first', 'err');
+  if (actActive()) return toast('Return to Mainline first (Actions panel)', 'err');
+  const sb = boneOf(B, S.selBone);
+  const r = await modal('Make Smart Bone Dial', `<div class="form" style="grid-template-columns:auto 1fr">
+    <label>Name</label><input type="text" name="name" value="${esc(sb ? sb.name : actUniqueName(B, 'Dial'))}">
+    <label>Minimum angle °</label><input type="number" name="min" value="-90" step="1">
+    <label>Maximum angle °</label><input type="number" name="max" value="90" step="1">
+    <label>Duration (frames)</label><input type="number" name="dur" value="24" min="2" max="1000" step="1">
+    <label></label><label><input type="checkbox" name="sep" checked> Separate actions for positive and negative angles</label></div>
+    <div class="note">${sb ? `Uses the selected bone <b>${esc(sb.name)}</b> and sets its strength to 0 so it does not deform artwork.` : 'Creates a new control bone with zero strength.'} The actions start at the neutral angle; open them in the Actions panel and edit the artwork at their frames.</div>`,
+  [{ label: 'Cancel', value: false }, { label: 'Create', value: true, pri: true }]);
+  if (!r || !r.v) return;
+  const name = String(r.data.name || '').trim().slice(0, 100), min = +r.data.min, max = +r.data.max, dur = Math.round(+r.data.dur);
+  if (!name) return toast('Enter a name', 'err');
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max || min > 0 || max < 0) return toast('Use a minimum ≤ 0 ≤ maximum, with minimum < maximum', 'err');
+  if (!Number.isInteger(dur) || dur < 2 || dur > 1000) return toast('Duration must be 2–1000 frames', 'err');
+  if (S.mode !== 'setup') setMode('setup');
+  const made = smartDialCreate(B, sb, name, min, max, dur, !!r.data.sep);
+  if (made) { setTab('actions'); toast(`Smart Bone “${name}” ready: ${made.map((a) => a.name).join(' and ')}`, 'ok'); }
+}
+function smartDialCreate(B, sb, name, min, max, dur, separate) {
+  let made = null;
+  edit('Make Smart Bone Dial', () => {
+    let b = sb;
+    if (!b) { const n = B.bones.length; b = newBone(B, name, null, 40 + 30 * (n % 6), -120 - 30 * Math.floor(n / 6), 0, 40); }
+    b.name = name; b.str = 0;
+    const rest = baseGet(B, 'bone:' + b.id + ':a'), key = (a, ranges) => { B.actions = B.actions || {}; B.actions[a.id] = { ch: { ['bone:' + b.id + ':a']: { keys: ranges.map(([f, v]) => ({ f, v: round(v, 4) })) } } }; };
+    made = [];
+    if (separate) {
+      const pos = actCreate(B, actUniqueName(B, name), 'smart', { bone: b.id, dur }); key(pos, [[0, rest], [dur, rest + max]]); made.push(pos);
+      if (min < 0) { const neg = actCreate(B, actUniqueName(B, name + ' 2'), 'smart', { bone: b.id, dur }); key(neg, [[0, rest], [dur, rest + min]]); made.push(neg); }
+    } else { const a = actCreate(B, actUniqueName(B, name), 'smart', { bone: b.id, dur }); key(a, [[0, rest + min], [dur, rest + max]]); made.push(a); }
+    selectBone(b.id);
+  });
+  return made;
+}
+
+// ---------- Actions panel ----------
+const ACTP = { cat: 'all', filter: '', sort: false, sel: null };
+function renderActions() {
+  const el = $('#tabBody'), owner = actOwner(), active = actActive();
+  if (!owner) { el.innerHTML = sec('Actions', '<div class="note">Select the character’s Bone layer (or any layer) to see its actions.</div>'); return; }
+  let list = (owner.actionList || []).filter((a) => ACTP.cat === 'all' || (ACTP.cat === 'smart' ? a.kind === 'smart' : a.kind === 'regular'));
+  if (ACTP.filter) list = list.filter((a) => a.name.toLowerCase().includes(ACTP.filter.toLowerCase()));
+  if (ACTP.sort) list = [...list].sort((a, b) => a.name.localeCompare(b.name));
+  const isActive = (id) => active && active.action.id === id, mark = (on) => `<span class="act-arrow" title="Active editing context">${on ? '▶' : ''}</span>`;
+  const row = (a) => { const b = a.kind === 'smart' && boneOf(owner, a.bone); return `<div class="act-row ${ACTP.sel === a.id ? 'sel' : ''} ${isActive(a.id) ? 'on' : ''}" data-act="${a.id}">${mark(isActive(a.id))}<span class="act-name">${esc(a.name)}</span><span class="act-kind">${a.kind === 'smart' ? '🦴 ' + esc(b ? b.name : '?') : 'Action'} · ${a.dur}f</span></div>`; };
+  const refs = (owner.actionRefs || []).map((r, i) => { const a = (owner.actionList || []).find((x) => x.id === r.id); return a ? `<div class="act-ref">↪ ${esc(a.name)} referenced at frame ${r.start}<button class="ib sm" data-actref="${i}" title="Remove reference">✕</button></div>` : ''; }).join('');
+  const cats = [['all', 'All'], ['regular', 'Regular'], ['smart', 'Smart Bones']].map(([k, n]) => `<button class="btn ${ACTP.cat === k ? 'pri' : ''}" data-actcat="${k}">${n}</button>`).join('');
+  const sel = (owner.actionList || []).find((a) => a.id === ACTP.sel);
+  const dis = (cond, why) => (cond ? '' : `disabled title="${esc(why)}"`);
+  el.innerHTML = sec('Actions — ' + esc(owner.name), `<div style="grid-column:1/-1;min-width:0"><div class="act-cats">${cats}</div>
+    <div class="act-tools"><input type="text" data-actfilter placeholder="Filter" value="${esc(ACTP.filter)}"><label><input type="checkbox" data-actsort ${ACTP.sort ? 'checked' : ''}> Sort</label></div>
+    <div class="act-list"><div class="act-row main ${active ? '' : 'on'}" data-act="">${mark(!active)}<span class="act-name">— Mainline —</span><span class="act-kind">scene animation</span></div>${list.map(row).join('') || '<div class="note">No actions in this category.</div>'}</div>
+    <div class="act-footer"><button class="ib" data-actmenu title="Action commands" aria-label="Action commands">⋯</button><span class="act-spacer"></span><button class="ib" data-actcmd="export" title="Export action" aria-label="Export action" ${dis(sel, 'Select an action')}>↗</button><button class="ib" data-actcmd="import" title="Import action" aria-label="Import action">↙</button><button class="ib" data-cmd="bone.smartdial" title="Make Smart Bone Dial" aria-label="Make Smart Bone Dial">◴</button></div>
+    ${refs ? '<div class="act-refs"><b>References on Mainline</b>' + refs + '</div>' : ''}
+    ${active ? `<div class="note act-banner">Editing <b>${esc(active.action.name)}</b>${active.action.kind === 'smart' ? ' (Smart Bone: rotate its driver within the action to set each frame’s response)' : ''}. Select each layer to edit its part of the action.</div>` : ''}</div>`);
+  const actionMenu = (x, y) => {
+    const selected = (owner.actionList || []).find(a => a.id === ACTP.sel);
+    showMenu(x, y, [
+      {label:'New action…',run:()=>actCommand('new',owner,selected)},
+      {label:'Make active',dis:!selected,run:()=>actCommand('open',owner,selected)},
+      {label:'Return to Mainline',dis:!active,run:()=>actOpen(owner,null)},
+      {sep:1},
+      {label:'Insert copy',dis:!selected || isActive(selected.id),run:()=>actCommand('copy',owner,selected)},
+      {label:'Insert reference',dis:!selected || !!active || selected.kind!=='regular',run:()=>actCommand('ref',owner,selected)},
+      {sep:1},
+      {label:'Rename…',dis:!selected,run:()=>actCommand('rename',owner,selected)},
+      {label:'Delete',dis:!selected,run:()=>actCommand('delete',owner,selected)}
+    ]);
+  };
+  const actionList=el.querySelector('.act-list');
+  if(actionList) actionList.oncontextmenu = e => {
+    e.preventDefault(); const row=e.target.closest('[data-act]');
+    if(row){ACTP.sel=row.dataset.act || null;el.querySelectorAll('[data-act]').forEach(r=>r.classList.toggle('sel',r===row));}
+    actionMenu(e.clientX,e.clientY);
+  };
+  const more=el.querySelector('[data-actmenu]');if(more) more.onclick=()=>{const r=more.getBoundingClientRect();actionMenu(r.left,r.bottom);};
+  if(actionList) actionList.tabIndex=0;
+  if(actionList) actionList.onkeydown=e=>{if(e.key==='ContextMenu'||(e.shiftKey&&e.key==='F10')){e.preventDefault();const r=e.currentTarget.getBoundingClientRect();actionMenu(r.left,r.top);}};
+  el.querySelectorAll('[data-actcat]').forEach((b) => (b.onclick = () => { ACTP.cat = b.dataset.actcat; renderActions(); }));
+  const fi = el.querySelector('[data-actfilter]'); fi.oninput = () => { ACTP.filter = fi.value; const pos = fi.selectionStart; renderActions(); const n = $('#tabBody [data-actfilter]'); n.focus(); n.setSelectionRange(pos, pos); };
+  el.querySelector('[data-actsort]').onchange = (e) => { ACTP.sort = e.target.checked; renderActions(); };
+  el.querySelectorAll('[data-act]').forEach((r) => { r.onclick = () => { ACTP.sel = r.dataset.act || null; renderActions(); }; r.ondblclick = () => { const id = r.dataset.act; actOpen(owner, id || null); ACTP.sel = id || null; toast(id ? `Editing action “${owner.actionList.find((a) => a.id === id).name}”` : 'Editing Mainline', 'ok'); }; });
+  el.querySelectorAll('[data-actref]').forEach((b) => (b.onclick = () => edit('Remove action reference', () => { owner.actionRefs.splice(+b.dataset.actref, 1); if (!owner.actionRefs.length) delete owner.actionRefs; })));
+  el.querySelectorAll('[data-actcmd]').forEach((b) => (b.onclick = () => actCommand(b.dataset.actcmd, owner, sel)));
+  bindCommon(el);
+}
+// Creating an action from a selected bone makes a rotation-driven response.
+function actCreateForSelectedBone(owner) {
+  const bone=owner?.type==='bone'&&boneOf(owner,S.selBone);
+  if(!bone)return null;
+  if(actActive()) {toast('Return to Mainline before creating a Smart Bone action','err');return false;}
+  let action;
+  if(edit('New Smart Bone action',()=>{
+    assertWritable(owner);
+    action=actCreate(owner,actUniqueName(owner,bone.name),'smart',{bone:bone.id});
+    // New Action is blank. The animator authors the driver's angle keys and response.
+  })===false)return false;
+  return action;
+}
+async function actCommand(c, owner, sel) {
+  if (c === 'new' && owner?.type==='bone' && boneOf(owner,S.selBone)) {
+    const action=actCreateForSelectedBone(owner);
+    if(action){ACTP.sel=action.id;ACTP.cat='smart';ACTP.filter='';actOpen(owner,action.id);toast('Editing Smart Bone action “'+action.name+'”','ok');}
+    return;
+  }
+  if (c === 'new') { const n = await askText('New action', 'Name', actUniqueName(owner, 'Action')); if (!n || !n.trim()) return; let a; if (edit('New action', () => { a = actCreate(owner, n.trim().slice(0, 100)); }) !== false) { ACTP.sel = a.id; actOpen(owner, a.id); toast(`Editing new action “${a.name}”`, 'ok'); } return; }
+  if (c === 'import') return actImport(owner);
+  if (!sel) return;
+  if (c === 'open') { actOpen(owner, sel.id); return; }
+  if (c === 'copy') { let n = 0; edit('Insert copy of ' + sel.name, () => { n = actInsertCopy(sel.id, S.frame); }); return toast(`Inserted ${n} key(s) from “${sel.name}” at frame ${S.frame}`, 'ok'); }
+  if (c === 'ref') { edit('Insert reference to ' + sel.name, () => { owner.actionRefs = [...(owner.actionRefs || []), { id: sel.id, start: S.frame }]; }); return toast(`“${sel.name}” plays from frame ${S.frame}; edits to the action update it`, 'ok'); }
+  if (c === 'rename') { const n = await askText('Rename action', sel.kind === 'smart' ? 'Name (the Smart Bone link is kept by bone, not by name)' : 'Name', sel.name); if (n && n.trim()) edit('Rename action', () => { sel.name = n.trim().slice(0, 100); }); return; }
+  if (c === 'delete') { const r = await modal('Delete action', `<div class="note">Delete “${esc(sel.name)}” and its keys on every layer? References to it are removed; inserted copies stay.</div>`, [{ label: 'Cancel', value: false }, { label: 'Delete', value: true, pri: true }]); if (r && r.v) { edit('Delete action', () => actDelete(sel.id)); ACTP.sel = null; refreshAll(); } return; }
+  if (c === 'export') return actExport(owner, sel);
+  if (c === 'import') return actImport(owner);
+}
+// Export / import: keys are matched to layers by their path of names inside the owner.
+function actLayerPath(owner, l) { const chain = [l, ...ancestors(l.id)]; const i = chain.indexOf(owner); return chain.slice(0, i).reverse().map((x) => x.name).join(' / '); }
+function actExport(owner, a) {
+  if (S.doc.activeAction && S.doc.activeAction.id === a.id) return toast('Return to Mainline before exporting the open action', 'err');
+  const layers = {}; for (const l of actSubtree(owner)) if (l.actions && l.actions[a.id]) layers[actLayerPath(owner, l)] = clone(l.actions[a.id].ch);
+  const bone = a.kind === 'smart' ? (boneOf(owner, a.bone) || {}).name : undefined;
+  download(new Blob([JSON.stringify({ app: 'Popai Animator', type: 'action', format: 1, action: { name: a.name, kind: a.kind, dur: a.dur, bone }, layers })], { type: 'application/json' }), a.name.replace(/[^\w\- ]+/g, '_') + '.popai-action.json');
+}
+function actImport(owner) {
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
+  inp.onchange = async () => {
+    try {
+      const f = inp.files[0]; if (!f || f.size > 20 * 1024 * 1024) throw new Error('Choose an action file under 20 MB');
+      const j = JSON.parse(await f.text()); if (!j || j.type !== 'action' || !j.action || typeof j.layers !== 'object') throw new Error('Not a Popai action file');
+      const kind = j.action.kind === 'smart' ? 'smart' : 'regular', bone = kind === 'smart' ? (owner.bones || []).find((b) => b.name === j.action.bone) : null;
+      if (kind === 'smart' && !bone) throw new Error(`This Smart Bone action needs a bone named “${j.action.bone}” in ${owner.name}`);
+      const byPath = new Map(actSubtree(owner).map((l) => [actLayerPath(owner, l), l])); let matched = 0, missing = 0;
+      edit('Import action', () => {
+        const a = actCreate(owner, actUniqueName(owner, String(j.action.name || 'Imported').slice(0, 100)), kind, { dur: Math.max(1, Math.min(100000, Math.round(+j.action.dur) || 24)), ...(bone ? { bone: bone.id } : {}) });
+        for (const [p, ch] of Object.entries(j.layers)) { const l = byPath.get(p); if (!l) { missing++; continue; } l.actions = l.actions || {}; l.actions[a.id] = { ch: clone(ch) }; matched++; }
+        validateProject({ format: 1, doc: JSON.parse(snapshot()) });
+      });
+      toast(`Imported action: ${matched} layer(s) matched${missing ? `, ${missing} not found` : ''}`, missing ? 'err' : 'ok');
+    } catch (e) { toast('Import failed: ' + e.message, 'err'); }
+  };
+  inp.click();
+}
+const actOldRenderSide = renderSide;
+renderSide = function () { if (currentTab === 'actions') { const el = $('#tabBody'); if (el && el.contains(document.activeElement) && document.activeElement.matches('[data-actfilter]')) return; return renderActions(); } return actOldRenderSide(); };
+const actOldInitSide = initSide;
+initSide = function () {
+  const jobs = $('#sideTabs [data-tab="jobs"]');
+  if (jobs && !$('#sideTabs [data-tab="actions"]')) { const b = document.createElement('button'); b.dataset.tab = 'actions'; b.textContent = 'Actions'; jobs.parentNode.insertBefore(b, jobs); }
+  actOldInitSide();
+};
+// The timeline says which context is being edited.
+const actOldTLContext = renderTimelineContext;
+renderTimelineContext = function () {
+  actOldTLContext();
+  const a = actActive(), host = $('#tlcontext'); if (!host) return;
+  document.body.classList.toggle('in-action', !!a);
+  document.body.classList.toggle('action-regular', !!a && a.action.kind!=='smart');
+  document.body.classList.toggle('action-smart', a?.action.kind==='smart');
+  let tag = $('#tlAction'); if (!tag) { tag = document.createElement('span'); tag.id = 'tlAction'; host.parentNode.insertBefore(tag, host); }
+  const text = a ? `▶ Action: ${a.action.name}${a.action.kind === 'smart' ? ' (Smart Bone)' : ''}` : '';
+  if (tag._t !== text) { tag._t = text; tag.innerHTML = a ? `${esc(text)} <button class="ib sm" id="tlMainline" title="Return to Mainline">Mainline</button>` : ''; const m = $('#tlMainline'); if (m) m.onclick = () => runCmd('act.mainline'); }
+};
+// Exporting renders Mainline.
+{ const c = CMDS.find((c) => c.id === 'file.export'); if (c) { const run = c.run; c.run = (...a) => (actActive() ? toast('Return to Mainline before exporting (Actions panel)', 'err') : run(...a)); } }
+
+// ---------- animated layer order ----------
+// A Group or Bone layer with "Animated layer order" keeps its child order per frame in its 'order' channel (step keys
+// of child ids). Frame 0 / Setup reordering changes the stored order; later frames key the order instead.
+CH_LABEL.order = 'Layer ordering';
+function orderAt(P, f) {
+  if (!P || !P.animOrder || !P.ch.order || !P.ch.order.keys.length) return P ? P.children : [];
+  const ids = String(val(P, 'order', f) || '').split(','), byId = new Map(P.children.map((c) => [c.id, c]));
+  const out = ids.map((id) => byId.get(id)).filter(Boolean); for (const c of P.children) if (!out.includes(c)) out.push(c);
+  return out;
+}
+const orderOldDrawContent = drawContent;
+drawContent = function (ctx, L, R, lc) {
+  if (!(L.type === 'group' || L.type === 'bone') || !L.animOrder || !L.ch.order) return orderOldDrawContent(ctx, L, R, lc);
+  const stored = L.children; L.children = orderAt(L, R.f);
+  try { return orderOldDrawContent(ctx, L, R, lc); } finally { L.children = stored; }
+};
+const orderOldRenderLayers = renderLayers;
+renderLayers = function () {
+  const swapped = []; for (const l of allLayers()) if (l.animOrder && l.ch && l.ch.order) { swapped.push([l, l.children]); l.children = orderAt(l, S.frame); }
+  try { return orderOldRenderLayers(); } finally { for (const [l, c] of swapped) l.children = c; }
+};
+function orderKeyed(P) { return P && (P.type === 'group' || P.type === 'bone') && P.animOrder && S.mode === 'animate' && S.frame > 0; }
+for (const [id, dir] of [['layer.up', -1], ['layer.down', 1]]) {
+  const c = CMDS.find((x) => x.id === id); if (!c) continue; const run = c.run;
+  c.run = () => {
+    const L = selLayer(), P = L && parentOf(L.id);
+    if (!orderKeyed(P)) { const r = run(); if (P && P.animOrder && P.ch.order) edit('Layer order', () => setVal(P, 'order', P.children.map((x) => x.id).join(','), 0)); return r; }
+    const order = [...orderAt(P, S.frame)], i = order.indexOf(L), j = i + dir; if (j < 0 || j >= order.length) return;
+    [order[i], order[j]] = [order[j], order[i]];
+    edit('Layer order', () => setVal(P, 'order', order.map((x) => x.id).join(','), S.frame, true));
+  };
+}
+// Drag-and-drop within the same parent keys the order too (moving into another parent is never animated).
+const orderOldReparent = reparentLayerSafe;
+reparentLayerSafe = function (l, target, where) {
+  const P = parentOf(l.id), dest = where === 'in' ? target : parentOf(target.id);
+  if (!orderKeyed(P) || dest !== P || where === 'in') return orderOldReparent(l, target, where);
+  const order = orderAt(P, S.frame).filter((x) => x !== l), at = order.indexOf(target); order.splice(at + (where === 'below' ? 1 : 0), 0, l);
+  setVal(P, 'order', order.map((x) => x.id).join(','), S.frame, true);
+};
+LS_FIELDS.push({ k: 'animOrder', tab: 'Depth Sort', label: 'Enable animated layer order', type: 'check', when: (L) => L.type === 'group' || L.type === 'bone', get: (L) => !!L.animOrder,
+  set: (L, v) => { L.animOrder = !!v; if (v && !L.ch.order) L.ch.order = { keys: [{ f: 0, v: L.children.map((c) => c.id).join(','), i: 'step' }] }; if (!v) delete L.ch.order; } });
+
+// ---------- Transform Layer additions ----------
+// Alt-drag moves in depth (Z); Shift+Alt changes depth while compensating scale so the apparent size stays the same;
+// Ctrl-drag on a motion-path key moves that position key. Numeric X / Y / Z are in the tool options.
+{
+  const T = TOOLS.select, down = T.down, move = T.move, up = T.up;
+  T.hint = 'Select a layer in Layers · drag anywhere to move it (Shift constrains) · Alt-drag: depth · Shift+Alt-drag: depth keeping apparent size · Ctrl-drag a motion-path key to move it · handles scale / rotate';
+  T.down = function (e, sx, sy) {
+    const L = selLayer();
+    if (!L) return toast('Select a layer in the Layers panel');
+    const why=writeReason(L);if(why)return toast(why,'err');
+    if (L && !L.lock && (e.ctrlKey || e.metaKey) && S.showPaths) { const k = pathKeyAt(L, sx, sy); if (k !== null) { beginEdit('Edit motion path'); startDrag(e, { mode: 'pathkey', L, f: k, x: val(L, 'x', k), y: val(L, 'y', k), inv: M.inv(parentFull(L)) }); return; } }
+    if (L && !L.lock && e.altKey) { const ts = L.type !== 'audio' ? [L] : []; beginEdit('Move layer in depth'); startDrag(e, { mode: 'depth', keep: e.shiftKey, ts: ts.map((l) => ({ l, z: val(l, 'z', S.frame) || 0, sx: val(l, 'sx', S.frame), sy: val(l, 'sy', S.frame) })) }); return; }
+    return down.call(this, e, sx, sy);
+  };
+  T.move = function (e, sx, sy) {
+    const d = Stage.drag; if (!d) return;
+    if (d.mode === 'pathkey') { const v = cameraDragDelta(d.inv, sx, sy, d.sx, d.sy); setVal(d.L, 'x', round(d.x + v[0]), d.f, true); setVal(d.L, 'y', round(d.y + v[1]), d.f, true); return requestDraw(); }
+    if (d.mode === 'depth') {
+      const dz = -(sy - d.sy) / (Stage.dpr || 1) / (S.view.zoom || 1);
+      for (const t of d.ts) { const z = round(Math.min(CAM_D - 60, t.z + dz)); setVal(t.l, 'z', z); if (d.keep) { const k = (CAM_D - z) / (CAM_D - t.z); setVal(t.l, 'sx', round(t.sx * k, 4)); setVal(t.l, 'sy', round(t.sy * k, 4)); } }
+      return requestDraw();
+    }
+    return move.call(this, e, sx, sy);
+  };
+  T.up = function (e) { const d = Stage.drag; if (d && (d.mode === 'pathkey' || d.mode === 'depth')) return commitEdit(); return up.call(this, e); };
+}
+function pathKeyAt(L, sx, sy) {
+  const fs = [...new Set(['x', 'y'].flatMap((k) => (L.ch[k] ? L.ch[k].keys.map((q) => q.f) : [])))];
+  const cam = stageCamFn(S.frame), V = viewM(); let best = null, bd = 9 * (Stage.dpr || 1);
+  for (const f of fs) { const lc = evalLC(L, f), p = M.ap(M.chain(V, cam(lc.z), lc.world), 0, 0), d = Math.hypot(p[0] - sx, p[1] - sy); if (d < bd) { bd = d; best = f; } }
+  return best;
+}
+function layerPosHTML() {
+  const L = selLayer(); if (!L || L.type === 'audio' || (S.tool !== 'select' && S.tool !== 'rotxy')) return '';
+  const disabled = writeReason(L) ? 'disabled' : '';
+  const n = (k, label, title, step = 1) => `<label title="${title}">${label} <input aria-label="${title}" type="number" data-lpos="${k}" value="${round(val(L, k, S.frame) ?? 0, 3)}" step="${step}" ${k === 'opacity' ? 'min="0" max="1"' : ''} ${disabled} style="width:52px"></label>`;
+  const pivot = (k,label) => `<label title="Pivot ${label}">P${label}<input aria-label="Pivot ${label}" type="number" data-lpivot="${k}" value="${round(L.p[k] || 0,3)}" step="1" ${disabled} style="width:48px"></label>`;
+  return '<span class="sep"></span>'+n('x','X','Position X')+n('y','Y','Position Y')+n('z','Z','Depth Z')+n('rot','↻','Rotation',0.1)+n('sx','Sx','Scale X',0.01)+n('sy','Sy','Scale Y',0.01)+n('opacity','α','Opacity',0.01)+pivot('ox','X')+pivot('oy','Y')+'<button class="btn" data-cmd="layer.pivotcenter" title="Center pivot on artwork">Center pivot</button>';
+}
+
+/* Document camera. World units remain compatible with existing Popai files:
+   the neutral camera sits at (0, 0, CAM_D), looking towards negative Z.
+   camera.p.z is a dolly offset from that position. Workspace views never save. */
+const CAMERA_DEFAULTS = { x:0, y:0, z:0, pan:0, tilt:0, zoom:1, roll:0, shake:0, shakeFreq:10,
+  focusDistance:CAM_D, focusRange:750, maxBlur:12 };
+const CAMERA_LIMITS = { x:[-1e7,1e7], y:[-1e7,1e7], z:[-1e7,1e7], pan:[-36000,36000], tilt:[-89,89],
+  zoom:[0.005,500], roll:[-36000,36000], shake:[0,10000], shakeFreq:[0,120], focusDistance:[1,1e7], focusRange:[1,1e7], maxBlur:[0,200] };
+const CAMERA_TOOLS = new Set(['camera','camzoom','camroll','campantilt']);
+const CAMERA_NEAR = 1;
+const CAMERA_VIEW = { mode:'camera', yaw:28, pitch:24, distance:CAM_D*2, showPath:true, showGuides:true, hideKeys:false, orbitRadius:CAM_D };
+function cameraMigrate(d) {
+  if (!d?.camera) return d;
+  const c=d.camera; c.p ||= {}; c.ch ||= {};
+  for (const [k,v] of Object.entries(CAMERA_DEFAULTS)) if(c.p[k]===undefined)c.p[k]=v;
+  if(c.dofEnabled===undefined)c.dofEnabled=false;
+  return d;
+}
+const cameraNewDoc=newDoc;
+newDoc=function(o){return cameraMigrate(cameraNewDoc(o));};
+const cameraValidateProject=validateProject;
+validateProject=function(j){
+  const d=cameraValidateProject(j); cameraMigrate(d);
+  if(typeof d.camera.dofEnabled!=='boolean')throw Error('Invalid camera depth of field');
+  for(const [k,limits] of Object.entries(CAMERA_LIMITS)) {
+    if(!Number.isFinite(d.camera.p[k])||d.camera.p[k]<limits[0]||d.camera.p[k]>limits[1])throw Error('Invalid camera '+k);
+    for(const key of d.camera.ch[k]?.keys||[])if(typeof key.v!=='number'||!Number.isFinite(key.v)||key.v<limits[0]||key.v>limits[1])throw Error('Invalid camera key '+k);
+  }
+  for(const l of flattenDocument(d).values())for(const k of ['faceCamera','immuneDOF'])if(l[k]!==undefined&&typeof l[k]!=='boolean')throw Error('Invalid layer '+k);
+  return d;
+};
+const cameraSetVal=setVal;
+const cameraValidateCmd=validateCmd;
+validateCmd=function(c){if(c?.op?.startsWith('cam')&&actActive())return 'Return to Mainline to edit the scene camera';return cameraValidateCmd(c);};
+setVal=function(o,path,v,f=S.frame,force=false){
+  if(o?.id==='CAM') {
+    if(actActive())throw Error('Return to Mainline to edit the scene camera');
+    const limits=CAMERA_LIMITS[path];
+    if(limits&&(!Number.isFinite(v)||v<limits[0]||v>limits[1]))throw Error('Camera '+path+' is out of range');
+  }
+  return cameraSetVal(o,path,v,f,force);
+};
+
+// Homographies extend the existing affine matrix API for tilted camera planes.
+// Six-number matrices keep the original fast path and existing file behavior.
+const cameraAffine={mul:M.mul,inv:M.inv,ap:M.ap,apv:M.apv,scaleOf:M.scaleOf,set:M.set};
+function cameraH(m){return m.length===9?m:[m[0],m[2],m[4],m[1],m[3],m[5],0,0,1];}
+M.mul=function(a,b){
+  if(a.length!==9&&b.length!==9)return cameraAffine.mul(a,b);
+  a=cameraH(a);b=cameraH(b);const out=Array(9).fill(0);
+  for(let r=0;r<3;r++)for(let c=0;c<3;c++)for(let k=0;k<3;k++)out[r*3+c]+=a[r*3+k]*b[k*3+c];
+  return out;
+};
+M.inv=function(m){
+  if(m.length!==9)return cameraAffine.inv(m);
+  const [a,b,c,d,e,f,g,h,i]=m,A=e*i-f*h,B=c*h-b*i,C=b*f-c*e,D=f*g-d*i,E=a*i-c*g,F=c*d-a*f,G=d*h-e*g,H=b*g-a*h,I=a*e-b*d;
+  const det=a*A+b*D+c*G;if(Math.abs(det)<1e-15)return [0,0,0,0,0,0,0,0,1];
+  return [A,B,C,D,E,F,G,H,I].map(v=>v/det);
+};
+M.ap=function(m,x,y){
+  if(m.length!==9)return cameraAffine.ap(m,x,y);
+  const w=m[6]*x+m[7]*y+m[8],den=Math.abs(w)<1e-9?(w<0?-1e-9:1e-9):w;
+  return [(m[0]*x+m[1]*y+m[2])/den,(m[3]*x+m[4]*y+m[5])/den];
+};
+M.apv=function(m,x,y){if(m.length!==9)return cameraAffine.apv(m,x,y);const p=M.ap(m,0,0),q=M.ap(m,x,y);return [q[0]-p[0],q[1]-p[1]];};
+M.scaleOf=function(m){if(m.length!==9)return cameraAffine.scaleOf(m);const p=M.ap(m,0,0),x=M.ap(m,1,0),y=M.ap(m,0,1);return Math.sqrt(Math.abs((x[0]-p[0])*(y[1]-p[1])-(x[1]-p[1])*(y[0]-p[0])))||1e-9;};
+M.set=function(ctx,m){if(m.length!==9)return cameraAffine.set(ctx,m);const p=M.ap(m,0,0),x=M.ap(m,1,0),y=M.ap(m,0,1);ctx.setTransform(x[0]-p[0],x[1]-p[1],y[0]-p[0],y[1]-p[1],p[0],p[1]);};
+function cameraDragDelta(inv,x,y,sx,sy){const a=M.ap(inv,sx,sy),b=M.ap(inv,x,y);return [b[0]-a[0],b[1]-a[1]];}
+const cameraDot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+function cameraBasis(pan,tilt,roll=0){
+  const a=pan*DEG,b=tilt*DEG,r=roll*DEG,ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cr=Math.cos(r),sr=Math.sin(r);
+  const right=[ca,0,sa],down=[sa*sb,cb,-ca*sb];
+  return {right:right.map((v,i)=>cr*v+sr*down[i]),down:down.map((v,i)=>cr*v-sr*right[i]),forward:[sa*cb,-sb,-ca*cb]};
+}
+function cameraStateAt(f){
+  f=actCameraFrame(f);
+  const c=S.doc.camera,read=k=>{const n=val(c,k,f);return Number.isFinite(n)?n:CAMERA_DEFAULTS[k];};
+  const amount=Math.max(0,read('shake')),t=f/S.doc.fps*read('shakeFreq');
+  const pan=read('pan'),tilt=read('tilt'),roll=read('roll')+(amount?amount*.05*vnoise(t,3):0);
+  return {position:[read('x')+(amount?amount*vnoise(t,1):0),read('y')+(amount?amount*vnoise(t,2):0),CAM_D+read('z')],
+    pan,tilt,roll,zoom:clamp(read('zoom'),.005,500),...cameraBasis(pan,tilt,roll),dof:!!c.dofEnabled,
+    focusDistance:Math.max(1,read('focusDistance')),focusRange:Math.max(1,read('focusRange')),maxBlur:clamp(read('maxBlur'),0,200)};
+}
+function cameraWorkspaceState(f){
+  if(CAMERA_VIEW.mode==='camera'||S.outputOnly)return cameraStateAt(f);
+  const pan=CAMERA_VIEW.yaw,tilt=CAMERA_VIEW.pitch,b=cameraBasis(pan,tilt),sceneCamera=cameraStateAt(f),target=sceneCamera.position.map(v=>v*.5),distance=Math.max(CAMERA_VIEW.distance,Math.hypot(...sceneCamera.position)*1.5);
+  return {position:b.forward.map((v,i)=>target[i]-v*distance),pan,tilt,roll:0,zoom:.65,...b,dof:false,focusDistance:distance,focusRange:750,maxBlur:0};
+}
+function cameraDepth(state,p){return cameraDot(state.forward,p.map((v,i)=>v-state.position[i]));}
+function cameraProject(state,p){const v=p.map((n,i)=>n-state.position[i]),d=cameraDot(state.forward,v),focal=CAM_D*state.zoom;return {x:focal*cameraDot(state.right,v)/Math.max(CAMERA_NEAR,d),y:focal*cameraDot(state.down,v)/Math.max(CAMERA_NEAR,d),depth:d};}
+function cameraProjection(state){
+  const cache=new Map(),focal=CAM_D*state.zoom,c=state.position;
+  return (z=0)=>{
+    if(cache.has(z))return cache.get(z);
+    const d=-cameraDot(state.forward,c)+state.forward[2]*z;
+    let m;
+    if(Math.abs(state.forward[0])+Math.abs(state.forward[1])<1e-10&&d>CAMERA_NEAR&&state.forward[2]<0){
+      const s=focal/d;m=M.chain(M.r(-state.roll*DEG),M.s(s),M.t(-c[0],-c[1]));
+    }else m=[focal*state.right[0],focal*state.right[1],focal*(state.right[2]*z-cameraDot(state.right,c)),
+      focal*state.down[0],focal*state.down[1],focal*(state.down[2]*z-cameraDot(state.down,c)),state.forward[0],state.forward[1],d];
+    cache.set(z,m);return m;
+  };
+}
+camFn=function(f){return cameraProjection(cameraStateAt(f));};
+function stageCamFn(f){return cameraProjection(cameraWorkspaceState(f));}
+function cameraFlag(L,k){return !!(L[k]||ancestors(L.id).some(a=>a[k]));}
+function cameraLayerProjection(R,L,lc){
+  if(camImmune(L))return R.view;
+  const state=R.cameraState||cameraStateAt(R.f??S.frame);
+  if(cameraFlag(L,'faceCamera')){
+    const origin=M.ap(lc.world,0,0),p=cameraProject(state,[...origin,lc.z]);
+    if(p.depth>CAMERA_NEAR)return M.chain(R.view,M.t(p.x,p.y),M.r(-state.roll*DEG),M.s(CAM_D*state.zoom/p.depth),M.t(-origin[0],-origin[1]));
+  }
+  return M.mul(R.view,R.cam(lc.z));
+}
+function cameraFullMatrix(R,L,lc){return M.mul(cameraLayerProjection(R,L,lc),lc.world);}
+function cameraDofRadius(R,L,lc){
+  const c=R.cameraState;if(!c?.dof||isContainer(L)||camImmune(L)||cameraFlag(L,'immuneDOF'))return 0;
+  const p=M.ap(lc.world,0,0),distance=cameraDepth(c,[...p,lc.z]);
+  return c.maxBlur*clamp(Math.abs(distance-c.focusDistance)/c.focusRange,0,1)*M.scaleOf(R.view);
+}
+function cameraFov(zoom=val(S.doc.camera,'zoom',S.frame)){return 2*Math.atan(S.doc.h/(2*CAM_D*zoom))/DEG;}
+function cameraZoomForFov(degrees){return S.doc.h/(2*CAM_D*Math.tan(degrees*DEG/2));}
+function cameraFocalLength(zoom=val(S.doc.camera,'zoom',S.frame)){return 12/Math.tan(cameraFov(zoom)*DEG/2);}
+
+// Rasterize only tilted leaf planes. Ordinary camera moves keep the original
+// vector Canvas2D path; a homogeneous GPU quad provides perspective-correct
+// sampling and near-plane clipping. A clipped triangle mesh is the fallback.
+const CAMERA_WARP={canvas:null,gl:null,program:null,buffer:null,texture:null,failed:false,backend:'Canvas2D'};
+function cameraWarpGL(){
+  if(CAMERA_WARP.failed)return null;if(CAMERA_WARP.gl)return CAMERA_WARP;
+  try{
+    const canvas=document.createElement('canvas'),gl=canvas.getContext('webgl2',{alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:true,antialias:true});
+    if(!gl)throw Error('No WebGL');
+    const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error('Camera shader');return s;};
+    const v=shader(gl.VERTEX_SHADER,'#version 300 es\nin vec2 uv; uniform mat3 plane; uniform vec2 viewport; out vec2 tex; void main(){vec3 q=plane*vec3(uv,1.0);gl_Position=vec4(2.0*q.x/viewport.x-q.z,q.z-2.0*q.y/viewport.y,2.0-q.z,q.z);tex=uv;}');
+    const f=shader(gl.FRAGMENT_SHADER,'#version 300 es\nprecision highp float;uniform sampler2D image;in vec2 tex;out vec4 color;void main(){color=texture(image,tex);}');
+    const program=gl.createProgram();gl.attachShader(program,v);gl.attachShader(program,f);gl.linkProgram(program);gl.deleteShader(v);gl.deleteShader(f);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error('Camera program');
+    const buffer=gl.createBuffer(),texture=gl.createTexture();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,0,1,0,0,1,1,1]),gl.STATIC_DRAW);
+    canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();CAMERA_WARP.failed=true;CAMERA_WARP.backend='Canvas2D mesh';});
+    Object.assign(CAMERA_WARP,{canvas,gl,program,buffer,texture,backend:'WebGL2'});return CAMERA_WARP;
+  }catch(e){CAMERA_WARP.failed=true;CAMERA_WARP.backend='Canvas2D mesh';return null;}
+}
+function cameraTextureTriangle(ctx,source,a,b,c){
+  const A=[a.x/a.w,a.y/a.w],B=[b.x/b.w,b.y/b.w],C=[c.x/c.w,c.y/c.w];
+  if(![...A,...B,...C].every(Number.isFinite))return;
+  const inv=cameraAffine.inv([b.u-a.u,b.v-a.v,c.u-a.u,c.v-a.v,a.u,a.v]);
+  const m=cameraAffine.mul([B[0]-A[0],B[1]-A[1],C[0]-A[0],C[1]-A[1],A[0],A[1]],inv);
+  ctx.save();ctx.beginPath();ctx.moveTo(...A);ctx.lineTo(...B);ctx.lineTo(...C);ctx.closePath();ctx.clip();cameraAffine.set(ctx,m);ctx.drawImage(source,0,0);ctx.restore();
+}
+function cameraWarpPlane(ctx,source,h,W,H){
+  const gpu=cameraWarpGL();
+  if(gpu){
+    const {canvas,gl,program,buffer,texture}=gpu;
+    canvas.width=W;canvas.height=H;gl.viewport(0,0,W,H);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER,buffer);const a=gl.getAttribLocation(program,'uv');gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+    const unit=M.mul(h,M.s(source.width,source.height)),p=cameraH(unit);
+    gl.uniformMatrix3fv(gl.getUniformLocation(program,'plane'),false,new Float32Array([p[0],p[3],p[6],p[1],p[4],p[7],p[2],p[5],p[8]]));
+    gl.uniform2f(gl.getUniformLocation(program,'viewport'),W,H);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source);gl.uniform1i(gl.getUniformLocation(program,'image'),0);gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    ctx.drawImage(canvas,0,0);return;
+  }
+  const m=cameraH(h),n=12;
+  const point=(u,v)=>({u,v,x:m[0]*u+m[1]*v+m[2],y:m[3]*u+m[4]*v+m[5],w:m[6]*u+m[7]*v+m[8]});
+  const triangle=(a,b,c)=>{
+    const input=[a,b,c],out=[];for(let i=0;i<3;i++){const p=input[i],q=input[(i+1)%3],pi=p.w>=CAMERA_NEAR,qi=q.w>=CAMERA_NEAR;if(pi)out.push(p);if(pi!==qi){const t=(CAMERA_NEAR-p.w)/(q.w-p.w);out.push(Object.fromEntries(['u','v','x','y','w'].map(k=>[k,lerp(p[k],q[k],t)])));}}
+    for(let i=1;i<out.length-1;i++)cameraTextureTriangle(ctx,source,out[0],out[i],out[i+1]);
+  };
+  for(let y=0;y<n;y++)for(let x=0;x<n;x++){const a=point(x*source.width/n,y*source.height/n),b=point((x+1)*source.width/n,y*source.height/n),c=point(x*source.width/n,(y+1)*source.height/n),d=point((x+1)*source.width/n,(y+1)*source.height/n);triangle(a,b,c);triangle(b,d,c);}
+}
+function cameraPlaneBounds(L,R,lc){
+  const points=[],add=(x,y,m=lc.world)=>points.push(M.ap(m,x,y));let pad=4;
+  if(L.type==='vector'){
+    const P=lc.P=deformedPts(L,R.f,lc);
+    for(const path of L.paths)for(let i=0;i<path.pts.length-(path.closed?0:1);i++)for(const p of vectorCubic(L,path,i,P,R.f,lc))add(...p);
+    pad+=Math.max(0,...L.shapes.map(s=>shapeStyle(L,s,R.f).width||0))*M.scaleOf(lc.world)*3+64;
+  }else if(L.type==='image'){for(const x of [-L.iw/2,L.iw/2])for(const y of [-L.ih/2,L.ih/2])add(x,y);}
+  else if(L.type==='text'){
+    _hitCtx.font=`${L.bold?'700 ':''}${L.size}px ${L.font}`;const lines=String(L.text).split('\n'),w=Math.max(1,...lines.map(l=>_hitCtx.measureText(l).width)),h=lines.length*L.size*1.3;
+    for(const x of [-w/2,w/2])for(const y of [-h/2,h/2])add(x,y);pad+=L.size*.3;
+  }else if(L.type==='particle'){
+    const m=M.mul(lc.base,lc.relParent);for(const q of particleList(L,R.f,lc)){const r=Math.max(1,q.size)*1.5;add(q.x-r,q.y-r,m);add(q.x+r,q.y+r,m);}
+  }
+  const bounds=points.reduce((b,p)=>{if(p.every(Number.isFinite)){b[0]=Math.min(b[0],p[0]);b[1]=Math.min(b[1],p[1]);b[2]=Math.max(b[2],p[0]);b[3]=Math.max(b[3],p[1]);}return b;},[Infinity,Infinity,-Infinity,-Infinity]);
+  if(!Number.isFinite(bounds[0]))return null;const x=bounds[0]-pad,y=bounds[1]-pad;
+  return {x,y,w:Math.max(1,bounds[2]+pad-x),h:Math.max(1,bounds[3]+pad-y)};
+}
+const cameraOriginalContent=drawContent;
+drawContent=function(ctx,L,R,lc){
+  if(R.planeCapture||isContainer(L)||lc.full.length!==9)return cameraOriginalContent(ctx,L,R,lc);
+  const bounds=cameraPlaneBounds(L,R,lc);if(!bounds)return;
+  const depths=[[bounds.x,bounds.y],[bounds.x+bounds.w,bounds.y],[bounds.x,bounds.y+bounds.h],[bounds.x+bounds.w,bounds.y+bounds.h]].map(p=>cameraDepth(R.cameraState,[...p,lc.z]));
+  if(Math.max(...depths)<=CAMERA_NEAR)return;
+  const center=[bounds.x+bounds.w/2,bounds.y+bounds.h/2],h=lc.tilted?M.mul(lc.full,M.inv(lc.world)):M.mul(R.view,R.cam(lc.z)),project=M.ap(h,...center),px=M.ap(h,center[0]+1,center[1]),py=M.ap(h,center[0],center[1]+1);
+  let scale=clamp(Math.max(Math.hypot(px[0]-project[0],px[1]-project[1]),Math.hypot(py[0]-project[0],py[1]-project[1])),.05,8);
+  scale=Math.min(scale,4096/bounds.w,4096/bounds.h);
+  const W=Math.max(1,Math.ceil(bounds.w*scale)),H=Math.max(1,Math.ceil(bounds.h*scale)),off=Pool.get(W,H),capture=M.chain(M.s(scale),M.t(-bounds.x,-bounds.y));
+  try{
+    const copy={...lc,full:M.mul(capture,lc.world)};
+    cameraOriginalContent(off.getContext('2d'),L,{...R,view:capture,cam:()=>M.I(),planeCapture:true,W,H,rec:null},copy);if(copy.P)lc.P=copy.P;
+    ctx.save();ctx.setTransform(1,0,0,1,0,0);cameraWarpPlane(ctx,off,M.mul(h,M.inv(capture)),R.W,R.H);ctx.restore();
+  }finally{Pool.put(off);}
+};
+
+// Hit-tests inverse-project the pointer into the drawing plane. Passing an
+// identity matrix to the original path tests avoids an affine approximation.
+const cameraHitLayer=hitLayerEntry;
+hitLayerEntry=function(e,sx,sy,tol=6){
+  if(e.full.length!==9)return cameraHitLayer(e,sx,sy,tol);
+  const q=M.ap(M.inv(e.full),sx,sy),world=M.ap(e.world,...q);
+  if(cameraDepth(cameraWorkspaceState(S.frame),[...world,e.z])<=CAMERA_NEAR)return null;
+  return cameraHitLayer({...e,full:M.I()},q[0],q[1],tol/Math.max(.001,M.scaleOf(e.full)));
+};
+
+// World-space distance is used even when parents move or the camera turns.
+depthSorted=function(L,list,f){
+  if(!L.depthSort||list.length<2)return list;const state=cameraStateAt(f);
+  const distance=l=>{const lc=evalLC(l,f),p=M.ap(lc.world,0,0),v=[...p,lc.z];return L.trueDistance?Math.hypot(...v.map((n,i)=>n-state.position[i])):cameraDepth(state,v);};
+  return list.map((l,i)=>({l,i,d:distance(l)})).sort((a,b)=>a.d-b.d||a.i-b.i).map(o=>o.l);
+};
+
+// ---------- Camera tools and workspace-only orbit ----------
+function cameraEditReason(){return actActive()?'Return to Mainline to edit the scene camera':CAMERA_VIEW.mode!=='camera'?'Return to Camera view to animate the camera':null;}
+const cameraToolAvail=toolAvail;
+toolAvail=function(id){if(CAMERA_TOOLS.has(id))return cameraEditReason();if(id==='orbitworkspace')return null;return cameraToolAvail(id);};
+function cameraBegin(e,mode){
+  const why=cameraEditReason();if(why)return toast(why,'err');
+  beginEdit('Camera '+mode);const values=Object.fromEntries(Object.keys(CAMERA_DEFAULTS).map(k=>[k,val(S.doc.camera,k,S.frame)]));
+  startDrag(e,{cameraMode:mode,values,basis:cameraStateAt(S.frame),invView:M.inv(viewM())});
+}
+function cameraMove(e,sx,sy){
+  const d=Stage.drag;if(!d?.cameraMode)return;const c=S.doc.camera,dx=(sx-d.sx)/(Stage.dpr||1),dy=(sy-d.sy)/(Stage.dpr||1);
+  let mode=d.cameraMode;if(mode==='track'&&e.altKey)mode='dolly';if(mode==='pantilt'&&e.altKey)mode='orbit';
+  const set=(k,v)=>setVal(c,k,clamp(round(v,5),...CAMERA_LIMITS[k]));
+  if(mode==='zoom')set('zoom',d.values.zoom*Math.exp(-dy/180));
+  else if(mode==='roll'){let a=d.values.roll+dx/3;if(e.shiftKey)a=Math.round(a/15)*15;set('roll',a);}
+  else if(mode==='pantilt'){
+    let x=dx*.15,y=dy*.15;if(e.shiftKey){if(Math.abs(x)>Math.abs(y))y=0;else x=0;}
+    set('pan',d.values.pan-x);set('tilt',d.values.tilt+y);
+  }else if(mode==='orbit'){
+    const radius=Math.max(1,CAMERA_VIEW.orbitRadius),pivot=d.basis.position.map((v,i)=>v+d.basis.forward[i]*radius);
+    const pan=d.values.pan-dx*.15,tilt=clamp(d.values.tilt+dy*.15,-89,89),forward=cameraBasis(pan,tilt).forward;
+    const p=pivot.map((v,i)=>v-forward[i]*radius);set('x',p[0]);set('y',p[1]);set('z',p[2]-CAM_D);set('pan',pan);set('tilt',tilt);
+  }else{
+    const amount=dy/(S.view.zoom||1)/Math.max(.01,d.values.zoom),v=mode==='dolly'?d.basis.forward.map(n=>n*amount):null;
+    if(v){set('x',d.values.x+v[0]);set('y',d.values.y+v[1]);set('z',d.values.z+v[2]);}
+    else{
+      const q=cameraDragDelta(d.invView,sx,sy,d.sx,d.sy);if(e.shiftKey){if(Math.abs(q[0])>Math.abs(q[1]))q[1]=0;else q[0]=0;}
+      const distance=Math.max(60,cameraDepth(d.basis,[0,0,0])),scale=distance/(CAM_D*d.values.zoom);
+      const delta=d.basis.right.map((v,i)=>-(v*q[0]+d.basis.down[i]*q[1])*scale);
+      set('x',d.values.x+delta[0]);set('y',d.values.y+delta[1]);set('z',d.values.z+delta[2]);
+    }
+  }
+  requestDraw();
+}
+for(const [id,icon,name,key,mode,hint] of [
+  ['camera','↔','Track Camera','4','track','Drag to track · Shift constrains · Alt-drag to dolly forward/back'],
+  ['camzoom','⌕','Zoom Camera','5','zoom','Drag vertically to change focal length · camera position stays fixed'],
+  ['camroll','↻','Roll Camera','6','roll','Drag horizontally to roll · Shift snaps to 15°'],
+  ['campantilt','◎','Pan/Tilt Camera','7','pantilt','Drag to turn the camera · Shift constrains · Alt-drag orbits the current look point']
+])defTool(id,{icon,name,key,cursor:'move',hint,down(e){cameraBegin(e,mode);},move:cameraMove,up(){if(Stage.drag?.cameraMode)commitEdit();}});
+TOOL_GROUPS.find(g=>g[0]==='Camera')[1]=[...CAMERA_TOOLS];
+defTool('orbitworkspace',{icon:'◇',name:'Orbit Workspace',key:'9',cursor:'grab',hint:'Inspect depth from outside the camera · changes your view only · Home returns to Camera view',
+  down(e){CAMERA_VIEW.mode='orbit';startDrag(e,{workspaceOrbit:true,yaw:CAMERA_VIEW.yaw,pitch:CAMERA_VIEW.pitch});requestDraw();},
+  move(e,sx,sy){const d=Stage.drag;if(!d?.workspaceOrbit)return;CAMERA_VIEW.yaw=d.yaw-(sx-d.sx)/(Stage.dpr||1)*.2;CAMERA_VIEW.pitch=clamp(d.pitch+(sy-d.sy)/(Stage.dpr||1)*.2,-85,85);requestDraw();},up(){}});
+TOOL_GROUPS.find(g=>g[0]==='View')[1].push('orbitworkspace');
+const cameraSetTool=setTool;
+setTool=function(id){
+  if(!TOOLS[id])return;
+  const why=toolAvail(id);if(why)return toast(why,'err');
+  S.camSel=CAMERA_TOOLS.has(id);cameraSetTool(id);renderProps();requestDraw();
+};
+const cameraFitView=fitView;
+fitView=function(){CAMERA_VIEW.mode='camera';return cameraFitView();};
+CMDS.find(c=>c.id==='view.fit').run=()=>fitView();
+function cameraView(mode){
+  CAMERA_VIEW.mode=mode;
+  if(mode==='top'){CAMERA_VIEW.yaw=0;CAMERA_VIEW.pitch=80;}
+  if(mode==='side'){CAMERA_VIEW.yaw=70;CAMERA_VIEW.pitch=8;}
+  if(mode==='orbit'){CAMERA_VIEW.yaw=28;CAMERA_VIEW.pitch=24;}
+  if(mode!=='camera'&&CAMERA_TOOLS.has(S.tool)){S.tool='orbitworkspace';S.camSel=true;}
+  updateToolbar();renderToolOpts();renderProps();requestDraw();
+}
+function cameraResetKey(paths=['x','y','z','pan','tilt','zoom','roll']){
+  const why=cameraEditReason();if(why)return toast(why,'err');
+  return edit('Reset camera at playhead',()=>{for(const k of paths)setVal(S.doc.camera,k,S.frame===0?CAMERA_DEFAULTS[k]:baseGet(S.doc.camera,k),S.frame,S.frame>0);});
+}
+function cameraKeyPose(){const why=cameraEditReason();if(why)return toast(why,'err');return edit('Key camera pose',()=>{for(const k of ['x','y','z','pan','tilt','zoom','roll'])setVal(S.doc.camera,k,val(S.doc.camera,k,S.frame),S.frame,true);});}
+function cameraTarget(){const L=selLayer();if(!L)return null;const lc=evalLC(L,S.frame),p=M.ap(lc.world,L.p.ox||0,L.p.oy||0);return [...p,lc.z];}
+function cameraAim(){
+  const target=cameraTarget();if(!target)return toast('Select a layer to aim at','err');const why=cameraEditReason();if(why)return toast(why,'err');
+  const state=cameraStateAt(S.frame),v=target.map((n,i)=>n-state.position[i]);
+  return edit('Aim camera at selection',()=>{setVal(S.doc.camera,'pan',Math.atan2(v[0],-v[2])/DEG);setVal(S.doc.camera,'tilt',clamp(Math.atan2(-v[1],Math.hypot(v[0],v[2]))/DEG,-89,89));});
+}
+function cameraFocus(){
+  const target=cameraTarget();if(!target)return toast('Select a layer to focus on','err');const why=cameraEditReason();if(why)return toast(why,'err');
+  edit('Focus camera on selection',()=>{S.doc.camera.dofEnabled=true;setVal(S.doc.camera,'focusDistance',clamp(cameraDepth(cameraStateAt(S.frame),target),1,1e7));});
+}
+const cameraSelect=()=>{CAMERA_VIEW.mode='camera';S.camSel=true;setTab('props');refreshAll();};
+Object.assign(CMDS.find(c=>c.id==='cam.select'),{run:cameraSelect});
+Object.assign(CMDS.find(c=>c.id==='cam.tool'),{label:'Track Camera',run:()=>setTool('camera')});
+Object.assign(CMDS.find(c=>c.id==='cam.reset'),{en:()=>actActive()?'Return to Mainline to edit the scene camera':null,run:()=>edit('Remove all camera animation',()=>{const c=S.doc.camera;c.ch={};Object.assign(c.p,CAMERA_DEFAULTS);c.dofEnabled=false;})});
+cmd('cam.zoom','Camera','Zoom Camera',()=>setTool('camzoom'));
+cmd('cam.roll','Camera','Roll Camera',()=>setTool('camroll'));
+cmd('cam.pantilt','Camera','Pan/Tilt Camera',()=>setTool('campantilt'));
+cmd('cam.key','Camera','Key camera pose',cameraKeyPose,{en:()=>cameraEditReason()});
+cmd('cam.resetkey','Camera','Reset camera at playhead',()=>cameraResetKey(),{en:()=>cameraEditReason()});
+cmd('cam.aim','Camera','Aim at selected layer',cameraAim,{en:()=>cameraEditReason()||(!selLayer()?'Select a layer':null)});
+cmd('cam.focus','Camera','Focus on selected layer',cameraFocus,{en:()=>cameraEditReason()||(!selLayer()?'Select a layer':null)});
+cmd('cam.path','Camera','Show camera motion path',()=>{CAMERA_VIEW.showPath=!CAMERA_VIEW.showPath;renderProps();requestDraw();});
+cmd('cam.view','View','Camera view',()=>cameraView('camera'));
+cmd('cam.overview','View','3D workspace overview',()=>cameraView('orbit'));
+cmd('cam.top','View','Workspace from above',()=>cameraView('top'));
+cmd('cam.side','View','Workspace from side',()=>cameraView('side'));
+cmd('cam.properties','Window','Camera properties',cameraSelect);
+
+// ---------- Inspector, tool options and timeline ----------
+Object.assign(CH_LABEL,{pan:'Camera Pan',tilt:'Camera Tilt',focusDistance:'Focus distance',focusRange:'Focus range',maxBlur:'Maximum focus blur'});
+function cameraField(k,label,tool=false){
+  const value=round(val(S.doc.camera,k,S.frame),3),[min,max]=CAMERA_LIMITS[k],disabled=cameraEditReason()?'disabled':'';
+  const input=`<input type="number" data-cam="${k}" aria-label="${esc(label)}" value="${value}" step="${['zoom'].includes(k)?'.01':['pan','tilt','roll'].includes(k)?'.1':'1'}" min="${min}" max="${max}" ${disabled}>`;
+  return tool?`<label>${label} ${input}</label>`:`<div class="prow" data-label="${esc(label.toLowerCase())}"><span class="pl nodrag">${label}</span><span class="pv">${input}</span>${keyBtn(S.doc.camera,k)}</div>`;
+}
+function cameraLens(tool=false){
+  const disabled=cameraEditReason()?'disabled':'',fov=cameraFov(),mm=cameraFocalLength(),fields=[['fov','Field of view',fov,.1,170],['focal','Focal length (35mm)',mm,1,10000]];
+  return fields.map(([k,label,v,min,max])=>tool?`<label>${k==='fov'?'FOV°':'Lens mm'} <input type="number" data-camlens="${k}" aria-label="${label}" value="${round(v,2)}" min="${min}" max="${max}" step=".1" ${disabled}></label>`:
+    `<div class="prow"><span class="pl">${label}${k==='fov'?' °':' mm'}</span><span class="pv"><input type="number" data-camlens="${k}" aria-label="${label}" value="${round(v,2)}" min="${min}" max="${max}" step=".1" ${disabled}></span><span></span></div>`).join('');
+}
+function cameraViewButtons(){return `<div class="camera-views">${[['camera','Camera'],['orbit','3D overview'],['top','Above'],['side','Side']].map(([mode,label])=>`<button class="ib ${CAMERA_VIEW.mode===mode?'on':''}" data-camview="${mode}">${label}</button>`).join('')}</div>`;}
+cameraProps=function(){
+  return sec('Camera · '+(CAMERA_VIEW.mode==='camera'?'Scene view':'Workspace overview'),cameraViewButtons()+`<div class="camera-actions"><button class="ib" data-camcommand="cam.key">◆ Key pose</button><button class="ib" data-camcommand="cam.resetkey">Reset at playhead</button></div>`+
+    ['x','y','z'].map((k,i)=>cameraField(k,['Track X','Track Y','Dolly Z'][i])).join('')+cameraField('pan','Pan °')+cameraField('tilt','Tilt °')+cameraField('roll','Roll °'))+
+    sec('Lens',cameraLens()+cameraField('zoom','Zoom factor'))+
+    sec('Depth of field',`<label class="camera-check"><input type="checkbox" data-camdof ${S.doc.camera.dofEnabled?'checked':''} ${cameraEditReason()?'disabled':''}> Enable depth of field</label>`+cameraField('focusDistance','Focus distance')+cameraField('focusRange','Focus falloff range')+cameraField('maxBlur','Maximum blur')+`<button class="ib camera-full" data-camcommand="cam.focus">Focus on selected layer</button>`)+
+    sec('Camera movement',cameraField('shake','Shake amount')+cameraField('shakeFreq','Shake frequency')+`<label class="camera-check"><input type="checkbox" data-campath ${CAMERA_VIEW.showPath?'checked':''}> Show camera path in overview</label><label class="camera-check"><input type="checkbox" data-camguides ${CAMERA_VIEW.showGuides?'checked':''}> Frame guides</label><button class="ib camera-full" data-camcommand="cam.aim">Aim at selected layer</button>`)+
+    sec('Notes','<div class="note">Camera moves belong to Mainline. Zoom changes the lens; Alt-drag with Track moves the camera in depth. Overview is for inspecting the scene and never changes exports.</div>','',true);
+};
+function cameraBindControls(el){
+  el.querySelectorAll('[data-cam]').forEach(input=>input.onchange=()=>{
+    const k=input.dataset.cam,n=Number(input.value);if(input.value.trim()===''||!Number.isFinite(n))return refreshAll();
+    const why=cameraEditReason();if(why)return toast(why,'err');edit('Camera '+k,()=>setVal(S.doc.camera,k,clamp(n,...CAMERA_LIMITS[k])));input.blur();
+  });
+  el.querySelectorAll('[data-camlens]').forEach(input=>input.onchange=()=>{
+    const n=Number(input.value);if(!Number.isFinite(n)||n<=0)return refreshAll();const why=cameraEditReason();if(why)return toast(why,'err');
+    const fov=input.dataset.camlens==='focal'?2*Math.atan(12/n)/DEG:clamp(n,.1,170);
+    edit('Camera lens',()=>setVal(S.doc.camera,'zoom',clamp(cameraZoomForFov(fov),...CAMERA_LIMITS.zoom)));input.blur();
+  });
+  el.querySelectorAll('[data-camview]').forEach(b=>b.onclick=()=>cameraView(b.dataset.camview));
+  el.querySelectorAll('[data-camcommand]').forEach(b=>{const command=CMDS.find(c=>c.id===b.dataset.camcommand);b.disabled=!!command?.en?.();b.onclick=()=>runCmd(b.dataset.camcommand);});
+  el.querySelectorAll('[data-camdof]').forEach(i=>i.onchange=()=>{if(cameraEditReason())return;edit('Camera depth of field',()=>S.doc.camera.dofEnabled=i.checked);});
+  el.querySelectorAll('[data-campath]').forEach(i=>i.onchange=()=>{CAMERA_VIEW.showPath=i.checked;requestDraw();});
+  el.querySelectorAll('[data-camguides]').forEach(i=>i.onchange=()=>{CAMERA_VIEW.showGuides=i.checked;requestDraw();});
+  el.querySelectorAll('[data-camorbit]').forEach(i=>i.onchange=()=>{CAMERA_VIEW.orbitRadius=clamp(Number(i.value)||CAM_D,1,1e7);});
+}
+const cameraBindProps=bindProps;
+bindProps=function(el){cameraBindProps(el);cameraBindControls(el);};
+const cameraRenderOptions=renderToolOpts;
+renderToolOpts=function(){
+  if(!CAMERA_TOOLS.has(S.tool)&&S.tool!=='orbitworkspace')return cameraRenderOptions();
+  const el=$('#toolopts');if(!el||el.contains(document.activeElement)&&document.activeElement.tagName==='INPUT')return;
+  const t=TOOLS[S.tool],paths=S.tool==='camera'?['x','y','z']:S.tool==='camroll'?['roll']:S.tool==='campantilt'?['pan','tilt']:[];
+  const html=`<span class="tname" title="${esc(t.hint)}">${t.icon} ${t.name}</span>`+paths.map(k=>cameraField(k,k.toUpperCase(),true)).join('')+
+    (S.tool==='camzoom'?cameraLens(true):'')+(S.tool==='campantilt'?`<label>Orbit radius <input type="number" data-camorbit value="${CAMERA_VIEW.orbitRadius}" min="1" step="10"></label>`:'')+
+    `<button class="ib" data-camview="camera">Camera view</button><button class="ib" data-camview="orbit">3D overview</button>`+
+    (CAMERA_TOOLS.has(S.tool)?'<button class="ib" data-camcommand="cam.key">◆ Key</button><button class="ib" data-camcommand="cam.resetkey">Reset key</button>':'')+
+    `<span class="hint">${esc(cameraEditReason()||t.hint)}</span>`;
+  if(el._h===html)return;el._h=html;el.innerHTML=html;cameraBindControls(el);
+};
+const cameraTimelineOwners=timelineOwners;
+timelineOwners=function(){
+  let owners=cameraTimelineOwners();if(actActive())return owners.filter(o=>o.id!=='CAM');
+  if(!CAMERA_VIEW.hideKeys&&!owners.some(o=>o.id==='CAM')&&Object.values(S.doc.camera.ch).some(ch=>ch.keys?.length))owners=[S.doc.camera,...owners];
+  return owners;
+};
+const cameraChannelGroups=channelGroups;
+channelGroups=function(o){
+  if(o.id!=='CAM')return cameraChannelGroups(o);
+  return [['Camera Tracking',['x','y','z']],['Camera Pan/Tilt',['pan','tilt']],['Camera Zoom',['zoom']],['Camera Roll',['roll']],['Camera Shake',['shake','shakeFreq']],['Camera Focus',['focusDistance','focusRange','maxBlur']]]
+    .map(([label,paths])=>({key:label,label,paths:paths.filter(p=>o.ch[p]?.keys.length),selected:false})).filter(g=>g.paths.length);
+};
+const cameraTimelineContext=renderTimelineContext;
+renderTimelineContext=function(){
+  cameraTimelineContext();const el=$('#tlcontext');if(!el||el.querySelector('[data-hidecam]'))return;
+  const label=document.createElement('label');label.innerHTML=`<input type="checkbox" data-hidecam ${CAMERA_VIEW.hideKeys?'checked':''}> Hide camera keys`;
+  const input=label.querySelector('input');if(input)input.onchange=e=>{CAMERA_VIEW.hideKeys=e.target.checked;requestDraw();};el.appendChild(label);
+};
+const cameraCurrentPose=keyCurrentTimelinePose;
+keyCurrentTimelinePose=function(){if(S.camSel||CAMERA_TOOLS.has(S.tool))return cameraKeyPose();return cameraCurrentPose();};
+CMDS.find(c=>c.id==='anim.keyall').run=keyCurrentTimelinePose;
+LS_FIELDS.push({k:'faceCamera',tab:'General',label:'Rotate to face camera',type:'check',when:L=>L.type!=='audio',get:L=>!!L.faceCamera,set:(L,v)=>{L.faceCamera=!!v;}});
+LS_FIELDS.push({k:'immuneDOF',tab:'General',label:'Immune to depth of field',type:'check',when:L=>L.type!=='audio',get:L=>!!L.immuneDOF,set:(L,v)=>{L.immuneDOF=!!v;}});
+
+// External-view camera path, orientation and frustum. These are editor overlays.
+function cameraDrawOverview(ctx){
+  const dpr=Stage.dpr||1,V=viewM(),viewer=cameraWorkspaceState(S.frame),state=cameraStateAt(S.frame),overview=CAMERA_VIEW.mode!=='camera'&&!S.outputOnly;
+  if(S.outputOnly)return;
+  ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.lineWidth=dpr;ctx.font=`${11*dpr}px sans-serif`;
+  if(overview){
+    const project=p=>{const q=cameraProject(viewer,p);return q.depth>CAMERA_NEAR?M.ap(V,q.x,q.y):null;};
+    const line=(a,b,color)=>{a=project(a);b=project(b);if(!a||!b)return;ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.stroke();};
+    for(let n=-4;n<=4;n++){line([-1000,n*250,0],[1000,n*250,0],'#62708055');line([n*250,-1000,0],[n*250,1000,0],'#62708055');}
+    if(CAMERA_VIEW.showPath){
+      const end=Math.min(100000,S.doc.end),step=Math.max(1,Math.ceil(end/600));let previous=null;ctx.strokeStyle='#65caff';ctx.beginPath();
+      for(let f=0;f<=end;f+=step){const p=project(cameraStateAt(f).position);if(p){previous?ctx.lineTo(...p):ctx.moveTo(...p);}previous=p;}ctx.stroke();
+      const frames=new Set(['x','y','z'].flatMap(k=>(S.doc.camera.ch[k]?.keys||[]).map(k=>k.f)));
+      for(const f of frames){const p=project(cameraStateAt(f).position);if(!p)continue;ctx.fillStyle='#65caff';ctx.fillRect(p[0]-3*dpr,p[1]-3*dpr,6*dpr,6*dpr);ctx.fillText(String(f),p[0]+5*dpr,p[1]-5*dpr);}
+    }
+    const distance=350,halfH=distance*Math.tan(cameraFov(state.zoom)*DEG/2),halfW=halfH*S.doc.w/S.doc.h;
+    const corners=[[-1,-1],[1,-1],[1,1],[-1,1]].map(([x,y])=>state.position.map((v,i)=>v+state.forward[i]*distance+state.right[i]*x*halfW+state.down[i]*y*halfH));
+    corners.forEach((p,i)=>{line(state.position,p,'#ffb55b');line(p,corners[(i+1)%4],'#ffb55b');});
+    const p=project(state.position);if(p){ctx.fillStyle='#ffb55b';ctx.fillText('Camera',p[0]+8*dpr,p[1]);}
+    ctx.fillStyle='#b8dfff';ctx.fillText('3D WORKSPACE · editor view only · Home returns to Camera',16*dpr,ctx.canvas.height-18*dpr);
+  }else if(CAMERA_VIEW.showGuides&&(S.camSel||CAMERA_TOOLS.has(S.tool))){
+    ctx.strokeStyle='#ffffff35';ctx.setLineDash([4*dpr,4*dpr]);
+    const a=M.ap(V,-S.doc.w/2,-S.doc.h/2),b=M.ap(V,S.doc.w/2,S.doc.h/2);
+    for(const t of [1/3,2/3]){ctx.beginPath();ctx.moveTo(lerp(a[0],b[0],t),a[1]);ctx.lineTo(lerp(a[0],b[0],t),b[1]);ctx.moveTo(a[0],lerp(a[1],b[1],t));ctx.lineTo(b[0],lerp(a[1],b[1],t));ctx.stroke();}
+  }
+  ctx.restore();
+}
+const cameraOverlays=drawOverlays;
+drawOverlays=function(ctx){cameraOverlays(ctx);cameraDrawOverview(ctx);};
+const cameraStartDoc=startDoc;
+startDoc=function(d){cameraMigrate(d);CAMERA_VIEW.mode='camera';return cameraStartDoc(d);};
+Object.assign(window.PopaiApp,{val,setVal,setTool,toolAvail,startDoc,validateProject,keyCurrentTimelinePose,
+  cameraStateAt,cameraWorkspaceState,cameraDepth,cameraProject,camFn,stageCamFn,cameraFov,cameraZoomForFov,cameraFocalLength,
+  cameraView,cameraResetKey,cameraKeyPose,cameraAim,cameraFocus,cameraFullMatrix,cameraDofRadius,cameraProjection,cameraDragDelta,
+  CAMERA_VIEW,CAMERA_WARP,M,newDoc,mkLayer,layerCtx,evalLC,lcOf,hitLayerEntry,renderStage,renderFrameCanvas,depthSorted,TOOLS,
+  cameraMigrate,cameraEditReason,cameraMove,cameraBegin,cameraPlaneBounds,cameraWarpPlane,actOpen,timelineOwners,buildRows,cameraProps,validateCmd,
+  actCreate,actCreateForSelectedBone,actActive,actOwnsLayer,actInsertCopy,actSubtree,actPreviewFrame,actProceduralFrame,timelineEnd,timelineMarkers,audioLayers,deleteSelectedKeys,pasteKeys,orderAt});
+
+// ---------- Layer tilt in space: Rotation X / Rotation Y (Moho's Rotate Layer XY) ----------
+// A layer is a flat plane. Rotation X tilts it forward/back, Rotation Y turns it left/right, about its
+// origin. The tilt is combined with the camera into a homography (the same perspective path the camera
+// pan/tilt uses), so tilted layers draw, hit-test and export with correct perspective.
+function tiltOf(L, f) { const rx = +val(L, 'rx', f) || 0, ry = +val(L, 'ry', f) || 0; return rx || ry ? [rx, ry] : null; }
+function m4mul(a, b) { const o = new Array(16).fill(0); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3]; return o; }
+const m4t = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
+const m4rx = (a) => { const s = Math.sin(a), c = Math.cos(a); return [1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]; };
+const m4ry = (a) => { const s = Math.sin(a), c = Math.cos(a); return [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]; };
+const m4from2 = (m, z) => [m[0], m[1], 0, 0, m[2], m[3], 0, 0, 0, 0, 1, 0, m[4], m[5], z, 1];
+const _cameraFullMatrixFlat = cameraFullMatrix;
+cameraFullMatrix = function (R, L, lc) {
+  const f = R.f ?? S.frame;
+  if (camImmune(L) || cameraFlag(L, 'faceCamera')) { lc.tilted = false; return _cameraFullMatrixFlat(R, L, lc); }
+  const chain = [L, ...ancestors(L.id)].filter((N) => N.type !== 'audio');
+  const tilted = chain.map((N) => [N, tiltOf(N, f)]).filter(([, t]) => t);
+  if (!tilted.length) { lc.tilted = false; return _cameraFullMatrixFlat(R, L, lc); }
+  lc.tilted = true;
+  let W = m4from2(lc.world, lc.z);
+  for (const [N, [rx, ry]] of tilted) { // innermost first, each about its own world origin
+    const e = N === L ? lc : evalLC(N, f), o = M.ap(e.world, N.p.ox || 0, N.p.oy || 0);
+    W = m4mul(m4mul(m4t(o[0], o[1], e.z), m4mul(m4ry(ry * DEG), m4mul(m4rx(rx * DEG), m4t(-o[0], -o[1], -e.z)))), W);
+  }
+  const st = R.cameraState || cameraStateAt(f), F = CAM_D * st.zoom, c = st.position, dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const P = [[...st.right.map((v) => F * v), -F * dot(st.right, c)], [...st.down.map((v) => F * v), -F * dot(st.down, c)], [...st.forward, -dot(st.forward, c)]];
+  const H = []; for (const row of P) for (const col of [0, 1, 3]) H.push(row[0] * W[col * 4] + row[1] * W[col * 4 + 1] + row[2] * W[col * 4 + 2] + row[3] * W[col * 4 + 3]);
+  return M.mul(R.view, H);
+};
+CH_LABEL.rx = 'Rotation X'; CH_LABEL.ry = 'Rotation Y';
+{ const _bg = baseGet; baseGet = function (o, path) { const v = _bg(o, path); return v === undefined && (path === 'rx' || path === 'ry') ? 0 : v; }; }
+
+// Rotate layer XY tool: drag left/right turns (Rotation Y), up/down tilts (Rotation X)
+defTool('rotxy', {
+  icon: '⟲', name: 'Rotate layer XY', key: 'R', cursor: 'move',
+  hint: 'Drag left/right to turn the layer (Rotation Y), up/down to tilt it (Rotation X) · Shift snaps to 15° · keys at the playhead like any transform · move it in depth with Alt-drag in Transform layer',
+  down(e, sx, sy) { const L = selLayer(); if (!L) return toast('Select a layer to turn it in space'); const why = typeof writeReason === 'function' ? writeReason(L) : null; if (why) return toast(why, 'err'); beginEdit('Rotate layer XY'); startDrag(e, { L, rx: +val(L, 'rx', S.frame) || 0, ry: +val(L, 'ry', S.frame) || 0 }); },
+  move(e, sx, sy) {
+    const d = Stage.drag; if (!d) return; const k = 0.4 / Stage.dpr;
+    let ry = d.ry + (sx - d.sx) * k, rx = d.rx - (sy - d.sy) * k;
+    if (e.shiftKey) { ry = Math.round(ry / 15) * 15; rx = Math.round(rx / 15) * 15; }
+    setVal(d.L, 'ry', round(ry, 1)); setVal(d.L, 'rx', round(rx, 1)); requestDraw();
+  },
+  up() { commitEdit(); refreshAll(); },
+});
+TOOL_GROUPS[0][1].splice(1, 0, 'rotxy');
+{ const _ta = toolAvail; toolAvail = function (id) { if (id === 'rotxy') { const L = selLayer(); if (!L) return 'Select a layer to turn it in space'; if (L.type === 'audio') return 'Sound layers have no position in space'; return null; } return _ta(id); }; }
+// Transform layer bar: Rotation X / Y fields next to the in-plane angle
+{ const _lp = layerPosHTML; layerPosHTML = function () { const h = _lp(); const L = selLayer(); if (!h || !L) return h; const disabled = typeof writeReason === 'function' && writeReason(L) ? 'disabled' : '';
+  const n = (k, label, title) => `<label title="${title}">${label} <input aria-label="${title}" type="number" data-lpos="${k}" value="${round(val(L, k, S.frame) ?? 0, 2)}" step="1" ${disabled} style="width:52px"></label>`;
+  return h.replace('<label title="Rotation">', n('rx', '↕', 'Rotation X (tilt forward/back)') + n('ry', '↔', 'Rotation Y (turn left/right)') + '<label title="Rotation">'); }; }
+
+// Minimal two-tone toolbar icons: light = what the tool works on, teal = what it does.
+/* Popai Animator toolbar icons.
+ * One minimal style for every tool, after Moho's toolbar: the object the tool works on is drawn in the
+ * light main colour (currentColor), and what the tool DOES to it (add, move, bend, link, select...) is drawn
+ * in the teal accent (class "a" = accent stroke, "af" = accent fill). Every bone tool uses the same bone shape,
+ * so the bone tells you the category and the teal mark tells you the action. 24x24 grid. */
+
+const r1 = (n) => Math.round(n * 10) / 10;
+
+/** A bone: a long kite from base (x0,y0) to tip (x1,y1), widest a fifth of the way along, like Moho. */
+function bone(x0, y0, x1, y1, w = 3, extra = 'fill="currentColor" fill-opacity=".28"') {
+  const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy) || 1;
+  const nx = -dy / L, ny = dx / L, mx = x0 + dx * 0.2, my = y0 + dy * 0.2;
+  return `<path d="M${x0} ${y0}L${r1(mx + nx * w)} ${r1(my + ny * w)}L${x1} ${y1}L${r1(mx - nx * w)} ${r1(my - ny * w)}Z" ${extra}/>`;
+}
+const ghostBone = (x0, y0, x1, y1, w = 2.5) =>
+  bone(x0, y0, x1, y1, w, 'stroke-dasharray="1.6 1.6" stroke-opacity=".55"');
+
+const svgT = (inner) =>
+  `<svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+
+/** Standard bone used by most bone tools: lower-left, leaving the top-right corner for the action mark. */
+const B = bone(3, 21, 15.5, 8.5);
+/** Mouse pointer (filled accent) */
+const cursorI = (x, y) =>
+  `<path class="af" d="M${x} ${y}v9.2l2.4-2.2 1.7 3.6 1.7-.8-1.7-3.5 3.3-.3z" stroke="none"/>`;
+/** Small square vector point */
+const nodeI = (x, y, cls = 'af') => `<rect class="${cls}" x="${x - 1.4}" y="${y - 1.4}" width="2.8" height="2.8" stroke="none"/>`;
+
+const TOOL_ICONS = {
+  // ---------- Select ----------
+  // Select / transform layer: pointer over a layer frame with handles
+  select: svgT(
+    '<rect x="8.5" y="8.5" width="12" height="12" rx="1" stroke-dasharray="2 1.8"/>' +
+    nodeI(8.5, 20.5, 'af') + nodeI(20.5, 8.5, 'af') + nodeI(20.5, 20.5, 'af') +
+    '<path d="M3 2.5v10.5l2.8-2.6 2 4.2 2-1-2-4.1 3.8-.3z" fill="currentColor" stroke="none"/>'),
+  // Rotate layer XY: a layer card turned in space, with the turning arrow
+  rotxy: svgT('<path d="M7 5.5l9-2v17l-9-2z" fill="currentColor" fill-opacity=".2"/>' +
+    '<path class="a" d="M3 12c0 2.3 4 4.2 9 4.2s9-1.9 9-4.2"/><path class="a" d="M18.6 17.6l2.3-1.4-1.3-2.4"/>'),
+  // Select / transform points: marquee box around a path's points
+  points: svgT(
+    '<rect x="2.5" y="2.5" width="19" height="19" rx="1" stroke-dasharray="2 2" stroke-opacity=".7"/>' +
+    '<path d="M6 17C8 9 12 15 18 7"/>' + nodeI(6, 17) + nodeI(11.6, 12.4) + nodeI(18, 7)),
+
+  // ---------- Draw ----------
+  // Pen: nib + the point it adds
+  pen: svgT(
+    '<path d="M15 3.5l5.5 5.5-2.8 1.4-4.2 7-8.5 3.1 3.1-8.5 7-4.2z"/><path d="M5 20.5l5.6-5.6"/><circle cx="12" cy="12" r="1.3"/>' +
+    nodeI(4, 4)),
+  // Freehand: pencil and the loose stroke it leaves
+  freehand: svgT(
+    '<path d="M15.5 3.5l5 5L10 19l-5.5.5L5 14z"/><path d="M13.5 5.5l5 5"/>' +
+    '<path class="a" d="M12.5 21c2-1.8 3.2.6 5-1s2.8.8 4-.6"/>'),
+  // Create shape: rectangle, ellipse and star together (the shape is picked in the bar above)
+  shape: svgT('<rect x="2.5" y="9.5" width="11" height="11" rx="1"/><circle cx="16" cy="8" r="5.5" fill="currentColor" fill-opacity=".14"/>' +
+    '<path class="a" d="M17.5 13.6l1.3 2.5 2.8.4-2 2 .5 2.8-2.6-1.3-2.5 1.3.5-2.8-2-2 2.8-.4z" stroke-width="1.4"/>'),
+  // Rectangle: box dragged corner to corner
+  rect: svgT('<rect x="4" y="6" width="16" height="12" rx="1"/>' + nodeI(4, 6) + nodeI(20, 18)),
+  // Ellipse
+  ellipse: svgT('<ellipse cx="12" cy="12" rx="8.5" ry="6.5"/>' + nodeI(12, 5.5) + nodeI(20.5, 12) + nodeI(12, 18.5) + nodeI(3.5, 12)),
+  // Polygon / star
+  polygon: svgT('<path d="M12 3l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 16.8l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/>' + nodeI(12, 3)),
+  // Text
+  text: svgT('<path d="M5 7V4.5h14V7M12 4.5v15M9 19.5h6"/><path class="a" d="M17.5 12.5v7"/>'),
+
+  // ---------- Edit ----------
+  // Select shape: a filled shape picked by the pointer
+  selshape: svgT('<path d="M3.5 12.5c0-5 4-8.5 8.5-8.5 3.5 0 5.5 2 5.5 4.5" fill="currentColor" fill-opacity=".3"/><path d="M3.5 12.5c0 3.7 2.7 6.5 6.5 6.5" fill="none"/>' +
+    '<path d="M3.5 12.5c0-5 4-8.5 8.5-8.5 3.5 0 5.5 2 5.5 4.5M3.5 12.5c0 3.7 2.7 6.5 6.5 6.5"/>' + cursorI(12.5, 10.5)),
+  // Create shape: a path's points getting a fill (checkered) — "make these points a shape"
+  createshape: svgT('<path d="M4 18L7 5l11 2 2 11z" fill="currentColor" fill-opacity=".22"/><path d="M4 18L7 5l11 2 2 11z" stroke-dasharray="2 1.6"/>' +
+    nodeI(4, 18, 'af') + nodeI(7, 5, 'af') + nodeI(18, 7, 'af') + nodeI(20, 18, 'af') + '<path class="a" d="M11.5 9.5v6M8.5 12.5h6" stroke-width="1.8"/>'),
+  // Curvature: a curve with its smoothness handle
+  curvature: svgT('<path d="M3 19C6 6 18 6 21 19"/><path class="a" d="M5 9.2h14"/>' + nodeI(12, 9.2) +
+    '<circle class="a" cx="5" cy="9.2" r="1.3"/><circle class="a" cx="19" cy="9.2" r="1.3"/>'),
+  // Paint bucket: tipped bucket pouring a drop
+  fill: svgT('<path d="M4 11.5L11 4.5l7.5 7.5-7 7z"/><path d="M4 11.5h14.5"/><path d="M8.5 7L6 4.5"/>' +
+    '<path class="af" d="M20.5 14.5s2 2.6 2 3.9a2 2 0 0 1-4 0c0-1.3 2-3.9 2-3.9z" stroke="none"/>'),
+
+  // ---------- Bone ----------
+  // Select bone: bone + pointer
+  bonesel: svgT(B + cursorI(14.5, 2.5)),
+  // Add bone: bone + plus
+  boneadd: svgT(B + '<path class="a" d="M18.5 2.5v7.5M14.75 6.25h7.5" stroke-width="2"/>'),
+  // Transform bone: bone + move arrows
+  bonetf: svgT(B + '<path class="a" d="M18 2v8.5M13.75 6.25h8.5M16.6 3.4L18 2l1.4 1.4M16.6 9.1L18 10.5l1.4-1.4M15.15 4.85l-1.4 1.4 1.4 1.4M20.85 4.85l1.4 1.4-1.4 1.4"/>'),
+  // Manipulate bones: a two-bone chain whose tip is being dragged (IK bend)
+  bonemanip: svgT(bone(3, 21, 10, 13, 2.8) + bone(10, 13, 19, 10, 2.8) +
+    '<circle class="af" cx="19" cy="10" r="1.8" stroke="none"/><path class="a" d="M21.5 15.5c-.5-4.5-3-8-7-10"/><path class="a" d="M16.8 4.3l-2.3 1.2 1 2.4"/>'),
+  // Reparent: a child bone being attached to a new parent (dashed link)
+  reparent: svgT(bone(2.5, 21.5, 11, 13, 2.8) + bone(13, 3.5, 21.5, 3.5, 2.4) +
+    '<path class="a" d="M13 6.5c-3.5.5-4.5 2.5-3.2 5"/><path class="a" d="M8 9.9l1.8 1.6 1.9-1.5"/><circle class="af" cx="11" cy="13" r="1.5" stroke="none"/>'),
+  // Bone strength: bone inside its influence region
+  strength: svgT(bone(5, 19, 19, 5, 2.9) +
+    '<ellipse class="a" cx="12" cy="12" rx="10.5" ry="4.6" transform="rotate(-45 12 12)" stroke-dasharray="2 1.8"/>'),
+  // Vitruvian bones: one bone with alternative versions from the same base
+  vitruvian: svgT(bone(4.5, 20, 18, 6.5, 2.9) + bone(4.5, 20, 21, 15, 2.6, 'class="a" stroke-dasharray="1.6 1.6"') +
+    bone(4.5, 20, 9.5, 3, 2.6, 'class="a" stroke-dasharray="1.6 1.6"') + '<circle cx="4.5" cy="20" r="1.6" fill="currentColor"/>'),
+  // Sketch bones: a drawn stroke turned into a chain of bones
+  sketch: svgT(bone(2.5, 21, 8, 15.5, 2.1) + bone(8, 15.5, 13.5, 13, 2.1) + bone(13.5, 13, 16.5, 7.5, 2.1) +
+    '<path class="a" d="M17.2 6.8l3.3-3.3 2 2-3.3 3.3-2.6.6z"/>'),
+  // Bind layer: a layer linked to a bone
+  bind: svgT('<rect x="2.5" y="2.5" width="9" height="9" rx="1.2" fill="currentColor" fill-opacity=".18"/>' + bone(10.5, 21, 21, 10.5, 2.9) +
+    '<path class="a" d="M8.6 11.4l-.9.9a2 2 0 0 0 2.8 2.8l.9-.9M11.4 8.6l.9-.9a2 2 0 0 1 2.8 2.8l-.9.9M10.3 13.7l3.4-3.4"/>'),
+  // Bind points: points linked to a bone
+  bindpts: svgT(nodeI(3.5, 4, 'af') + nodeI(9, 3, 'af') + nodeI(4, 9.5, 'af') + bone(10.5, 21, 21, 10.5, 2.9) +
+    '<path class="a" d="M5.5 6l7.5 9" stroke-dasharray="1.6 1.6"/>'),
+  // Offset bone: bone moved away from where it was (dashed)
+  offset: svgT(ghostBone(2.5, 13, 12, 3.5, 2.1) + bone(10, 21, 21, 10, 2.9) +
+    '<path class="a" d="M7.5 12.5l5 5M12.5 13.8v3.7H8.8"/>'),
+  // Bone physics: bone continuing as a spring with a weight
+  physics: svgT(bone(3, 21, 10.5, 13.5, 2.8) +
+    '<path class="a" d="M10.5 13.5l.8-2.6 1.9 1.9.8-2.6 1.9 1.9.8-2.6 1.9 1.9.6-2"/><circle class="af" cx="19.8" cy="4.6" r="2.3" stroke="none"/>'),
+  // Force: wind lines and a gravity arrow
+  force: svgT('<path class="a" d="M2.5 7.5h9a2.5 2.5 0 1 0-2.5-2.5M2.5 12h12a2.5 2.5 0 1 1-2.5 2.5M2.5 16.5h6"/>' +
+    '<path d="M19.5 8v13M17 18.5l2.5 2.5 2.5-2.5"/>'),
+
+  // ---------- FX ----------
+  // Particle emitter: a source spraying particles
+  emitter: svgT('<circle cx="6" cy="18" r="2.6" fill="currentColor" fill-opacity=".28"/>' +
+    '<circle class="af" cx="12" cy="11" r="1.3" stroke="none"/><circle class="af" cx="17" cy="6" r="1.1" stroke="none"/>' +
+    '<circle class="af" cx="15.5" cy="14" r="1.2" stroke="none"/><circle class="af" cx="20.5" cy="11" r="1" stroke="none"/>' +
+    '<circle class="af" cx="9" cy="6" r="1" stroke="none"/><circle class="af" cx="19.5" cy="18" r="1" stroke="none"/>' +
+    '<path class="a" d="M8.2 15.8l1.6-1.6M9 17.6h1.8M7.8 14l.3-1.6"/>'),
+
+  // ---------- Camera ----------
+  camera: svgT('<rect x="2.5" y="9" width="13" height="10" rx="1.8"/><path d="M15.5 12.5l6-3.5v10l-6-3.5"/>' +
+    '<circle cx="6" cy="5.5" r="2.5"/><circle cx="12" cy="5.5" r="2.5"/><circle class="af" cx="6.5" cy="14" r="1.4" stroke="none"/>'),
+
+  // ---------- View ----------
+  pan: svgT('<path d="M8 13V5.6a1.5 1.5 0 0 1 3 0V11M11 4.6a1.5 1.5 0 0 1 3 0V11M14 5.6a1.5 1.5 0 0 1 3 0V12M17 8.6a1.5 1.5 0 0 1 3 0V14c0 4-3 7-7 7h-1.2c-2.3 0-3.9-.9-5.3-2.8L3.8 14.6c-.7-1.2.9-2.5 2-1.5L8 15.2"/>'),
+  // Orbit workspace: an eye circling the scene
+  orbit: svgT('<rect x="8" y="8" width="8" height="8" rx="1" fill="currentColor" fill-opacity=".2"/>' +
+    '<ellipse class="a" cx="12" cy="12" rx="10" ry="4.5"/><path class="a" d="M19.3 6.5l2 2.3-2.6 1"/>' +
+    '<ellipse class="a" cx="12" cy="12" rx="4.5" ry="10" stroke-opacity=".45"/>'),
+  zoom: svgT('<circle cx="10" cy="10" r="6.5"/><path d="M14.8 14.8L21 21" stroke-width="2.4"/><path class="a" d="M10 7v6M7 10h6"/>'),
+};
+
+// ---- tools of the full vector / camera tool set ----
+Object.assign(TOOL_ICONS, {
+  // Transform points: a few points with move arrows
+  pointtf: svgT('<path d="M5 17C7 10 11 15 15 8"/>' + nodeI(5, 17, 'af') + nodeI(10.2, 12.6, 'af') + nodeI(15, 8, 'af') +
+    '<path class="a" d="M19 11v10M14 16h10M17.6 12.4L19 11l1.4 1.4M17.6 19.6L19 21l1.4-1.4M15.4 14.6L14 16l1.4 1.4M22.6 14.6L24 16l-1.4 1.4" stroke-width="1.4"/>'),
+  // Delete edge: a path with a gap and a cross
+  deleteedge: svgT('<path d="M3 17l5-7M16 7l5-3"/>' + nodeI(3, 17, 'af') + nodeI(21, 4, 'af') + '<path class="a" d="M9.5 9.5l5 5M14.5 9.5l-5 5" stroke-width="2"/>'),
+  // Magnet: pulls points
+  magnet: svgT('<path d="M5 4v8a7 7 0 0 0 14 0V4h-4v8a3 3 0 0 1-6 0V4z" fill="currentColor" fill-opacity=".2"/><path class="a" d="M5 4h4M15 4h4"/>'),
+  // Blob brush: a filled round stroke
+  blob: svgT('<path d="M4 16c0-4 4-5 7-5s4-3 7-3 3 4 1 6-5 1-7 3-8 2-8-1z" fill="currentColor" fill-opacity=".3"/><path class="a" d="M17 4l3 3-6 6-3-3z"/>'),
+  // Vector eraser
+  eraser: svgT('<path d="M3 16l8-8 7 7-5 5H7z" fill="currentColor" fill-opacity=".18"/><path d="M7 20h13"/><path class="a" d="M11 8l5-5 6 6-5 5"/>'),
+  // Point reduction: many points become few
+  reduce: svgT('<path d="M3 17C6 9 9 9 12 12s6 3 9-5"/>' + [3, 6, 9, 12, 15, 18, 21].map((x, i) => `<circle cx="${x}" cy="${[17, 11.5, 10, 12, 13.6, 12, 7][i]}" r="1" fill="currentColor" stroke="none"/>`).join('') + '<path class="a" d="M8 21h8M13 19l3 2-3 2" stroke-width="1.5"/>'),
+  // Scatter brush: sprinkled shapes
+  scatter: svgT('<path class="a" d="M3 21l7-7"/>' + nodeI(13, 11) + nodeI(18, 6) + nodeI(19, 14) + nodeI(10, 4) + '<circle cx="15" cy="18" r="1.6" fill="currentColor" stroke="none"/><circle cx="6" cy="10" r="1.3" fill="currentColor" stroke="none"/>'),
+  // Perspective: a square pulled into a trapezoid
+  perspective: svgT('<path d="M8 6h8l5 13H3z" fill="currentColor" fill-opacity=".18"/><path class="a" d="M8 6l-3-3M16 6l3-3" stroke-dasharray="1.6 1.6"/>'),
+  // Shear: a square slanted
+  shear: svgT('<path d="M7 5h13l-3 14H4z" fill="currentColor" fill-opacity=".18"/><path class="a" d="M3 3h6M18 21h-6M7 3l-2 0M15 21l2 0" /><path class="a" d="M7.5 2.2L9 3l-1.5.8M16.5 20.2L15 21l1.5.8"/>'),
+  // Bend: a straight bar bent into an arc
+  bend: svgT('<path d="M4 18c2-9 14-9 16 0" stroke-width="3.2" stroke-opacity=".35"/><path d="M4 18c2-9 14-9 16 0"/><path class="a" d="M12 4v5M10 7l2 2 2-2"/>'),
+  // Noise: a jittery line
+  noise: svgT('<path d="M2 12l2-4 2 7 2-9 2 8 2-5 2 6 2-8 2 7 2-4 2 2"/><path class="a" d="M2 19h20" stroke-dasharray="1.5 2"/>'),
+  // Delete shape: a filled shape with a cross (its points stay)
+  deleteshape: svgT('<path d="M4 17L7 5l11 2 2 11z" fill="currentColor" fill-opacity=".22"/><path d="M4 17L7 5l11 2 2 11z" stroke-dasharray="2 1.6"/><path class="a" d="M9 9l6 6M15 9l-6 6" stroke-width="2"/>'),
+  // Line width: a stroke getting thicker
+  linewidth: svgT('<path d="M3 8c6 0 8 8 18 8" stroke-width="1"/><path d="M3 15c6 0 8 4 18 4" stroke-width="3.4"/><path class="a" d="M19 3v7M16.5 5.5L19 3l2.5 2.5"/>'),
+  // Hide edge: a shape edge turned invisible
+  hideedge: svgT('<path d="M4 18L7 5l12 1 1 12z" fill="currentColor" fill-opacity=".22"/><path d="M4 18L7 5l12 1 1 12"/><path class="a" d="M4 18h16" stroke-dasharray="1.5 2.5"/>'),
+  // Stroke exposure: part of a stroke shown
+  exposure: svgT('<path d="M3 18C6 5 18 5 21 18" stroke-opacity=".3" stroke-dasharray="1.6 1.6"/><path class="a" d="M3 18C4.5 11.5 8 8.6 12 8.2" stroke-width="2.2"/>' + nodeI(12, 8.2)),
+  // Curve profile: a stroke whose width varies along it
+  profile: svgT('<path d="M2 14c4-1 6-5 10-5s6 4 10 5c-4 1-6 4-10 4s-6-3-10-4z" fill="currentColor" fill-opacity=".3"/><path class="a" d="M7 4l-2 4M12 3v4M17 4l2 4"/>'),
+  // Color points: points that carry their own colours
+  colorpoints: svgT('<path d="M3 18C7 8 13 8 21 12" stroke-opacity=".6"/><circle cx="3" cy="18" r="2.4" fill="#ff6b6b" stroke="none"/><circle cx="12" cy="9.6" r="2.4" fill="#ffd43b" stroke="none"/><circle cx="21" cy="12" r="2.4" class="af" stroke="none"/>'),
+  // Eyedropper
+  eyedropper: svgT('<path d="M14 4l6 6-9.5 9.5H6v-4.5z" fill="currentColor" fill-opacity=".2"/><path d="M14 4l6 6"/><path class="a" d="M17 2.8l4.2 4.2-2 2-4.2-4.2zM6 18l-3 3"/>'),
+  // Switch layer: alternatives with the chosen one marked
+  switchlayer: svgT('<rect x="3" y="4" width="8" height="7" rx="1.2"/><rect x="13" y="4" width="8" height="7" rx="1.2" stroke-opacity=".5"/><rect x="8" y="13" width="8" height="7" rx="1.2" stroke-opacity=".5"/><rect class="af" x="5" y="6" width="4" height="3" stroke="none"/><path class="a" d="M7 13v-1M17 13v-1"/>'),
+  // Camera tools: the camera body + what changes
+  camzoom: svgT('<rect x="2.5" y="9" width="11" height="9" rx="1.6"/><path d="M13.5 12l4.5-2.5v8L13.5 15"/><path class="a" d="M17.5 2.5v6M14.5 5.5h6" stroke-width="1.8"/>'),
+  camroll: svgT('<rect x="5" y="8" width="11" height="8" rx="1.6"/><path d="M16 10.5l3.5-2v7l-3.5-2"/><path class="a" d="M3 9a9 9 0 0 1 6-6.5M8.8 2.3L9.2 4.6 7 5.2"/>'),
+  campantilt: svgT('<rect x="6" y="8" width="10" height="8" rx="1.6"/><path d="M16 10.5l3.5-2v7l-3.5-2"/><path class="a" d="M2.5 12h2.5M1.5 11l-1 1 1 1M11 2.5V5M10 1.5l1-1 1 1M11 19v2.5M10 22.5l1 1 1-1"/>'),
+});
+TOOL_ICONS.drawshape = TOOL_ICONS.shape;
+TOOL_ICONS.shapeselect = TOOL_ICONS.selshape;
+TOOL_ICONS.orbitworkspace = TOOL_ICONS.orbit;
+TOOL_ICONS.camera = svgT('<rect x="2.5" y="9" width="13" height="10" rx="1.8"/><path d="M15.5 12.5l6-3.5v10l-6-3.5"/><circle cx="6" cy="5.5" r="2.5"/><circle cx="12" cy="5.5" r="2.5"/><path class="a" d="M5 14h6M9.5 12.2L11.3 14l-1.8 1.8"/>');
+
+/* Compact workspace: presentation only; document and editing commands remain intact. */
+defTool('switchlayer', {icon:'⇄',name:'Switch layer',hint:'Choose and key switch alternatives',cursor:'default',down(){},move(){},up(){}});
+TOOL_GROUPS.splice(4,0,['Switch',['switchlayer']]);
+const switchSetTool = setTool;
+setTool = function(id){switchSetTool(id);if(id==='switchlayer'&&selLayer()?.type==='switch')setTab('switch');};
+const compactSections = new Map();
+function compactToolVisible(id, layer = selLayer()) {
+  const vector = VECTOR_DRAW.includes(id) || VECTOR_FILL.includes(id) || id === 'text';
+  if (['bone','switch'].includes(layer?.type) && vector) return false;
+  if (id === 'switchlayer') return layer?.type === 'switch';
+  if (layer?.type === 'switch' && BONE_TOOLS.has(id)) return id === 'bind';
+  if (layer?.type === 'vector' && BONE_TOOLS.has(id)) return ['bonesel','bonemanip','bind','bindpts'].includes(id);
+  return true;
+}
+function compactRefresh() {
+  if(currentTab==='switch'&&selLayer()?.type!=='switch')setTab('props');
+  if (!compactToolVisible(S.tool)) setTool('select');
+  document.querySelectorAll('#tabBody .sec').forEach(section=>{
+    const header=section.querySelector(':scope > h4');if(!header)return;
+    const key=currentTab+':'+header.textContent.trim();
+    section.dataset.compactKey=key;
+    const collapsed=compactSections.has(key)?compactSections.get(key):/Notes|Getting started|Effects stack|Particle motion|Over life|References/.test(header.textContent);
+    section.classList.toggle('compact-collapsed',collapsed);
+    header.tabIndex=0;header.setAttribute('role','button');header.setAttribute('aria-expanded',String(!collapsed));
+  });
+  document.querySelectorAll('#toolbar .tg').forEach(header=>{
+    const group=header.dataset.group, ids=TOOL_GROUPS.find(([name])=>name===group)?.[1] || [];
+    const visible=ids.filter(id=>compactToolVisible(id));
+    header.classList.toggle('compact-tool-hidden',!visible.length);
+    header.removeAttribute('tabindex');header.removeAttribute('role');header.removeAttribute('aria-expanded');header.title=group+' tools';
+    for(let button=header.nextElementSibling;button&&!button.classList.contains('tg');button=button.nextElementSibling)button.classList.toggle('compact-tool-hidden',!compactToolVisible(button.dataset.tool));
+  });
+  document.querySelectorAll('#tabBody .note').forEach(note=>{
+    if(note.dataset.compactNote||note.classList.contains('act-banner')||note.textContent.length<110||note.querySelector('input,button,select'))return;
+    note.dataset.compactNote='true';const details=document.createElement('details');details.className='compact-help';const summary=document.createElement('summary');summary.textContent='Help';details.append(summary);note.replaceWith(details);details.append(note);
+  });
+  const options=document.getElementById('toolopts');
+  if(options&&!options.querySelector('[data-compact-options]')){
+    const commands=[...options.querySelectorAll('button.btn')].filter(b=>b.id!=='penDone');
+    if(commands.length){
+      commands.forEach(b=>b.classList.add('compact-secondary-command'));
+      const more=document.createElement('button');more.className='ib compact-options';more.dataset.compactOptions='true';more.textContent='⋯';more.title='Tool commands';more.setAttribute('aria-label','Tool commands');
+      more.onclick=()=>{const r=more.getBoundingClientRect();showMenu(r.left,r.bottom,commands.map(b=>({label:b.textContent.trim(),dis:b.disabled,run:()=>b.click()})));};options.append(more);
+    }
+  }
+  document.querySelectorAll('#toolopts .hint,#toolopts .chip').forEach(note=>{note.title=note.textContent;});
+}
+function compactToggle(target){
+  const header=target.closest('#tabBody .sec > h4');
+  if(header&&!target.closest('button,input,select,a')){const section=header.parentElement;compactSections.set(section.dataset.compactKey,!section.classList.contains('compact-collapsed'));compactRefresh();return;}
+
+}
+document.addEventListener('click',e=>compactToggle(e.target));
+document.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.matches('#tabBody .sec > h4')){e.preventDefault();compactToggle(e.target);}});
+const compactStart=window.PopaiRuntime;
+function compactInit(){
+  if(!document.querySelector('#toolbar .tg')){setTimeout(compactInit,50);return;}
+  const observer=new MutationObserver(()=>{observer.disconnect();compactRefresh();for(const id of ['tabBody','toolbar','toolopts']){const el=document.getElementById(id);if(el)observer.observe(el,{childList:true,subtree:true});}});
+  compactRefresh();for(const id of ['tabBody','toolbar','toolopts']){const el=document.getElementById(id);if(el)observer.observe(el,{childList:true,subtree:true});}
+}
+setTimeout(compactInit,0);
+
+// ---------- Popai extras on top of the Nov 17 editor: logo, minimal icons, Select Bone layout ----------
+var POPAI_WORDMARK = (typeof window !== 'undefined' && window.__POPAI_WORDMARK__) || '';
+// physics and force live in the Select bone bar now
+{ const g = TOOL_GROUPS.find((x) => x[0] === 'Bone'); if (g) g[1] = g[1].filter((id) => id !== 'physics' && id !== 'force'); }
+for (const id in TOOL_ICONS) if (TOOLS[id]) TOOLS[id].icon = TOOL_ICONS[id];
+
+boot();
+})();
