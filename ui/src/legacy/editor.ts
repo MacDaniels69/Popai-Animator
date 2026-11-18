@@ -6,6 +6,7 @@
  * the legacy JavaScript engine stays available as a fallback and for parity checks. */
 import type { EngineClient } from '../engine/client';
 import { SceneStore } from '../engine/client';
+import { TOOL_ICONS } from './toolIcons';
 
 export function mountEditor(ENGINE: EngineClient) {
 'use strict';
@@ -2132,6 +2133,7 @@ function initStage() {
   new ResizeObserver(() => requestDraw()).observe(Stage.cv);
   // toolbar
   const tb = $('#toolbar');
+  for (const id in TOOL_ICONS) if (TOOLS[id]) TOOLS[id].icon = TOOL_ICONS[id];
   for (const [g, ids] of TOOL_GROUPS) {
     const lab = document.createElement('div'); lab.className = 'tg'; lab.dataset.group = g; lab.textContent = g; tb.appendChild(lab);
     for (const id of ids) {
