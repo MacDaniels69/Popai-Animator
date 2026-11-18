@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/popai-core", "crates/popai-engine-host"]
+members = ["crates/popai-core", "crates/popai-engine-host", "crates/popai-format", "crates/popai-thumbnails"]
 # The desktop app (src-tauri) is its own workspace: it needs the platform webview SDK
 # (WebView2 on Windows). Build it with `npm run tauri build` in ui/.
 

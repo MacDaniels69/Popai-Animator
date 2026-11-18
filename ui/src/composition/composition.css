@@ -1,0 +1,667 @@
+#app.composition-open {
+  grid-template-rows: 34px minmax(0, 1fr);
+}
+#app.composition-open > #toolopts,
+#app.composition-open > #main,
+#app.composition-open > #tsplit,
+#app.composition-open > #timeline {
+  display: none;
+}
+#app.composition-open #modeSeg,
+#app.composition-open #menus,
+#app.composition-open #btnCmd {
+  display: none;
+}
+.workspace-tabs {
+  display: flex;
+  align-self: stretch;
+  margin-left: auto;
+  gap: 2px;
+}
+.workspace-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--dim);
+  padding: 0 12px;
+  cursor: pointer;
+}
+.workspace-tabs button[aria-selected="true"] {
+  border-bottom-color: var(--acc);
+  background: var(--panel);
+  color: var(--txt);
+}
+#menubar .mb-right {
+  margin-left: 8px;
+}
+#composition-workspace {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 36px minmax(180px, 1fr) auto minmax(180px, 28%);
+  background: var(--bg);
+  outline: none;
+}
+#composition-workspace[hidden] {
+  display: none;
+}
+#composition-workspace:not(:has(.comp-error)) {
+  grid-template-rows: 36px minmax(180px, 1fr) minmax(180px, 28%);
+}
+#composition-workspace button {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#composition-workspace button:hover:not(:disabled) {
+  background: var(--sel2);
+  border-color: var(--line2);
+}
+#composition-workspace button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+#composition-workspace button[aria-pressed="true"],
+#composition-workspace button[aria-selected="true"] {
+  background: var(--sel2);
+  color: var(--txt);
+  border-color: var(--sel);
+}
+#composition-workspace input,
+#composition-workspace select,
+#composition-workspace textarea {
+  max-width: 100%;
+  min-width: 0;
+}
+#composition-workspace input:not([type]) {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 6px;
+  color: var(--txt);
+  height: 24px;
+}
+#composition-workspace input:focus-visible,
+#composition-workspace button:focus-visible,
+#composition-workspace select:focus-visible,
+#composition-workspace textarea:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 1px;
+}
+.comp-toolbar,
+.comp-view-controls,
+.comp-transport,
+.comp-timeline-toolbar,
+.comp-button-row,
+.comp-key-editor {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.comp-toolbar {
+  padding: 4px 8px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--line);
+}
+.comp-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.comp-toolbar select {
+  max-width: 220px;
+}
+.comp-format {
+  color: var(--dim);
+  white-space: nowrap;
+}
+.comp-spacer {
+  flex: 1;
+}
+.comp-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+}
+.comp-body {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr) 285px;
+  min-height: 0;
+  min-width: 0;
+}
+.comp-browser,
+.comp-inspector {
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.comp-browser {
+  border-right: 1px solid var(--line);
+}
+.comp-inspector {
+  border-left: 1px solid var(--line);
+}
+.comp-tabs {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+.comp-tabs button {
+  flex: 1;
+}
+.comp-effect-browser {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.comp-effect-browser button {
+  text-align: left;
+  white-space: normal !important;
+  padding: 8px !important;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.comp-effect-browser span {
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.45;
+}
+.comp-library-heading,
+.comp-panel-title {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--txt);
+  padding: 5px 0;
+}
+.comp-asset {
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.comp-asset span {
+  font-size: 9px;
+  letter-spacing: 0.7px;
+  color: var(--acc2);
+  display: block;
+}
+.comp-browser p {
+  margin: 0;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.comp-plan {
+  padding: 8px;
+  background: var(--bg2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.comp-view {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 34px minmax(100px, 1fr) 38px;
+  background: #292c32;
+}
+.comp-view-controls {
+  padding: 4px 8px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--line);
+}
+.comp-view-controls strong {
+  font-size: 11px;
+  white-space: nowrap;
+}
+.comp-canvas-wrap {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background-color: #292c32;
+  background-image:
+    linear-gradient(45deg, #34373c 25%, transparent 25%),
+    linear-gradient(-45deg, #34373c 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #34373c 75%),
+    linear-gradient(-45deg, transparent 75%, #34373c 75%);
+  background-size: 20px 20px;
+  background-position:
+    0 0,
+    0 10px,
+    10px -10px,
+    -10px 0;
+}
+.comp-canvas-wrap canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.comp-canvas-wrap.drawing {
+  cursor: crosshair;
+}
+.comp-mask-hint {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  background: var(--bg2);
+  color: var(--acc2);
+  padding: 6px;
+  pointer-events: none;
+  font-size: 11px;
+}
+.comp-mask-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.comp-mask-overlay polyline {
+  stroke: var(--acc);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.comp-mask-overlay circle {
+  pointer-events: all;
+  fill: var(--acc);
+  stroke: var(--bg);
+  stroke-width: 2;
+  cursor: move;
+  vector-effect: non-scaling-stroke;
+}
+.comp-mask-overlay circle:focus {
+  outline: none;
+  stroke: var(--txt);
+}
+.comp-track {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  margin-top: 8px;
+  background: var(--bg2);
+}
+.comp-track span {
+  font-size: 11px;
+  color: var(--dim);
+}
+.comp-tracking-error {
+  font-size: 11px;
+  color: var(--acc2);
+  line-height: 1.5;
+}
+.comp-transport {
+  padding: 4px 8px;
+  background: var(--bg2);
+  border-top: 1px solid var(--line);
+}
+.comp-transport label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.comp-transport input[type="number"] {
+  width: 68px;
+}
+.comp-inspector details {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.comp-inspector summary {
+  font-weight: 600;
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+.comp-clip-name {
+  width: 100%;
+  font-weight: 600;
+}
+.comp-field {
+  display: grid;
+  grid-template-columns: minmax(85px, 1fr) minmax(50px, 90px) 23px;
+  align-items: center;
+  gap: 4px;
+  min-height: 27px;
+}
+.comp-field input,
+.comp-field select {
+  width: 100%;
+}
+.comp-field input[type="checkbox"],
+.comp-field input[type="color"] {
+  width: 30px;
+  justify-self: start;
+}
+.comp-field input[type="text"] {
+  min-width: 0;
+}
+.comp-field > span {
+  font-size: 11px;
+  color: var(--dim);
+}
+.comp-key {
+  border: 0 !important;
+  background: transparent !important;
+  color: var(--dim);
+  padding: 3px !important;
+}
+.comp-key.on {
+  color: var(--key) !important;
+}
+.comp-effect {
+  margin: 6px 0;
+  padding: 7px;
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.comp-effect-heading {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 5px;
+}
+.comp-effect-heading strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+}
+.comp-effect-heading button {
+  padding: 1px 5px !important;
+}
+.comp-effect > button {
+  margin-top: 6px;
+  font-size: 10px;
+}
+.comp-muted,
+.comp-empty {
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.comp-empty {
+  padding: 12px;
+}
+.comp-timeline {
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  background: var(--bg2);
+}
+.comp-timeline-toolbar {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  padding: 4px 8px;
+  z-index: 2;
+  flex-wrap: wrap;
+}
+.comp-timeline-toolbar button,
+.comp-timeline-toolbar select {
+  font-size: 11px;
+}
+.comp-scrubber {
+  display: block;
+  width: calc(100% - 20px);
+  margin: 6px 10px;
+  height: 15px;
+}
+.comp-lane {
+  display: grid;
+  grid-template-columns: 25px 165px minmax(0, 1fr);
+  height: 29px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.comp-lane.selected {
+  background: var(--sel2);
+}
+.comp-lane-name {
+  border: 0 !important;
+  text-align: left;
+  background: transparent !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.comp-eye {
+  border: 0 !important;
+  background: none !important;
+}
+.comp-lane-track {
+  position: relative;
+  height: 27px;
+  overflow: hidden;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    transparent calc(10% - 1px),
+    var(--line) calc(10% - 1px),
+    var(--line) 10%
+  );
+  margin-right: 10px;
+}
+.comp-clip-bar {
+  position: absolute;
+  top: 4px;
+  height: 20px;
+  min-width: 1px;
+  text-align: left;
+  overflow: hidden;
+  font-size: 10px;
+  padding: 1px 5px !important;
+  background: #3c6474 !important;
+  border: 0 !important;
+  border-radius: 3px !important;
+}
+.comp-clip-bar.kind-scene,
+.comp-clip-bar.kind-layer,
+.comp-clip-bar.kind-precomp {
+  background: #655184 !important;
+}
+.comp-clip-bar.kind-adjustment {
+  background: #736138 !important;
+}
+.comp-clip-bar.kind-audio {
+  background: #3c6950 !important;
+}
+.comp-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--acc);
+  pointer-events: none;
+}
+.comp-parameter-lane {
+  height: 24px;
+  font-size: 10px;
+}
+.comp-key-marker {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  padding: 1px !important;
+  background: none !important;
+  border: 0 !important;
+  color: var(--key);
+  font-size: 12px;
+}
+.comp-curve {
+  display: block;
+  width: 100%;
+  height: 140px;
+}
+.comp-curve line {
+  stroke: var(--line2);
+}
+.comp-curve polyline {
+  stroke: var(--acc);
+  stroke-width: 2;
+}
+.comp-curve text {
+  fill: var(--dim);
+  font-size: 10px;
+}
+.comp-flow {
+  display: flex;
+  gap: 10px;
+  padding: 20px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.comp-flow span {
+  background: var(--panel2);
+  padding: 10px;
+  border-radius: 4px;
+}
+.comp-flow .bypassed {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+.comp-key-editor {
+  padding: 6px 10px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+.comp-key-editor label {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.comp-key-editor input[type="number"] {
+  width: 60px;
+}
+.comp-key-editor input[type="text"] {
+  width: 130px;
+}
+.comp-key-editor strong {
+  font-size: 11px;
+}
+.comp-error {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  background: #542d2b;
+  color: #ffe6dc;
+  padding: 6px 12px;
+  font-size: 11px;
+}
+.comp-error button {
+  margin-left: auto;
+}
+.comp-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  background: #0009;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.comp-dialog {
+  width: min(520px, 100%);
+  padding: 22px;
+  display: flex;
+  gap: 12px;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line2);
+  border-radius: 8px;
+  box-shadow: 0 20px 70px #0008;
+}
+.comp-dialog h2 {
+  font-size: 17px;
+  margin: 0;
+}
+.comp-dialog p {
+  margin: 0;
+  color: var(--dim);
+  line-height: 1.5;
+}
+.comp-dialog label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.comp-dialog input[type="number"] {
+  width: 90px;
+}
+.comp-dialog .comp-button-row {
+  flex-wrap: wrap;
+}
+@media (max-width: 1200px) {
+  .comp-body {
+    grid-template-columns: 175px minmax(0, 1fr) 255px;
+  }
+  .comp-format {
+    display: none;
+  }
+  #menubar .engine-badge {
+    max-width: 115px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .workspace-tabs button {
+    padding: 0 7px;
+  }
+}
+@media (max-width: 1250px) {
+  #menubar #docname,
+  #menubar #btnCmd {
+    display: none;
+  }
+  #menus > button {
+    padding-left: 5px;
+    padding-right: 5px;
+  }
+  .comp-transport {
+    gap: 4px;
+  }
+  .comp-transport select {
+    max-width: 105px;
+  }
+}
+@media (max-width: 850px) {
+  .comp-body {
+    grid-template-columns: 145px minmax(0, 1fr);
+  }
+  .comp-inspector {
+    grid-column: 1/-1;
+    max-height: 220px;
+    display: block;
+  }
+  .comp-toolbar {
+    flex-wrap: wrap;
+  }
+  .comp-view-controls strong {
+    display: none;
+  }
+  #composition-workspace {
+    grid-template-rows: auto minmax(200px, 1fr) auto 190px;
+  }
+  #composition-workspace:not(:has(.comp-error)) {
+    grid-template-rows: auto minmax(200px, 1fr) 190px;
+  }
+  .comp-lane {
+    grid-template-columns: 22px 120px 1fr;
+  }
+  .workspace-tabs {
+    margin-left: 0;
+  }
+  #menubar .engine-badge {
+    display: none;
+  }
+}

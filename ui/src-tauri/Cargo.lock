@@ -2382,11 +2382,13 @@ name = "popai-animator"
 version = "0.3.0"
 dependencies = [
  "popai-core",
+ "popai-format",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "winreg",
 ]
 
 [[package]]
@@ -2396,6 +2398,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "popai-format"
+version = "1.0.0"
 
 [[package]]
 name = "portable-atomic"

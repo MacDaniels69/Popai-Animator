@@ -5,6 +5,8 @@
 //! The JavaScript side (`ui/src/services/tauri-bridge.ts`) exposes them as `window.popaiDesktop`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod filetypes;
+
 use popai_core::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -23,6 +25,8 @@ struct Desk {
     paths: HashMap<String, PathBuf>,
     /// open token -> file picked in the open dialog (bound to a document once it loaded)
     pending: HashMap<String, PathBuf>,
+    /// a project passed on the command line (double-clicked in File Explorer), handed out once
+    startup: Option<PathBuf>,
     dirty: bool,
     close_pending: bool,
     close_approved: bool,
@@ -71,6 +75,28 @@ fn check_project(text: &str) -> Result<(), String> {
     }
     serde_json::from_str::<Value>(text).map(|_| ()).map_err(|_| "Project data is not valid JSON".to_string())
 }
+/// Read a project from disk: a `.popai` container or an older plain `.popai.json`.
+fn read_project(path: &Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("Could not open {}: {e}", path.display()))?;
+    if meta.len() as usize > MAX_PROJECT {
+        return Err("That file is too large to be a Popai project".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    popai_format::project_text(&bytes)
+}
+fn is_json_path(path: &Path) -> bool {
+    path.extension().map(|e| e.eq_ignore_ascii_case("json")).unwrap_or(false)
+}
+fn pend(desk: &State<'_, DeskState>, path: PathBuf, text: String) -> Result<Opened, String> {
+    let mut d = desk.0.lock().map_err(|_| "busy")?;
+    d.counter += 1;
+    let token = format!("open-{}-{}", d.counter, std::process::id());
+    if d.pending.len() > 8 {
+        d.pending.clear();
+    }
+    d.pending.insert(token.clone(), path.clone());
+    Ok(Opened { canceled: false, name: Some(base_name(&path)), text: Some(text), open_token: Some(token) })
+}
 fn recovery_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -84,22 +110,20 @@ fn popai_info(app: tauri::AppHandle) -> Value {
 
 #[tauri::command]
 async fn popai_open(app: tauri::AppHandle, desk: State<'_, DeskState>) -> Result<Opened, String> {
-    let picked = app.dialog().file().set_title("Open Popai project").add_filter("Popai project", &["json", "popai"]).blocking_pick_file();
+    let picked = app.dialog().file().set_title("Open Popai project").add_filter("Popai project", &["popai", "json"]).blocking_pick_file();
     let Some(fp) = picked else { return Ok(Opened { canceled: true, name: None, text: None, open_token: None }) };
     let path = fp.into_path().map_err(|e| e.to_string())?;
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    if meta.len() as usize > MAX_PROJECT {
-        return Err("That file is too large to be a Popai project".into());
-    }
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-    let mut d = desk.0.lock().map_err(|_| "busy")?;
-    d.counter += 1;
-    let token = format!("open-{}-{}", d.counter, std::process::id());
-    if d.pending.len() > 8 {
-        d.pending.clear();
-    }
-    d.pending.insert(token.clone(), path.clone());
-    Ok(Opened { canceled: false, name: Some(base_name(&path)), text: Some(text), open_token: Some(token) })
+    let text = read_project(&path)?;
+    pend(&desk, path, text)
+}
+
+/// The project Windows asked us to open (double-click on a .popai file), if any. Answers once.
+#[tauri::command]
+fn popai_startup_open(desk: State<'_, DeskState>) -> Result<Opened, String> {
+    let path = desk.0.lock().map_err(|_| "busy")?.startup.take();
+    let Some(path) = path else { return Ok(Opened { canceled: true, name: None, text: None, open_token: None }) };
+    let text = read_project(&path)?;
+    pend(&desk, path, text)
 }
 
 #[tauri::command]
@@ -114,22 +138,32 @@ fn popai_bind_open(desk: State<'_, DeskState>, document_id: String, open_token: 
 }
 
 #[tauri::command]
-async fn popai_save(app: tauri::AppHandle, desk: State<'_, DeskState>, document_id: String, name: String, text: String, save_as: Option<bool>) -> Result<Saved, String> {
+async fn popai_save(app: tauri::AppHandle, desk: State<'_, DeskState>, document_id: String, name: String, text: String, save_as: Option<bool>, thumbnail: Option<Vec<u8>>) -> Result<Saved, String> {
     check_project(&text)?;
     let known = if save_as.unwrap_or(false) { None } else { desk.0.lock().map_err(|_| "busy")?.paths.get(&document_id).cloned() };
     let path = match known {
         Some(p) => p,
         None => {
-            let file = format!("{}.popai.json", safe_file_name(name.trim_end_matches(".popai.json").trim_end_matches(".json"), "Untitled"));
+            let stem = name.trim_end_matches(".json").trim_end_matches(".popai");
+            let file = format!("{}.popai", safe_file_name(stem, "Untitled"));
             let title = if save_as.unwrap_or(false) { "Save project as" } else { "Save Popai project" };
-            let picked = app.dialog().file().set_title(title).set_file_name(&file).add_filter("Popai project", &["popai.json", "json"]).blocking_save_file();
+            let picked = app
+                .dialog()
+                .file()
+                .set_title(title)
+                .set_file_name(&file)
+                .add_filter("Popai project", &["popai"])
+                .add_filter("Older Popai project (JSON, no thumbnail)", &["json"])
+                .blocking_save_file();
             match picked {
                 Some(fp) => fp.into_path().map_err(|e| e.to_string())?,
                 None => return Ok(Saved { canceled: true, name: None }),
             }
         }
     };
-    atomic_write(&path, text.as_bytes())?;
+    // .popai files carry the camera-view thumbnail; projects opened from an older .popai.json stay JSON.
+    let bytes = if is_json_path(&path) { text.into_bytes() } else { popai_format::encode(&text, thumbnail.as_deref().unwrap_or(&[]))? };
+    atomic_write(&path, &bytes)?;
     desk.0.lock().map_err(|_| "busy")?.paths.insert(document_id, path.clone());
     Ok(Saved { canceled: false, name: Some(base_name(&path)) })
 }
@@ -218,11 +252,31 @@ fn engine_rpc(state: State<'_, EngineState>, method: String, params: Value) -> R
     engine.call(&method, &params)
 }
 
+/// A project file given on the command line (how Windows passes a double-clicked file).
+fn startup_file() -> Option<PathBuf> {
+    std::env::args_os().skip(1).map(PathBuf::from).find(|p| {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        (ext == "popai" || ext == "json") && p.is_file()
+    })
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--register-file-types") {
+        std::process::exit(if filetypes::register().is_ok() { 0 } else { 1 });
+    }
+    if args.iter().any(|a| a == "--unregister-file-types") {
+        std::process::exit(if filetypes::unregister().is_ok() { 0 } else { 1 });
+    }
+    // Keep the .popai association and thumbnails pointing at this copy of the app (also covers the portable exe).
+    std::thread::spawn(|| {
+        let _ = filetypes::register();
+    });
+    let desk = Desk { startup: startup_file(), ..Desk::default() };
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(EngineState(Mutex::new(Engine::new())))
-        .manage(DeskState(Mutex::new(Desk::default())))
+        .manage(DeskState(Mutex::new(desk)))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<DeskState>();
@@ -241,6 +295,7 @@ fn main() {
             popai_info,
             popai_open,
             popai_bind_open,
+            popai_startup_open,
             popai_save,
             popai_save_video,
             popai_recovery_write,

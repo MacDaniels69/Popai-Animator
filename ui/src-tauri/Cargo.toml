@@ -16,6 +16,10 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 popai-core = { path = "../../crates/popai-core" }
+popai-format = { path = "../../crates/popai-format" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
 
 [profile.release]
 opt-level = 3

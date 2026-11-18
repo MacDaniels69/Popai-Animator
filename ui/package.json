@@ -4,11 +4,11 @@
   "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Popai animation editor — TypeScript, React and Tauri (Rust)",
+  "description": "Popai animation editor \u2014 TypeScript, React and Tauri (Rust)",
   "scripts": {
     "dev": "node scripts/build-engine.cjs && vite --host 127.0.0.1",
     "build": "node scripts/build-engine.cjs && tsc --noEmit && vite build",
-    "test": "vitest run",
+    "test": "vitest run && node scripts/test-composition.mjs",
     "test:legacy": "node legacy/build.cjs && node legacy/regression.cjs && node legacy/vector-regression.cjs",
     "check": "tsc --noEmit",
     "tauri": "tauri"
