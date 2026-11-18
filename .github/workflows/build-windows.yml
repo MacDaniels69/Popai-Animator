@@ -1,11 +1,15 @@
-# Builds the Windows app on GitHub's Windows machines. Nothing to install on your PC:
-# open the repository on github.com → Actions → "Build Windows app" → the latest run → download
-# "Popai-Animator-Windows" (installer .exe and the portable .exe).
+# Builds the Windows app on GitHub's Windows machines. Nothing to install on your PC.
+# Every build is published on the repository's Releases page as "Popai Animator (latest build)":
+#   https://github.com/MacDaniels69/Popai-Animator/releases/latest
+# with the installer .exe and the portable .exe ready to download (no sign-in needed).
 name: Build Windows app
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -35,9 +39,19 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          Copy-Item ui/src-tauri/target/release/bundle/nsis/*.exe out/
-          Copy-Item ui/src-tauri/target/release/popai-animator.exe "out/Popai Animator (portable).exe"
+          Copy-Item ui/src-tauri/target/release/bundle/nsis/*.exe "out/Popai-Animator-Setup.exe"
+          Copy-Item ui/src-tauri/target/release/popai-animator.exe "out/Popai-Animator-Portable.exe"
+          Compress-Archive -Path out/Popai-Animator-Setup.exe, out/Popai-Animator-Portable.exe -DestinationPath out/Popai-Animator-Windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: Popai-Animator-Windows
           path: out/
+      - name: Publish as the latest release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Built automatically from commit ${{ github.sha }} on $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC.`n`n- Popai-Animator-Setup.exe: installs the app (Start menu + desktop shortcut)`n- Popai-Animator-Portable.exe: runs without installing`n- Popai-Animator-Windows.zip: both, zipped`n`nIf Windows shows 'Windows protected your PC', click More info, then Run anyway."
+          gh release delete latest --yes --cleanup-tag 2>$null
+          gh release create latest out/Popai-Animator-Setup.exe out/Popai-Animator-Portable.exe out/Popai-Animator-Windows.zip --title "Popai Animator (latest build)" --notes $notes --latest
