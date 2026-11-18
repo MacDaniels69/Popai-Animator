@@ -2374,7 +2374,7 @@ function renderToolOpts() {
 /* ======================= timeline.js ======================= */
 /* ===================== Popai Animator — timeline (dope sheet + curve editor), playback, audio ===================== */
 
-const TL = { cv: null, ctx: null, dpr: 1, ppf: 14, scrollX: 0, scrollY: 0, mode: 'dope', rows: [], drag: null, NAMEW: 200, RULER: 24, clip: null, curveView: null };
+const TL = { cv: null, ctx: null, dpr: 1, ppf: 14, scrollX: 0, scrollY: 0, mode: 'dope', rows: [], drag: null, NAMEW: 0, RULER: 24, clip: null, curveView: null };
 
 // ---------- channel naming / grouping ----------
 const CH_LABEL = { x: 'Position X', y: 'Position Y', z: 'Depth Z', rot: 'Rotation', sx: 'Scale X', sy: 'Scale Y', opacity: 'Opacity', sw: 'Switch', color: 'Color', zoom: 'Zoom', roll: 'Roll', shake: 'Shake', shakeFreq: 'Shake freq', gain: 'Gain' };
@@ -2403,19 +2403,23 @@ function chanName(o, path) {
 function rowFrames(o, paths) { const s = new Set(); for (const p of paths) { const c = o.ch[p]; if (c) c.keys.forEach((k) => s.add(k.f)); } return [...s].sort((a, b) => a - b); }
 
 function buildRows() {
-  const rows = [{ kind: 'markers', h: 18 }];
+  // The timeline shows only what is selected in the Layers panel (right side): the selected layer(s) as a
+  // summary row and the channels of the last one. Layers are listed only in the Layers panel.
+  const rows = [{ kind: 'markers', h: 16 }];
   const cam = S.doc.camera;
-  rows.push({ kind: 'layer', owner: cam, label: '🎥 Camera', depth: 0, h: 20, paths: Object.keys(cam.ch) });
-  if (S.camSel) for (const g of channelGroups(cam)) rows.push({ kind: 'chan', owner: cam, label: g.label, paths: g.paths, depth: 1, h: 18, gkey: g.key });
-  const rec = (list, depth) => {
-    for (const L of list) {
-      const h = L.type === 'audio' ? 44 : 20;
-      rows.push({ kind: 'layer', owner: L, label: L.name, depth, h, paths: Object.keys(L.ch) });
-      if (S.selLayers[S.selLayers.length - 1] === L.id && !S.camSel) for (const g of channelGroups(L)) rows.push({ kind: 'chan', owner: L, label: g.label, paths: g.paths, depth: depth + 1, h: 18, gkey: g.key });
-      if (L.children && L.open) rec(L.children, depth + 1);
+  if (S.camSel) {
+    rows.push({ kind: 'layer', owner: cam, label: '🎥 Camera', depth: 0, h: 20, paths: Object.keys(cam.ch) });
+    for (const g of channelGroups(cam)) rows.push({ kind: 'chan', owner: cam, label: g.label, paths: g.paths, depth: 1, h: 18, gkey: g.key });
+  } else {
+    const sel = S.selLayers.map((id) => findLayer(id)).filter(Boolean);
+    for (const L of sel) {
+      rows.push({ kind: 'layer', owner: L, label: L.name, depth: 0, h: L.type === 'audio' ? 44 : 20, paths: Object.keys(L.ch) });
+      if (L === sel[sel.length - 1]) for (const g of channelGroups(L)) rows.push({ kind: 'chan', owner: L, label: g.label, paths: g.paths, depth: 1, h: 18, gkey: g.key });
     }
-  };
-  rec(S.doc.layers, 0);
+  }
+  // sound tracks stay visible (for timing and lip-sync) even when another layer is selected
+  for (const A of allLayers()) if (A.type === 'audio' && !S.selLayers.includes(A.id)) rows.push({ kind: 'layer', owner: A, label: A.name, depth: 0, h: 44, paths: Object.keys(A.ch) });
+  if (rows.length === 1) rows.push({ kind: 'hint', h: 30 });
   let y = 0; for (const r of rows) { r.y = y; y += r.h; }
   TL.rows = rows; TL.totalH = y;
   return rows;
@@ -2469,10 +2473,7 @@ function renderTimeline() {
     ctx.fillStyle = m.color || '#5ccf8a'; ctx.beginPath(); ctx.moveTo(x - 5, top - 10); ctx.lineTo(x + 5, top - 10); ctx.lineTo(x, top - 3); ctx.fill();
   }
   // name column header
-  ctx.fillStyle = '#16181d'; ctx.fillRect(0, 0, TL.NAMEW, top);
-  ctx.fillStyle = '#dfe3ea'; ctx.font = '600 11px Inter, system-ui, sans-serif';
-  ctx.fillText(TL.mode === 'curves' ? 'Curve editor' : 'Layers & channels', 8, 12);
-  ctx.fillStyle = '#343a46'; ctx.fillRect(TL.NAMEW - 1, 0, 1, h); ctx.fillRect(0, top - 1, w, 1);
+  ctx.fillStyle = '#343a46'; ctx.fillRect(0, top - 1, w, 1);
   // playhead
   const px = fx2x(S.frame);
   if (px >= TL.NAMEW) {
@@ -2498,20 +2499,18 @@ function drawRows(ctx, w, h) {
     ctx.fillRect(0, y, w, r.h);
     ctx.fillStyle = 'rgba(255,255,255,.04)'; ctx.fillRect(0, y + r.h - 1, w, 1);
     if (r.kind === 'markers') {
-      ctx.fillStyle = '#636c7b'; ctx.font = '10px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText('Markers (dbl-click ruler)', 8, y + r.h / 2);
+      ctx.font = '10px Inter, system-ui'; ctx.textBaseline = 'middle';
       for (const m of d.markers) { const x = fx2x(m.f); if (x < TL.NAMEW - 2) continue; ctx.fillStyle = m.color || '#5ccf8a'; ctx.fillRect(x, y + 2, 2, r.h - 4); ctx.fillText(m.name, x + 4, y + r.h / 2); }
       continue;
     }
-    // name column
-    ctx.save(); ctx.beginPath(); ctx.rect(0, y, TL.NAMEW - 2, r.h); ctx.clip();
-    const ind = 8 + r.depth * 12;
-    ctx.fillStyle = r.kind === 'chan' ? '#9099a8' : '#dfe3ea'; ctx.font = (r.kind === 'chan' ? '' : '500 ') + '11px Inter, system-ui'; ctx.textBaseline = 'middle';
+    if (r.kind === 'hint') { ctx.fillStyle = '#636c7b'; ctx.font = '11px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText('Select a layer in the Layers panel to see its keyframes here.', 12, y + r.h / 2); continue; }
+    // row label, drawn faintly inside the track so the keys sit on top of it
     const L = r.owner;
     let label = r.label;
     if (r.kind === 'layer' && L.type) label = (LAYER_TYPES[L.type] ? LAYER_TYPES[L.type].icon + ' ' : '') + r.label;
-    if (r.kind === 'layer' && L.children) label = (L.open ? '▾ ' : '▸ ') + label;
-    ctx.fillText(label, ind, y + Math.min(r.h, 20) / 2);
-    ctx.restore();
+    ctx.save(); ctx.globalAlpha = r.kind === 'chan' ? 0.5 : 0.7; ctx.fillStyle = r.kind === 'chan' ? '#9099a8' : '#dfe3ea';
+    ctx.font = (r.kind === 'chan' ? '' : '600 ') + '10.5px Inter, system-ui'; ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right'; ctx.fillText(label, w - 10, y + Math.min(r.h, 20) / 2); ctx.restore();
     // audio waveform
     if (r.kind === 'layer' && L.type === 'audio') drawWave(ctx, L, y, r.h);
     // keys
@@ -2575,7 +2574,7 @@ function curveRange(ts) {
 function drawCurves(ctx, w, h) {
   const top = TL.RULER, ts = curveTargets();
   ctx.fillStyle = '#9099a8'; ctx.font = '11px Inter, system-ui'; ctx.textBaseline = 'middle';
-  if (!ts.length) { ctx.fillText('Select a channel row in the Dope Sheet (click its name), then switch to Curves.', TL.NAMEW + 16, top + 30); return; }
+  if (!ts.length) { ctx.fillText('Click a channel row in the Dope Sheet, then switch to Curves.', TL.NAMEW + 16, top + 30); return; }
   const o = TL.active.owner, [lo, hi] = curveRange(ts);
   const vy = (v) => top + 10 + (1 - (v - lo) / (hi - lo)) * (h - top - 20);
   TL.curveView = { lo, hi, vy, inv: (y) => lo + (1 - (y - top - 10) / (h - top - 20)) * (hi - lo) };
@@ -2599,7 +2598,7 @@ function drawCurves(ctx, w, h) {
 // ---------- interaction ----------
 function rowAt(y) { const yy = y - TL.RULER + TL.scrollY; return TL.rows.find((r) => yy >= r.y && yy < r.y + r.h) || null; }
 function keyHit(r, x) {
-  if (!r || r.kind === 'markers') return null;
+  if (!r || r.kind === 'markers' || r.kind === 'hint') return null;
   const frames = rowFrames(r.owner, r.paths);
   let best = null, bd = 7;
   for (const f of frames) { const d = Math.abs(fx2x(f) + TL.ppf / 2 - x); if (d < bd) { bd = d; best = f; } }
@@ -2721,7 +2720,7 @@ function initTimeline() {
       const r = [Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]; d.r = r;
       const s = new Set(d.add ? d.base : []);
       for (const row of TL.rows) {
-        if (row.kind === 'markers') continue;
+        if (row.kind === 'markers' || row.kind === 'hint') continue;
         const ry = TL.RULER + row.y - TL.scrollY + Math.min(row.h, 20) / 2; if (ry < r[1] || ry > r[3]) continue;
         for (const f of rowFrames(row.owner, row.paths)) { const kx = fx2x(f) + TL.ppf / 2; if (kx >= r[0] && kx <= r[2]) row.paths.forEach((p) => keyAt(row.owner, p, f) && s.add(kid(row.owner, p, f))); }
       }
@@ -2731,7 +2730,7 @@ function initTimeline() {
   const up = (e) => {
     const d = TL.drag; TL.drag = null; if (!d) return;
     if (d.mode === 'keys' || d.mode === 'curve') commitEdit();
-    if (d.mode === 'marquee' && !d.moved) { const [x, y] = pos(e); if (x > TL.NAMEW) { if (!d.add) S.selKeys = new Set(); setFrame(Math.max(0, Math.floor(x2f(x)))); const r = rowAt(y); if (r && r.kind === 'layer' && r.owner.id !== 'CAM' && !S.selLayers.includes(r.owner.id)) { S.selLayers = [r.owner.id]; S.camSel = false; } } }
+    if (d.mode === 'marquee' && !d.moved) { const [x, y] = pos(e); if (x > TL.NAMEW) { if (!d.add) S.selKeys = new Set(); setFrame(Math.max(0, Math.floor(x2f(x)))); const r = rowAt(y); if (r && r.kind === 'chan') TL.active = { owner: r.owner, paths: r.paths, gkey: r.gkey, label: r.label }; else if (r && r.kind === 'layer' && r.owner.id !== 'CAM' && !S.selLayers.includes(r.owner.id)) { S.selLayers = [r.owner.id]; S.camSel = false; } } }
     refreshAll();
   };
   TL.cv.addEventListener('pointerup', up); TL.cv.addEventListener('pointercancel', up);
