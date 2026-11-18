@@ -87,9 +87,28 @@ const EASE = {
 };
 const INTERPS = [
   ['smooth', 'Smooth'], ['linear', 'Linear'], ['ease', 'Ease in/out'], ['easein', 'Ease in'], ['easeout', 'Ease out'],
-  ['step', 'Step (hold)'], ['bounce', 'Bounce'], ['elastic', 'Elastic'],
+  ['bezier', 'Bézier'], ['step', 'Step (hold)'], ['noisy', 'Noisy'], ['cycle', 'Cycle'], ['bounce', 'Bounce'], ['elastic', 'Elastic'],
 ];
-const INTERP_COLORS = { smooth: '#7fb4ff', linear: '#ffd166', ease: '#7ee08a', easein: '#5cc2a0', easeout: '#a0e05c', step: '#ff6b6b', bounce: '#d68cff', elastic: '#ff9de2' };
+const INTERP_COLORS = { smooth: '#7fb4ff', linear: '#ffd166', ease: '#7ee08a', easein: '#5cc2a0', easeout: '#a0e05c', step: '#ff6b6b', bounce: '#d68cff', elastic: '#ff9de2', bezier: '#ffa94d', noisy: '#adb5bd', cycle: '#63e6be' };
+const INTERP_HELP = {
+  smooth: 'Flowing: the curve is shaped by the neighbouring keys', linear: 'Constant speed', ease: 'Starts slowly, speeds up, slows down at the end',
+  easein: 'Soft start', easeout: 'Soft landing', bezier: 'Editable curve handles (shape them in Curves)', step: 'Holds until the next key, then jumps',
+  noisy: 'Irregular wobble between the keys (trembling, shake)', cycle: 'Repeats an earlier range of frames from this key on', bounce: 'Rebounds into the next key', elastic: 'Overshoots and springs into the next key',
+};
+const LABEL_COLORS = [['', 'None'], ['#ff6b6b', 'Red'], ['#ffa94d', 'Orange'], ['#ffd43b', 'Yellow'], ['#69db7c', 'Green'], ['#4dabf7', 'Blue'], ['#da77f2', 'Purple']];
+// Bézier easing: solve x(s) = t by bisection (identical in the Rust engine), then y(s)
+function bezierEase(bz, t) {
+  const x1 = clamp(bz[0], 0, 1), y1 = bz[1], x2 = clamp(bz[2], 0, 1), y2 = bz[3];
+  const cb = (a, b, s) => 3 * (1 - s) * (1 - s) * s * a + 3 * (1 - s) * s * s * b + s * s * s;
+  let lo = 0, hi = 1;
+  for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (cb(x1, x2, mid) < t) lo = mid; else hi = mid; }
+  return cb(y1, y2, (lo + hi) / 2);
+}
+function cycleMap(a, f) {
+  const c = a.cy || 0, target = a.cm === 'rel' ? a.f - c : c, len = a.f - target;
+  if (!(len > 0)) return null;
+  return target + ((((f - a.f) % len) + len) % len);
+}
 
 function mixVal(a, b, t) {
   if (typeof a === 'number') return a + (b - a) * t;
@@ -106,12 +125,27 @@ function evalChannel(ch, f) {
   if (!k.length) return undefined;
   if (f <= k[0].f) return k[0].v;
   const last = k[k.length - 1];
-  if (f >= last.f) return last.v;
+  if (f >= last.f) {
+    if (f > last.f && last.i === 'cycle') { const g = cycleMap(last, f); if (g !== null) return evalChannel(ch, g); }
+    return last.v;
+  }
   let lo = 0, hi = k.length - 1;
   while (hi - lo > 1) { const m = (lo + hi) >> 1; if (k[m].f <= f) lo = m; else hi = m; }
   const a = k[lo], b = k[hi];
-  const t = (f - a.f) / (b.f - a.f);
   const it = a.i || 'smooth';
+  if (it === 'cycle') { const g = cycleMap(a, f); return g === null ? a.v : evalChannel(ch, g); }
+  // timing controls: hold, interval (on twos...), stagger
+  const hold = Math.min(Math.max(a.hold || 0, 0), b.f - a.f);
+  if (f - a.f < hold) return a.v;
+  const start = a.f + hold;
+  let fa = f;
+  const iv = Math.floor(a.iv || 0);
+  if (iv >= 2) fa = start + Math.floor((fa - start) / iv) * iv;
+  if (a.stg === true) {
+    const q = iv >= 2 ? iv : 2, idx = Math.floor((fa - start) / q);
+    fa = ((idx % 2) + 2) % 2 === 1 ? start + (idx - 0.5) * q : start + idx * q;
+  }
+  const t = b.f - start > 0 ? clamp((fa - start) / (b.f - start), 0, 1) : 1;
   const numeric = typeof a.v === 'number' || Array.isArray(a.v);
   if (!numeric && !isColor(a.v)) return a.v; // discrete -> hold
   if (it === 'step') return a.v;
@@ -125,6 +159,13 @@ function evalChannel(ch, f) {
     if (typeof a.v === 'number') return comp(a.v, b.v, p ? p.v : 0, n ? n.v : 0);
     return a.v.map((av, i) => comp(av, b.v[i], p ? p.v[i] : 0, n ? n.v[i] : 0));
   }
+  if (it === 'bezier') return mixVal(a.v, b.v, bezierEase(a.bz || [0.33, 0, 0.67, 1], t));
+  if (it === 'noisy' && numeric) {
+    const amp = a.na ?? 10, per = Math.max(0.5, a.nf ?? 3), env = Math.sin(Math.PI * t);
+    const nz = (i) => vnoise((fa - a.f) / per, a.f * 0.137 + 7 + i * 13) * amp * env, m = mixVal(a.v, b.v, t);
+    return typeof m === 'number' ? m + nz(0) : m.map((x, i) => x + nz(i));
+  }
+  if (it === 'noisy') return mixVal(a.v, b.v, t);
   const e = EASE[it] || EASE.ease;
   return mixVal(a.v, b.v, it === 'smooth' ? EASE.ease(t) : e(t));
 }
@@ -271,7 +312,11 @@ function keyAt(o, path, f) { const ch = o.ch[path]; return ch ? ch.keys.find((k)
 function setKey(ch, f, v, interp) {
   const k = ch.keys.find((k) => k.f === f);
   if (k) { k.v = clone(v); if (interp) k.i = interp; }
-  else { ch.keys.push({ f, v: clone(v), i: interp || S.defInterp }); ch.keys.sort((a, b) => a.f - b.f); }
+  else {
+    let i = interp || S.defInterp;
+    if (i === 'copy') { const prev = ch.keys.filter((q) => q.f < f).pop(); i = prev && prev.i && prev.i !== 'cycle' ? prev.i : 'smooth'; }
+    ch.keys.push({ f, v: clone(v), i }); ch.keys.sort((a, b) => a.f - b.f);
+  }
 }
 const DISCRETE = (path) => path === 'sw' || path === 'vis' || path === 'vit';
 let REV = 0; // bumped on every document change (invalidates simulation caches)
@@ -2706,9 +2751,13 @@ function drawRows(ctx, w, h) {
     const cy = y + Math.min(r.h, 20) / 2;
     for (const f of frames) {
       const x = fx2x(f) + TL.ppf / 2; if (x < TL.NAMEW || x > w + 6) continue;
-      let sel = false, interp = 'smooth';
-      for (const p of r.paths) { const k = L.ch[p] && L.ch[p].keys.find((k) => k.f === f); if (k) { interp = k.i || 'smooth'; if (S.selKeys.has(kid(L, p, f))) sel = true; } }
+      let sel = false, interp = 'smooth', kk = null;
+      for (const p of r.paths) { const k = L.ch[p] && L.ch[p].keys.find((k) => k.f === f); if (k) { interp = k.i || 'smooth'; if (!kk || k.lb || k.hold) kk = k; if (S.selKeys.has(kid(L, p, f))) sel = true; } }
       const s = r.kind === 'chan' ? 4.5 : 5.5;
+      if (kk && kk.hold) { ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(x, cy - 1.5, kk.hold * TL.ppf, 3); }
+      if (kk && kk.lb) { ctx.strokeStyle = kk.lb; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, cy, s + 3, 0, Math.PI * 2); ctx.stroke(); }
+      if (interp === 'cycle') { ctx.fillStyle = INTERP_COLORS.cycle; ctx.font = '11px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText('↻', x + s + 2, cy); }
+      if (kk && (kk.iv > 1 || kk.stg)) { ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '9px Inter, system-ui'; ctx.textBaseline = 'middle'; ctx.fillText(kk.stg ? 'stg' : '×' + kk.iv, x + s + 2, cy + 7); }
       ctx.beginPath(); ctx.moveTo(x, cy - s); ctx.lineTo(x + s, cy); ctx.lineTo(x, cy + s); ctx.lineTo(x - s, cy); ctx.closePath();
       ctx.fillStyle = sel ? '#ffffff' : INTERP_COLORS[interp] || '#7fb4ff'; ctx.fill();
       ctx.strokeStyle = sel ? '#ff8a3d' : 'rgba(0,0,0,.6)'; ctx.lineWidth = sel ? 2 : 1; ctx.stroke();
@@ -2766,6 +2815,7 @@ function drawCurves(ctx, w, h) {
   const o = TL.active.owner, [lo, hi] = curveRange(ts);
   const vy = (v) => top + 10 + (1 - (v - lo) / (hi - lo)) * (h - top - 20);
   TL.curveView = { lo, hi, vy, inv: (y) => lo + (1 - (y - top - 10) / (h - top - 20)) * (hi - lo) };
+  TL.bzHandles = [];
   // value grid
   ctx.strokeStyle = 'rgba(255,255,255,.06)';
   for (let i = 0; i <= 4; i++) { const v = lo + ((hi - lo) * i) / 4, y = vy(v); ctx.beginPath(); ctx.moveTo(TL.NAMEW, y); ctx.lineTo(w, y); ctx.stroke(); ctx.fillStyle = '#636c7b'; ctx.fillText(round(v, 2), TL.NAMEW + 4, y - 6); }
@@ -2776,6 +2826,17 @@ function drawCurves(ctx, w, h) {
     const fA = Math.max(0, Math.floor(x2f(TL.NAMEW))), fB = Math.ceil(x2f(w));
     for (let f = fA; f <= fB; f += 0.25) { let v = val(o, t.path, f); if (t.comp >= 0) v = v[t.comp]; const x = fx2x(f) + TL.ppf / 2, y = vy(v); f === fA ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
     ctx.stroke();
+    const kl = o.ch[t.path].keys;
+    for (let j = 0; j < kl.length - 1; j++) {
+      const a = kl[j], b = kl[j + 1]; if (a.i !== 'bezier') continue;
+      const av = t.comp >= 0 ? a.v[t.comp] : a.v, bv = t.comp >= 0 ? b.v[t.comp] : b.v, dv = bv - av, span = b.f - a.f, bz = a.bz || [0.33, 0, 0.67, 1];
+      if (typeof av !== 'number' || Math.abs(dv) < 1e-9) continue;
+      const ax = fx2x(a.f) + TL.ppf / 2, ay = vy(av), bx = fx2x(b.f) + TL.ppf / 2, by = vy(bv);
+      const h1 = [fx2x(a.f + bz[0] * span) + TL.ppf / 2, vy(av + bz[1] * dv)], h2 = [fx2x(a.f + bz[2] * span) + TL.ppf / 2, vy(av + bz[3] * dv)];
+      ctx.strokeStyle = 'rgba(255,169,77,.8)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(h1[0], h1[1]); ctx.moveTo(bx, by); ctx.lineTo(h2[0], h2[1]); ctx.stroke();
+      ctx.fillStyle = '#ffa94d'; for (const h of [h1, h2]) ctx.fillRect(h[0] - 3.5, h[1] - 3.5, 7, 7);
+      TL.bzHandles.push({ o, path: t.path, comp: t.comp, f: a.f, which: 1, x: h1[0], y: h1[1], av, dv, span }, { o, path: t.path, comp: t.comp, f: a.f, which: 2, x: h2[0], y: h2[1], av, dv, span });
+    }
     for (const k of o.ch[t.path].keys) {
       const v = t.comp >= 0 ? k.v[t.comp] : k.v, x = fx2x(k.f) + TL.ppf / 2, y = vy(v), sel = S.selKeys.has(kid(o, t.path, k.f));
       ctx.fillStyle = sel ? '#fff' : col; ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x, y, sel ? 5 : 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
@@ -2823,9 +2884,61 @@ function deleteSelectedKeys() {
   });
   return true;
 }
+function selectedKeyObjs() { const out = []; for (const k of S.selKeys) { const { o, path, f } = parseKid(k); const key = o && keyAt(o, path, f); if (key) out.push({ o, path, key }); } return out; }
 function setInterpSelected(it) {
   if (!S.selKeys.size) return toast('Select keys first');
-  edit('Set interpolation', () => { for (const k of S.selKeys) { const { o, path, f } = parseKid(k); const key = o && keyAt(o, path, f); if (key) key.i = it; } });
+  if (it === 'cycle') return keyframePanel('cycle');
+  edit('Set interpolation', () => { for (const { key } of selectedKeyObjs()) { key.i = it; if (it === 'bezier' && !key.bz) key.bz = [0.33, 0, 0.67, 1]; } });
+  if (it === 'bezier') toast('Bézier: open Curves and drag the square handles to shape the motion', 'ok');
+}
+// Keyframe panel (Moho: Window ▸ Keyframe, Ctrl+Alt+E): interpolation and timing of the selected keys
+async function keyframePanel(focus) {
+  const ks = selectedKeyObjs(); if (!ks.length) return toast('Select keys in the timeline first (click a key, Shift-click or drag a box for more)');
+  const k0 = ks[0].key, ch0 = ks[0].o.ch[ks[0].path], firstF = ch0.keys[0].f, prevK = ch0.keys.filter((q) => q.f < k0.f).pop();
+  const it0 = focus === 'cycle' ? 'cycle' : k0.i || 'smooth', bz = k0.bz || [0.33, 0, 0.67, 1];
+  const num = (n, v, a = '') => `<input type="number" name="${n}" value="${v}" ${a}>`;
+  const pr = modal(`Keyframe · ${ks.length} key${ks.length > 1 ? 's' : ''} at frame${new Set(ks.map((q) => q.key.f)).size > 1 ? 's ' + [...new Set(ks.map((q) => q.key.f))].join(', ') : ' ' + k0.f}`, `<div class="form kfp">
+    <label>Interpolation</label><select name="i">${INTERPS.map(([k, n]) => `<option value="${k}" ${k === it0 ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    <label></label><div class="note" id="kfHelp" style="margin:0">${esc(INTERP_HELP[it0] || '')}</div>
+    <label title="Normalized handles of the curve leaving this key: x = time 0–1, y = value 0–1 (beyond 0–1 overshoots)">Bézier handles</label><div class="row4">${num('x1', bz[0], 'step="0.05" min="0" max="1"')}${num('y1', bz[1], 'step="0.05"')}${num('x2', bz[2], 'step="0.05" min="0" max="1"')}${num('y2', bz[3], 'step="0.05"')}</div>
+    <label>Noise</label><div class="row2"><span>amount ${num('na', k0.na ?? 10, 'step="1" min="0"')}</span><span>frames per wiggle ${num('nf', k0.nf ?? 3, 'step="0.5" min="0.5"')}</span></div>
+    <label>Cycle back to</label><div class="row2"><select name="cm"><option value="abs" ${k0.cm !== 'rel' ? 'selected' : ''}>Absolute: frame</option><option value="rel" ${k0.cm === 'rel' ? 'selected' : ''}>Relative: frames back</option></select>${num('cy', k0.cy ?? (k0.cm === 'rel' ? k0.f - firstF : firstF), 'step="1" min="0"')}</div>
+    <label title="Stay on this key's value for this many frames before moving towards the next key">Hold</label><span>${num('hold', k0.hold || 0, 'step="1" min="0"')} frames</span>
+    <label title="Show a new in-between only every N frames — 2 = animation on twos at the project frame rate">Interval</label><span>${num('iv', k0.iv || 1, 'step="1" min="1"')} frame(s)</span>
+    <label title="Uneven stair-step timing">Stagger</label><label style="text-align:left"><input type="checkbox" name="stg" ${k0.stg ? 'checked' : ''}> stair-step the motion</label>
+    <label title="Colour only — helps you find keys; never changes the motion">Label</label><select name="lb">${LABEL_COLORS.map(([c, n]) => `<option value="${c}" ${c === (k0.lb || '') ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    </div><div class="note">Applies to every selected key. Cycle example: keys at 0 (arm down), 12 (up), 24 (down) — set the key at 24 to Cycle, back to frame 0 (absolute) or 24 frames back (relative), and it repeats without extra keys.${prevK ? '' : ''}</div>`,
+    [{ label: 'Cancel', value: false }, { label: 'Apply', value: true, pri: true }], 'kfpanel');
+  const isel = $('#modal select[name=i]'); if (isel) isel.onchange = () => { $('#kfHelp').textContent = INTERP_HELP[isel.value] || ''; };
+  const r = await pr;
+  if (!r || !r.v) return;
+  const d = r.data;
+  edit('Keyframe settings', () => {
+    for (const { key } of ks) {
+      key.i = d.i;
+      if (d.i === 'bezier') key.bz = [clamp(+d.x1, 0, 1), +d.y1, clamp(+d.x2, 0, 1), +d.y2]; else delete key.bz;
+      if (d.i === 'noisy') { key.na = Math.max(0, +d.na); key.nf = Math.max(0.5, +d.nf); } else { delete key.na; delete key.nf; }
+      if (d.i === 'cycle') { key.cm = d.cm; key.cy = Math.max(0, Math.round(+d.cy)); } else { delete key.cm; delete key.cy; }
+      if (+d.hold > 0) key.hold = Math.round(+d.hold); else delete key.hold;
+      if (+d.iv > 1) key.iv = Math.round(+d.iv); else delete key.iv;
+      if (d.stg) key.stg = true; else delete key.stg;
+      if (d.lb) key.lb = d.lb; else delete key.lb;
+    }
+  });
+  if (d.i === 'cycle') { const bad = ks.filter(({ key }) => !(key.f - (d.cm === 'rel' ? key.f - +d.cy : +d.cy) > 0)); if (bad.length) toast('The cycle target must be earlier than the key — that key just holds', 'err'); }
+}
+// right-click on an empty spot of a channel: record its current value as a key
+function addKeysAt(r, f) {
+  const o = r.owner; let paths = r.paths.filter((p) => o.ch[p]);
+  if (!paths.length) paths = o.id === 'CAM' ? ['x', 'y', 'zoom', 'roll'] : ['x', 'y', 'rot', 'sx', 'sy'];
+  edit('Add keyframe', () => {
+    for (const p of paths) {
+      const v = val(o, p, f); if (v === undefined) continue;
+      if (!o.ch[p]) { o.ch[p] = { keys: [] }; if (f !== 0) setKey(o.ch[p], 0, baseGet(o, p), DISCRETE(p) ? 'step' : undefined); }
+      setKey(o.ch[p], f, v, DISCRETE(p) ? 'step' : undefined);
+    }
+    S.selKeys = new Set(paths.filter((p) => o.ch[p]).map((p) => kid(o, p, f)));
+  });
 }
 function copyKeys() {
   if (!S.selKeys.size) return false;
@@ -2903,6 +3016,12 @@ function initTimeline() {
       const sk = S.selKeys; restore(d.snap); S.selKeys = sk; moveSelectedKeys(d.base, df); refreshAll(); return;
     }
     if (d.mode === 'curve') return curveMove(e, x, y);
+    if (d.mode === 'bzh') {
+      const q = d.h, key = q.o.ch[q.path] && q.o.ch[q.path].keys.find((k) => k.f === q.f); if (!key) return;
+      const f = x2f(x - TL.ppf / 2), v = TL.curveView.inv(y), bz = (key.bz = (key.bz || [0.33, 0, 0.67, 1]).slice());
+      bz[q.which === 1 ? 0 : 2] = round(clamp((f - q.f) / q.span, 0, 1), 3); bz[q.which === 1 ? 1 : 3] = round((v - q.av) / q.dv, 3);
+      REV++; requestDraw(); return;
+    }
     if (d.mode === 'marquee') {
       if (Math.hypot(x - d.x0, y - d.y0) < 3 && !d.moved) return; d.moved = true;
       const r = [Math.min(d.x0, x), Math.min(d.y0, y), Math.max(d.x0, x), Math.max(d.y0, y)]; d.r = r;
@@ -2917,7 +3036,7 @@ function initTimeline() {
   });
   const up = (e) => {
     const d = TL.drag; TL.drag = null; if (!d) return;
-    if (d.mode === 'keys' || d.mode === 'curve') commitEdit();
+    if (d.mode === 'keys' || d.mode === 'curve' || d.mode === 'bzh') commitEdit();
     if (d.mode === 'marquee' && !d.moved) { const [x, y] = pos(e); if (x > TL.NAMEW) { if (!d.add) S.selKeys = new Set(); setFrame(Math.max(0, Math.floor(x2f(x)))); const r = rowAt(y); if (r && r.kind === 'chan') TL.active = { owner: r.owner, paths: r.paths, gkey: r.gkey, label: r.label }; else if (r && r.kind === 'layer' && r.owner.id !== 'CAM' && !S.selLayers.includes(r.owner.id)) { S.selLayers = [r.owner.id]; S.camSel = false; } } }
     refreshAll();
   };
@@ -2931,11 +3050,15 @@ function initTimeline() {
   });
   TL.cv.addEventListener('contextmenu', (e) => {
     e.preventDefault(); const [x, y] = pos(e), r = rowAt(y);
-    if (TL.mode === 'dope' && r && x > TL.NAMEW) { const f = keyHit(r, x); if (f !== null && !r.paths.some((p) => S.selKeys.has(kid(r.owner, p, f)))) selectRowKeys(r, f, false); }
+    let emptyAt = null;
+    if (TL.mode === 'dope' && r && x > TL.NAMEW) { const f = keyHit(r, x); if (f !== null && !r.paths.some((p) => S.selKeys.has(kid(r.owner, p, f)))) selectRowKeys(r, f, false); if (f === null && (r.kind === 'chan' || r.kind === 'layer')) emptyAt = { r, f: Math.max(0, Math.floor(x2f(x))) }; }
     requestDraw();
     showMenu(e.clientX, e.clientY, [
+      ...(emptyAt ? [{ label: `Add keyframe at frame ${emptyAt.f} — ${emptyAt.r.kind === 'chan' ? emptyAt.r.label : 'this layer'}`, run: () => addKeysAt(emptyAt.r, emptyAt.f) }, { sep: 1 }] : []),
       { hd: 'Interpolation' },
-      ...INTERPS.map(([k, n]) => ({ label: n, run: () => setInterpSelected(k), dot: INTERP_COLORS[k] })),
+      ...INTERPS.map(([k, n]) => ({ label: k === 'cycle' ? 'Cycle…' : n, run: () => setInterpSelected(k), dot: INTERP_COLORS[k], dis: () => (S.selKeys.size ? false : 'Select keys first') })),
+      { sep: 1 },
+      { label: 'Keyframe settings… (hold, interval, stagger, label)', k: 'Ctrl+Alt+E', run: () => keyframePanel(), dis: () => (S.selKeys.size ? false : 'Select keys first') },
       { sep: 1 },
       { label: 'Copy keys', k: 'Ctrl+C', run: copyKeys }, { label: 'Paste keys at playhead', k: 'Ctrl+V', run: pasteKeys },
       { label: 'Delete keys', k: 'Del', run: deleteSelectedKeys },
@@ -2955,6 +3078,8 @@ function initTimeline() {
 function curveDown(e, x, y) {
   const ts = curveTargets(); if (!ts.length || !TL.curveView) return;
   const o = TL.active.owner, cv = TL.curveView;
+  const hh = (TL.bzHandles || []).find((q) => Math.hypot(q.x - x, q.y - y) < 7);
+  if (hh) { beginEdit('Shape Bézier curve'); TL.drag = { mode: 'bzh', h: hh }; return; }
   for (const t of ts) for (const k of o.ch[t.path].keys) {
     const v = t.comp >= 0 ? k.v[t.comp] : k.v;
     if (Math.hypot(fx2x(k.f) + TL.ppf / 2 - x, cv.vy(v) - y) < 7) {
@@ -2990,7 +3115,7 @@ function renderTLBar() {
     <span class="sep" style="width:1px;height:18px;background:var(--line)"></span>
     <button class="ib toggle ${S.loop ? 'on' : ''}" id="tlLoop" title="Loop playback">⟳ Loop</button>
     <button class="ib toggle ${S.autoKey ? 'on' : ''}" id="tlAuto" title="Auto-key: edits at frames other than 0 create keyframes">● Auto-key</button>
-    <label title="Interpolation for new keys">New keys <select id="tlInterp">${INTERPS.map(([k, n]) => `<option value="${k}" ${k === S.defInterp ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+    <label title="Interpolation for new keys">New keys <select id="tlInterp">${INTERPS.filter(([k]) => k !== 'cycle').map(([k, n]) => `<option value="${k}" ${k === S.defInterp ? 'selected' : ''}>${n}</option>`).join('')}<option value="copy" ${S.defInterp === 'copy' ? 'selected' : ''}>Copy previous key</option></select></label>
     <button class="ib toggle ${S.onion ? 'on' : ''}" id="tlOnion" title="Onion skins for the selected layer (past red, future green)">◐ Onion</button>
     <input type="number" id="tlOnionN" min="1" max="8" value="${S.onionN}" style="width:40px" title="Onion skin frames each side">
     <span class="sep" style="width:1px;height:18px;background:var(--line)"></span>
@@ -4531,6 +4656,7 @@ cmd('anim.first', 'Animate', 'First frame', () => setFrame(0), { k: 'Home', keys
 cmd('anim.last', 'Animate', 'Last frame', () => setFrame(S.doc.end), { k: 'End', keys: 'end' });
 cmd('anim.nextkey', 'Animate', 'Next keyframe (selected layer)', () => jumpKey(1), { k: 'Shift+.', keys: 'shift+>|shift+.' });
 cmd('anim.prevkey', 'Animate', 'Previous keyframe (selected layer)', () => jumpKey(-1), { k: 'Shift+,', keys: 'shift+<|shift+,' });
+cmd('key.settings', 'Animate', 'Keyframe settings… (interpolation, cycle, hold, interval, stagger, label)', () => keyframePanel(), { k: 'Ctrl+Alt+E', keys: 'ctrl+alt+e', kw: 'keyframe window interpolation cycle hold interval stagger label' });
 cmd('anim.keyall', 'Animate', 'Key pose: key all transforms of selected layer here', () => edit('Key pose', () => { const L = selLayer(); for (const p of ['x', 'y', 'rot', 'sx', 'sy', 'opacity']) setVal(L, p, val(L, p, S.frame), S.frame, true); if (L.type === 'bone') for (const b of L.bones) setVal(L, 'bone:' + b.id + ':a', val(L, 'bone:' + b.id + ':a', S.frame), S.frame, true); }), { en: needLayer, kw: 'freeze pose key' });
 cmd('anim.delkeys', 'Animate', 'Delete selected keys', deleteSelectedKeys, { en: () => (S.selKeys.size ? false : 'Select keys in the timeline') });
 cmd('anim.clear', 'Animate', 'Clear all animation on selected layer', () => edit('Clear animation', () => { const L = selLayer(); for (const p of Object.keys(L.ch)) { baseSet(L, p, val(L, p, 0)); delete L.ch[p]; } }), { en: needLayer, kw: 'reset' });

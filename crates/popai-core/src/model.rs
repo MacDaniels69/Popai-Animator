@@ -20,6 +20,31 @@ pub struct Key {
     pub v: Val,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i: Option<String>,
+    /// Bézier handles of the segment that starts at this key, normalized: [x1, y1, x2, y2]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bz: Option<[f64; 4]>,
+    /// Noisy: amplitude (value units) and frames per wiggle
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub na: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nf: Option<f64>,
+    /// Cycle: target frame (`cm` = "abs") or frames back (`cm` = "rel")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cy: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm: Option<String>,
+    /// Hold this key's value for N frames before moving on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<f64>,
+    /// Update the in-between only every N frames ("on twos")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iv: Option<f64>,
+    /// Stagger: uneven stair-step timing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stg: Option<bool>,
+    /// Label colour (identification only, never changes motion)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lb: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Channel {

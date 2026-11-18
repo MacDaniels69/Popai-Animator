@@ -42,7 +42,7 @@ async def main():
         await pg.goto(URL); await pg.wait_for_timeout(800)
         assert await pg.evaluate('PopaiApp.ENGINE.mode') == 'rust', 'Rust engine not connected'
         await pg.evaluate("document.querySelector('#modal .x') && document.querySelector('#modal .x').click()")
-        for name in ['demo', 'features']:
+        for name in ['demo', 'features', 'keys']:
             txt = (ROOT / 'fixtures' / f'{name}.popai.json').read_text()
             await pg.evaluate('(t) => PopaiApp.loadProjectJSON(t)', txt); await pg.wait_for_timeout(300)
             end = int(json.loads(txt)['doc']['end'])
